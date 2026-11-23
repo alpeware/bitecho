@@ -750,9 +750,44 @@
 ;; =============================================================================
 
 (def default-passthrough-drain-timeout-ms
-  "Maximum time (ms) to wait for a peer socket to flush final bytes after the other side
+  "Idle-progress drain timeout (ms) to wait for a peer socket to flush final bytes after the other side
    closes cleanly before forcing `.destroy()` to prevent leaked paused sockets / ArrayBuffers."
   5000)
+
+(def max-passthrough-drain-ms
+  "Hard ceiling (ms) for active-progress `:443` passthrough draining (BIP-021 §2.6.1)."
+  30000)
+
+(def default-max-draining-pairs
+  "Global bounded cap on concurrent draining `:443` passthrough pairs on 940 MiB e2-micro nodes (BIP-021 §2.6.1)."
+  64)
+
+(defn enforce-draining-pair-cap
+  "Pure helper (BIP-021 §2.6.1): registers `pair-id` in FIFO `draining-order` bounded by `max-draining`.
+   If adding `pair-id` exceeds `max-draining`, evicts the oldest draining pair and emits a counted
+   `:diagnose {:reason :passthrough-drain-cap-evicted}` effect."
+  ([draining-order pair-id]
+   (enforce-draining-pair-cap draining-order pair-id default-max-draining-pairs))
+  ([draining-order pair-id max-draining]
+   (let [cap (max 1 (long (or max-draining default-max-draining-pairs)))
+         cur (vec (remove #(= % pair-id) (or draining-order [])))
+         next-order (conj cur pair-id)]
+     (if (> (count next-order) cap)
+       (let [evicted (first next-order)
+             kept (vec (rest next-order))]
+         {:draining-order kept
+          :evicted-pair-id evicted
+          :effects [{:effect :diagnose
+                     :type :diagnose
+                     :reason :passthrough-drain-cap-evicted
+                     :evicted-pair-id evicted
+                     :pair-id pair-id
+                     :max-draining cap}
+                    {:effect :force-destroy-pair
+                     :pair-id evicted}]})
+       {:draining-order next-order
+        :evicted-pair-id nil
+        :effects []}))))
 
 (defn init-passthrough-pair
   "Initializes single-authority generation-tagged lifecycle state for a spliced
@@ -760,6 +795,7 @@
   ([] (init-passthrough-pair nil))
   ([opts]
    {:generation (long (or (:generation opts) 1))
+    :pair-id (:pair-id opts)
     :phase :spliced
     :client-closed? false
     :backend-closed? false
@@ -767,6 +803,7 @@
     :backend-writable-finished? false
     :drain-timer-active? false
     :drain-timeout-ms (long (or (:drain-timeout-ms opts) default-passthrough-drain-timeout-ms))
+    :max-drain-ms (long (or (:max-drain-ms opts) max-passthrough-drain-ms))
     :ignored-stale 0}))
 
 (defn- other-passthrough-side
@@ -786,14 +823,22 @@
    guaranteeing that spliced `:443` passthrough socket pairs NEVER leak paused sockets,
    `TCPSocketWrap` handles, or unread TLS `close_notify` `ArrayBuffer` slabs when one side closes.
 
+   BIP-021 §2.6.1:
+   - Clean `:socket-close` (including `peer-fin? true` with `(not (:had-error? event))`) routes
+     through `:draining` with `:end-socket` + `5,000 ms` idle-progress drain timeout.
+   - `:drain-progress` resets the drain timer up to the `30,000 ms` hard ceiling.
+   - All terminal transitions emit explicit `{:effect :cancel-drain-timeout :pair-id ... :generation ...}`.
+
    Events:
    - `{:type :socket-close :side (:client|:backend) :had-error? bool :peer-writable-finished? bool :generation g}`
    - `{:type :socket-finish :side (:client|:backend) :generation g}`
+   - `{:type :drain-progress :side (:client|:backend) :elapsed-ms n :generation g}`
    - `{:type :socket-error :side (:client|:backend) :detail str :generation g}`
    - `{:type :drain-timeout :side (:client|:backend) :generation g}`"
   [st event]
   (let [st (merge (init-passthrough-pair) st)
         curr-gen (long (:generation st 1))
+        pair-id (:pair-id st)
         ev-gen (:generation event)
         stale? (and (some? ev-gen) (< (long ev-gen) curr-gen))]
     (if stale?
@@ -809,7 +854,12 @@
             peer-ck (side-closed-key peer)
             side-fk (side-finished-key side)
             peer-fk (side-finished-key peer)
-            clear-effs (if (:drain-timer-active? st) [{:effect :clear-drain-timeout}] [])]
+            cancel-eff {:effect :cancel-drain-timeout
+                        :pair-id pair-id
+                        :generation curr-gen}
+            clear-effs (if (:drain-timer-active? st)
+                         [cancel-eff {:effect :clear-drain-timeout :pair-id pair-id :generation curr-gen}]
+                         [])]
         (case (:type event)
           :socket-finish
           (let [st1 (assoc st side-fk true)]
@@ -833,21 +883,46 @@
               [(assoc st1 :phase :closed :drain-timer-active? false)
                clear-effs]
 
-              (or (boolean (:had-error? event)) peer-fin?)
+              (boolean (:had-error? event))
               [(assoc st1
                       :phase :closed
                       peer-ck true
                       :drain-timer-active? false)
                (conj clear-effs {:effect :destroy-socket :side peer})]
 
+              ;; BIP-021 §2.6.1: clean close (even when peer-fin? is true!) routes through :draining
+              ;; so in-flight TLS close_notify / final bytes flush cleanly without premature TCP RST.
               :else
               [(assoc st1
                       :phase :draining
                       :drain-timer-active? true)
                [{:effect :end-socket :side peer}
                 {:effect :schedule-drain-timeout
+                 :pair-id pair-id
                  :side peer
-                 :timeout-ms (:drain-timeout-ms st1)}]]))
+                 :timeout-ms (:drain-timeout-ms st1)
+                 :generation curr-gen}]]))
+
+          :drain-progress
+          (if (and (= :draining (:phase st)) (not (get st side-ck)))
+            (let [elapsed (long (or (:elapsed-ms event) 0))
+                  hard-cap (long (:max-drain-ms st max-passthrough-drain-ms))]
+              (if (> elapsed hard-cap)
+                [(assoc st
+                        :phase :closed
+                        side-ck true
+                        :drain-timer-active? false)
+                 [cancel-eff
+                  {:effect :diagnose :reason :passthrough-drain-timeout :side side :elapsed-ms elapsed}
+                  {:effect :destroy-socket :side side}]]
+                [(assoc st :drain-timer-active? true)
+                 [cancel-eff
+                  {:effect :schedule-drain-timeout
+                   :pair-id pair-id
+                   :side side
+                   :timeout-ms (:drain-timeout-ms st)
+                   :generation curr-gen}]]))
+            [st []])
 
           :socket-error
           (let [reason (if (= side :client)
@@ -857,7 +932,7 @@
                        (:detail event) (assoc :detail (:detail event)))
                 already-closed? (= :closed (:phase st))
                 effs (cond-> [diag]
-                       (:drain-timer-active? st) (conj {:effect :clear-drain-timeout})
+                       (:drain-timer-active? st) (into clear-effs)
                        (not (get st peer-ck)) (conj {:effect :destroy-socket :side peer})
                        (and (not already-closed?) (not (get st side-ck))) (conj {:effect :destroy-socket :side side}))]
             [(assoc st
@@ -873,7 +948,8 @@
                     :phase :closed
                     side-ck true
                     :drain-timer-active? false)
-             [{:effect :diagnose :reason :passthrough-drain-timeout :side side}
+             [cancel-eff
+              {:effect :diagnose :reason :passthrough-drain-timeout :side side}
               {:effect :destroy-socket :side side}]]
             [(assoc st :drain-timer-active? false) []])
 

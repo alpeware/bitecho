@@ -269,23 +269,42 @@
              :effects []})
 
           :else
-          (let [target-state (if (map? (:light-state state)) (:light-state state) state)
-                res (light-core/handle-command target-state cmd-map privkey-bytes)
-                raw-resp (:response res)
+          (let [has-light? (map? (:light-state state))
+                base-target (if has-light? (:light-state state) state)
                 mesh-diag (when (map? (:mesh-conns state))
                             (browser/summarize-mesh-diagnostics (:mesh-conns state)))
-                enriched-resp (if (and (= (get cmd-map "cmd") "status") mesh-diag)
+                status-cmd? (= (get cmd-map "cmd") "status")
+                target-state (if (and has-light? status-cmd?)
+                               (let [open-peers (long (or (count (:open-peers mesh-diag))
+                                                          (:mesh-open-peers state)
+                                                          0))
+                                     conn-err (or (:last-error mesh-diag)
+                                                  (get-in state [:conn :last-error])
+                                                  (:connection-error state))
+                                     relay-active? (boolean (or (:relay-fallback-healthy? state)
+                                                                (:relay-fallback-active? state)))]
+                                 (browser/project-light-state-liveness
+                                  base-target
+                                  {:mesh-open-peers open-peers
+                                   :relay-fallback-active? relay-active?
+                                   :connection-error conn-err}))
+                               base-target)
+                res (light-core/handle-command target-state cmd-map privkey-bytes)
+                raw-resp (:response res)
+                enriched-resp (if (and status-cmd? mesh-diag)
                                 (assoc raw-resp
                                        "mesh_diagnostics" mesh-diag
                                        "connected_nodes" (:open-peers mesh-diag)
                                        "closed_nodes" (:closed-peers mesh-diag)
                                        "degraded" (:degraded? mesh-diag))
                                 raw-resp)
-                updated-state (if (map? (:light-state state))
+                ;; Rule 4: never persist projected liveness back into :light-state
+                next-light (if status-cmd? base-target (:state res))
+                updated-state (if has-light?
                                 (-> state
-                                    (assoc :light-state (:state res))
-                                    (assoc :sessions (:sessions (:state res))))
-                                (:state res))]
+                                    (assoc :light-state next-light)
+                                    (assoc :sessions (:sessions next-light)))
+                                next-light)]
             {:ok? (boolean (get enriched-resp "ok" true))
              :verb verb
              :state updated-state

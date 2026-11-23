@@ -34,6 +34,7 @@
             [bitecho.d45-bip018-hardening-and-failover-test]
             [bitecho.d46-bip019-fepoch1-test]
             [bitecho.d47-bip020-delivery-telemetry-test]
+            [bitecho.d48-bip021-subnet-session-updater-test]
             [bitecho.e2e.d29-remediation-scenario-test]
             [bitecho.economy.account-fuzz-test]
             [bitecho.economy.account-test]

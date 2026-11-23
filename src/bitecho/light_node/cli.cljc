@@ -221,6 +221,7 @@
 (def known-command-flags
   "Inventory of all supported CLI flags across Bitecho shells (Rule 6)."
   ["--state-dir" "--control-port" "--bootstrap" "--relay-url" "--relay-urls" "--quorum" "--subnet-id" "--subnet"
+   "--reset-network-state"
    "--subscribe-subnets" "--subnets" "--transport" "--proxy" "--timeout-ms" "--max-epoch-skew"
    "--cmd-file" "--events-out" "--session-id" "--session" "--min-seq" "--min-broadcast-seq"
    "--cursor" "--after-ts" "--min-balance" "--non-destructive"
@@ -233,7 +234,7 @@
    "--invariant-diff-edn" "--jurisdiction-map" "--human-anchor-sunset" "--bip-cid"
    "--path" "--cid" "--file" "--hex" "--seq" "--authority" "--prefix" "--endpoint" "--candidates"
    "--nickname" "--name" "--domain"
-   "--pin-version" "--auto-update-pointer" "--auto-update-interval-ms"
+   "--pin-version" "--auto-update-pointer" "--auto-update-interval-ms" "--trusted-deploy-authorities"
    "--node-role" "--retention-max-entries" "--retention-max-bytes" "--rotate-every"
    "--grace-epochs" "--lkg-cid" "--walk-depth-cap" "--owner-pubkey" "--cache-incentive"
    "--chunk-size" "--concurrency" "--resume-dir" "--max-bytes"

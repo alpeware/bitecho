@@ -4,7 +4,8 @@
    (`bitecho.main`), delegating all pointer verification, monotonic version checks,
    SHA-256 == CID checks, pin-version opt-out, stale-generation guards, and LKG rollback
    decisions to pure `.cljc` `bitecho.deploy.core/reduce-light-update-tick`."
-  (:require [bitecho.deploy.core :as deploy]
+  (:require [bitecho.config :as config]
+            [bitecho.deploy.core :as deploy]
             [clojure.edn :as edn]
             [clojure.string :as str])
   (:import [java.net URI]
@@ -67,7 +68,8 @@
    `deploy/reduce-light-update-tick` (`:artifact-role :jvm-jar`).
    Returns a zero-arg stop function, or nil when `pointer-url` is blank."
   [{:keys [node-id pointer-url poll-interval-ms current-version pinned-version
-           trusted-deploy-authorities last-applied-seq on-event stop-node-fn!]}]
+           trusted-deploy-authorities last-applied-seq on-event stop-node-fn!
+           mesh-connected-fn mesh-chunk-fetch-fn]}]
   (when (and (string? pointer-url) (not (str/blank? pointer-url)))
     (let [jar-path (current-jar-path)
           cur-cid (file-sha256-hex jar-path)
@@ -75,12 +77,15 @@
           client (-> (HttpClient/newBuilder)
                      (.connectTimeout (Duration/ofSeconds 10))
                      (.build))
+          eff-trusted (if (some? trusted-deploy-authorities)
+                        (set trusted-deploy-authorities)
+                        #{config/infra-cold-root-pubkey})
           updater-atom (atom (deploy/init-light-updater-state
                               (cond-> {:node-id (or node-id "jvm-node")
                                        :artifact-role :jvm-jar
                                        :current-version (or current-version "0.23.22")
                                        :current-cid cur-cid
-                                       :trusted-deploy-authorities trusted-deploy-authorities
+                                       :trusted-deploy-authorities eff-trusted
                                        :pinned-version pinned-version
                                        :poll-interval-ms poll-ms}
                                 (some? last-applied-seq) (assoc :last-applied-seq (long last-applied-seq)))))
@@ -104,9 +109,33 @@
                       (let [txt (String. ^bytes (:bytes res) StandardCharsets/UTF_8)
                             ptr (try (edn/read-string txt) (catch Exception _ nil))]
                         (if (map? ptr)
-                          (dispatch! {:type :pointer-seen :pointer ptr :generation gen})
+                          (dispatch! {:type :pointer-seen
+                                      :pointer ptr
+                                      :mesh-connected? (boolean (and mesh-connected-fn (mesh-connected-fn)))
+                                      :generation gen})
                           (emit! {"event" "auto-update-diagnose" "reason" "malformed-pointer-edn"})))
                       (emit! {"event" "auto-update-diagnose" "reason" "fetch-pointer-failed" "error" (:error res)})))
+
+                  :fetch-bundle-mesh-chunks
+                  (let [gen (:generation eff)
+                        cid (:cid eff)]
+                    (if (fn? mesh-chunk-fetch-fn)
+                      (let [mres (try
+                                   (mesh-chunk-fetch-fn cid eff)
+                                   (catch Exception e
+                                     {:ok? false :reason (.getMessage e)}))]
+                        (if (and (:ok? mres) (bytes? (:bytes mres)))
+                          (do
+                            (reset! staged-bytes-atom (:bytes mres))
+                            (dispatch! {:type :blob-fetched :cid cid :bytes (:bytes mres) :generation gen}))
+                          (dispatch! {:type :mesh-fetch-failed
+                                      :cid cid
+                                      :reason (or (:reason mres) (:error mres) :mesh-chunk-fetch-failed)
+                                      :generation gen})))
+                      (dispatch! {:type :mesh-fetch-failed
+                                  :cid cid
+                                  :reason :mesh-chunk-unavailable-jvm
+                                  :generation gen})))
 
                   :fetch-bundle-blob
                   (let [gen (:generation eff)
@@ -117,7 +146,9 @@
                       (do
                         (reset! staged-bytes-atom (:bytes res))
                         (dispatch! {:type :blob-fetched :cid cid :bytes (:bytes res) :generation gen}))
-                      (emit! {"event" "auto-update-diagnose" "reason" "fetch-bundle-blob-failed" "cid" cid "error" (:error res)})))
+                      (do
+                        (emit! {"event" "auto-update-diagnose" "reason" "fetch-bundle-blob-failed" "cid" cid "error" (:error res)})
+                        (dispatch! {:type :blob-fetch-failed :cid cid :reason (:error res) :generation gen}))))
 
                   :stage-light-bundle
                   (when (and jar-path @staged-bytes-atom)

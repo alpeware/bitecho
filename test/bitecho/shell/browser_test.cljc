@@ -520,7 +520,16 @@
             "blob-hot-evicted" "max-pinned-app-bytes" "max-hot-blob-bytes"
             "pinned-app-bytes" "pinned-app-cap-exceeded" "blob-stored-cold"
             ;; v0.23.22 client hotfix diagnostic keys
-            "subnet-id-startup-override" "ctl-socket-error"}
+            "subnet-id-startup-override" "ctl-socket-error"
+            ;; BIP-021 non-liveness persisted keys
+            "rekey-required?" "rekey-required" "reoffer-recommended?" "reoffer-recommended"
+            "tx-tainted?" "tx-tainted" "auto-sync-last-error" "rx-ciphertext-hashes" "ciphertext-sha256"
+            "subnet-id-reconciled" "cross-network-subnet-switch-blocked"
+            "broadcast-malformed" "broadcast-sig-invalid" "broadcast-dac-missing" "broadcast-dac-invalid"
+            "broadcast-sig-invalid-queue-throttled" "dac-required-missing"
+            "session-replay-detected" "session-stale-seq-detected" "session-rx-gap-detected"
+            "session-tx-seq-rollback-detected" "session-tx-seq-rollback-evicted" "session-ack-invalid"
+            "rollback-collision" "auto-update-mesh-fallback" "update-poll-suppressed"}
           test-map (into {}
                          (concat (map (fn [k] [k "SENSITIVE"]) all-forbidden-keys)
                                  (map (fn [k] [k "UNLISTED"]) unlisted-keys)

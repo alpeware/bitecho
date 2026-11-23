@@ -93,7 +93,7 @@
           [st3 effs3] (deploy/reduce-light-update-tick st2 {:type :health-check-result :healthy? false :generation (:generation st2)})]
       (is (= :watching (:phase st-pin')))
       (is (= :pinned (get-in (first effs-pin) [:record :data :transition])))
-      (is (= :fetching (:phase st1)))
+      (is (= :fetching-https (:phase st1)))
       (is (some #(= :fetch-bundle-blob (:effect %)) effs1))
       (is (= 1 (:dropped st-stale)))
       (is (= :stale-generation-callback (:reason (first effs-stale))))
@@ -101,7 +101,9 @@
       (is (some #(= :light-update-hash-mismatch (:reason %)) effs-bad))
       (is (= :health-checking (:phase st2)))
       (is (some #(= :atomic-swap-and-restart-light-node (:effect %)) effs2))
-      (is (= :rolled-back (:phase st3)))
+      (is (= :watching (:phase st3)))
+      (is (= 1 (:rollback-count st3)))
+      (is (contains? (:quarantined-cids st3) good-cid))
       (is (= "0.23.17" (:current-version st3)))
       (is (some #(= :restore-lkg-light-bundle (:effect %)) effs3))))
   (testing "S-D40-1: Node.js light node and full/infra node wire deploy/reduce-light-update-tick"
@@ -152,7 +154,7 @@
           [st-down effs-down] (deploy/reduce-light-update-tick st0 {:type :pointer-seen :pointer ptr-lower-seq :generation 1})]
       (is (= :watching (:phase st-noop)))
       (is (empty? effs-noop))
-      (is (= :fetching (:phase st-hotfix)))
+      (is (= :fetching-https (:phase st-hotfix)))
       (is (some #(= :fetch-bundle-blob (:effect %)) effs-hotfix))
       (is (= :watching (:phase st-down)))
       (is (some #(= :light-update-non-monotonic-seq (:reason %)) effs-down)))))

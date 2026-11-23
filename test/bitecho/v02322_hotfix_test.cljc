@@ -89,14 +89,14 @@
                               (= trimmed (:subnet-id st1))
                               (= trimmed (get resp "subnet_id"))
                               (contains? (:subscribed-subnets st1) trimmed)
-                              (= 1 (get-in st1 [:diagnostics :subnet-id-startup-override]))
+                              (= 1 (get-in st1 [:diagnostics :subnet-id-reconciled]))
                               (some #(and (= :diagnose (:effect %))
-                                          (= :subnet-id-startup-override (:reason %)))
+                                          (= :subnet-id-reconciled (:reason %)))
                                     (:effects res)))
                          (and (false? (:reconciled? res))
                               (= persisted-sub (:subnet-id st1))
                               (= persisted-sub (get resp "subnet_id"))
-                              (zero? (long (or (get-in st1 [:diagnostics :subnet-id-startup-override]) 0)))
+                              (zero? (long (or (get-in st1 [:diagnostics :subnet-id-reconciled]) 0)))
                               (empty? (:effects res))))))))
 
 ;; =============================================================================
@@ -208,7 +208,7 @@
 
         ;; Higher :seq + distinct 64-char CID -> triggers update REGARDLESS of semver!
                     :else
-                    (and (= :fetching (:phase st1))
+                    (and (= :fetching-https (:phase st1))
                          (some #(and (= :fetch-bundle-blob (:effect %))
                                      (= new-cid (:cid %)))
                                effs1))))))
@@ -232,7 +232,7 @@
                                             :code-target-cid new-cid})
           [st-up effs-up] (deploy/reduce-light-update-tick st0 {:type :pointer-seen :pointer ptr-up :generation 1})
           [st-down effs-down] (deploy/reduce-light-update-tick st0 {:type :pointer-seen :pointer ptr-down :generation 1})]
-      (is (= :fetching (:phase st-up)))
+      (is (= :fetching-https (:phase st-up)))
       (is (some #(= :fetch-bundle-blob (:effect %)) effs-up))
       (is (= :watching (:phase st-down)))
       (is (some #(= :light-update-non-monotonic-version (:reason %)) effs-down)))))

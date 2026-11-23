@@ -385,13 +385,14 @@
 (def eviction-reasons
   "Closed enum of Pillar 2 outbox eviction reasons."
   #{:retries-exhausted :epoch-skew :session-not-open
-    :mesh-disconnected :capacity-overflow :expired})
+    :mesh-disconnected :capacity-overflow :expired :rollback-collision})
 
 (def suppression-reasons
   "Closed enum of Pillar 3 receiver/watcher received_but_not_emitted suppression reasons."
   #{:cursor-skip :subnet-mismatch :session-mismatch :event-type-mismatch
     :min-seq-filter :min-broadcast-seq-filter :after-ts-filter
-    :duplicate-replay :queue-overflow :foreign-unicast :watcher-closed :admission-drop})
+    :duplicate-replay :queue-overflow :foreign-unicast :watcher-closed :admission-drop
+    :broadcast-malformed :broadcast-sig-invalid :dac-required-missing :broadcast-dac-invalid})
 
 (def initial-delivery-telemetry
   "Initial pure Sans-IO Pillar 1-3 delivery telemetry structure."
@@ -403,7 +404,8 @@
                        :session-not-open 0
                        :mesh-disconnected 0
                        :capacity-overflow 0
-                       :expired 0}
+                       :expired 0
+                       :rollback-collision 0}
    :received-but-not-emitted {:cursor-skip 0
                               :subnet-mismatch 0
                               :session-mismatch 0
@@ -415,7 +417,11 @@
                               :queue-overflow 0
                               :foreign-unicast 0
                               :watcher-closed 0
-                              :admission-drop 0}
+                              :admission-drop 0
+                              :broadcast-malformed 0
+                              :broadcast-sig-invalid 0
+                              :dac-required-missing 0
+                              :broadcast-dac-invalid 0}
    :fanout {:mesh-submitted 0
             :p2p-direct 0
             :peers-targeted 0
@@ -525,20 +531,37 @@
       expected-subnet (conj expected-subnet)
       (config/equivalent-subnet-id? "global" expected-subnet active-net-uri) (conj "global"))))
 
+(def ^:private canonical-network-uri-set
+  (set (vals config/network-uris)))
+
+(defn- canonical-network-uri-for-subnet
+  "Resolves canonical network URI strictly against `(vals config/network-uris)` (BIP-021 §2.1).
+   Returns nil if `subnet-id` does not explicitly name a canonical network URI."
+  [subnet-id]
+  (when (and (string? subnet-id) (not (str/blank? subnet-id)))
+    (let [s (str/trim subnet-id)]
+      (cond
+        (contains? canonical-network-uri-set s) s
+        :else (some (fn [net-uri]
+                      (when (str/starts-with? s (str net-uri "/"))
+                        net-uri))
+                    canonical-network-uri-set)))))
+
 (declare enqueue-actionable-events)
 
 (defn reconcile-startup-subnet-id
-  "Pure Sans-IO startup `--subnet-id` authority reconciler (`v0.23.22` / `Rule 2`, `Rule 5`).
+  "Pure Sans-IO startup `subnet_id` reconciler (BIP-021 §2.1).
    - Preserves persisted `:subnet-id` with 0 spurious diagnostics when `explicit-subnet-id` is nil/blank or equal.
-   - When `explicit-subnet-id` differs from persisted `:subnet-id`, overrides `:subnet-id`, merges
-     `explicit-subscribe-subnets` and the new `:subnet-id` into `:subscribed-subnets`, increments
-     `[:diagnostics :subnet-id-startup-override]`, emits a counted Rule 5 `:diagnose` effect
-     (`:subnet-id-startup-override`), and emits a `subnet-id-startup-override` event."
+   - Refuses silent cross-network-URI switches (`devnet` <-> `testnet` <-> `mainnet`) with counted
+     `[:diagnostics :cross-network-subnet-switch-blocked]` unless `:reset-network-state?` is true.
+   - Within the same canonical network (or with `:reset-network-state? true`), updates `:subnet-id`,
+     merges `explicit-subscribe-subnets` and the new `:subnet-id` into `:subscribed-subnets`,
+     increments `[:diagnostics :subnet-id-reconciled]`, and emits a `subnet-id-reconciled` event."
   ([state explicit-subnet-id]
    (reconcile-startup-subnet-id state explicit-subnet-id nil nil))
   ([state explicit-subnet-id explicit-subscribe-subnets]
    (reconcile-startup-subnet-id state explicit-subnet-id explicit-subscribe-subnets nil))
-  ([state explicit-subnet-id explicit-subscribe-subnets _opts]
+  ([state explicit-subnet-id explicit-subscribe-subnets opts]
    (let [persisted-sub (str (or (:subnet-id state) "global"))
          trimmed-explicit (when (and (some? explicit-subnet-id)
                                      (not (str/blank? (str explicit-subnet-id))))
@@ -554,27 +577,62 @@
      (if (or (nil? trimmed-explicit) (= trimmed-explicit persisted-sub))
        {:ok? true
         :reconciled? false
+        :blocked? false
         :state (assoc state :subscribed-subnets merged-subs)
         :effects []
         :stdout-events []}
-       (let [evt {"event" "subnet-id-startup-override"
-                  "from" persisted-sub
-                  "to" trimmed-explicit}
-             diag {:effect :diagnose
-                   :type :diagnose
-                   :reason :subnet-id-startup-override
-                   :from persisted-sub
-                   :to trimmed-explicit}
-             st0 (-> state
-                     (assoc :subnet-id trimmed-explicit
-                            :subscribed-subnets (conj merged-subs trimmed-explicit))
-                     (update-in [:diagnostics :subnet-id-startup-override] (fnil inc 0)))
-             st1 (enqueue-actionable-events st0 [evt])]
-         {:ok? true
-          :reconciled? true
-          :state st1
-          :effects [diag]
-          :stdout-events [evt]})))))
+       (let [old-net (or (canonical-network-uri-for-subnet (:network-uri state))
+                         (canonical-network-uri-for-subnet persisted-sub)
+                         "devnet.bitecho.org")
+             new-net (or (canonical-network-uri-for-subnet trimmed-explicit)
+                         old-net)
+             cross-net? (not= old-net new-net)
+             reset? (boolean (:reset-network-state? opts))]
+         (if (and cross-net? (not reset?))
+           (let [diag {:effect :diagnose
+                       :type :diagnose
+                       :reason :cross-network-subnet-switch-blocked
+                       :from old-net
+                       :to new-net
+                       :from-subnet persisted-sub
+                       :to-subnet trimmed-explicit}
+                 st' (update-in state [:diagnostics :cross-network-subnet-switch-blocked] (fnil inc 0))]
+             {:ok? false
+              :reconciled? false
+              :blocked? true
+              :error :cross-network-subnet-switch-blocked
+              :state st'
+              :effects [diag]
+              :stdout-events []})
+           (let [evt (cond-> {"event" "subnet-id-reconciled"
+                              "from" persisted-sub
+                              "to" trimmed-explicit}
+                       reset? (assoc "reset_network_state" true))
+                 diag {:effect :diagnose
+                       :type :diagnose
+                       :reason :subnet-id-reconciled
+                       :from persisted-sub
+                       :to trimmed-explicit}
+                 st0 (-> state
+                         (assoc :subnet-id trimmed-explicit
+                                :subscribed-subnets (conj merged-subs trimmed-explicit))
+                         (cond-> cross-net?
+                           (assoc :network-uri new-net))
+                         (cond-> (and cross-net? reset?)
+                           (assoc :account nil
+                                  :chain-state-snapshots {}
+                                  :sessions {}
+                                  :pending-offers {}
+                                  :relay-since-broadcast-seq 0
+                                  :relay-cursors {}))
+                         (update-in [:diagnostics :subnet-id-reconciled] (fnil inc 0)))
+                 st1 (enqueue-actionable-events st0 [evt])]
+             {:ok? true
+              :reconciled? true
+              :blocked? false
+              :state st1
+              :effects [diag]
+              :stdout-events [evt]})))))))
 
 (defn effective-signaling-burn-floor
   "Computes the effective signaling burn floor for P2P signaling envelopes.
@@ -2266,7 +2324,7 @@
                                                             :required-scope "offer"}))
                                    d))
                     suites (or (:crypto-suites state) sealed/default-crypto-suites)
-                    sub-id (str (or (:subnet-id state) "global"))
+                    sub-id (str (or (get cmd-map "subnet_id") (get cmd-map "subnet-id") (:subnet-id cmd-map) (:subnet-id state) "global"))
                     net-uri (or (:network-uri state) (config/resolve-network-uri (:subnet-id state)))
                     offer-hash (compute-offer-hash (cond-> {:session-id session-id
                                                             :caller caller
@@ -2310,6 +2368,7 @@
                                   :session-id session-id}
                     header-env (wrap-agent-event header-event caller privkey-bytes)
                     session-entry {:session-id session-id
+                                   :subnet-id sub-id
                                    :peer callee
                                    :role :initiator
                                    :state "offered"
@@ -2389,7 +2448,7 @@
                         (str session-id "-" eph-pub-hex "|" selected-suite)
                         (str session-id "-" eph-pub-hex))
             sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (fressian/utf8->bytes sig-input)))
-            sub-id (str (or (:subnet-id state) "global"))
+            sub-id (str (or (:subnet-id offer) (:subnet-id state) "global"))
             burn-amt (if (get state :economy-enabled? true) 500 0)
             accept-payload (cond-> {:protocol-version current-wire-version
                                     :wire-format current-wire-format
@@ -2406,6 +2465,7 @@
             outer-sub (if (and (pos? (long burn-amt)) (config/root-subnet-id? sub-id)) "*" sub-id)
             gossip-env (build-gossip-envelope (:pubkey state) privkey-bytes (freeze-payload accept-payload) burn-amt outer-sub)
             session-entry {:session-id session-id
+                           :subnet-id sub-id
                            :peer caller
                            :role :responder
                            :state "open"
@@ -2597,7 +2657,7 @@
             session (get-in state [:sessions session-id])]
         (if-not (and session (= "open" (:state session)))
           {:state state :response {"ok" false "error" "session-not-open"} :net-envelopes [] :stdout-events []}
-          (let [sub-id (str (or (get cmd-map "subnet_id") (get cmd-map "subnet-id") (:subnet-id cmd-map) (:subnet-id state) "global"))
+          (let [sub-id (str (or (get cmd-map "subnet_id") (get cmd-map "subnet-id") (:subnet-id cmd-map) (:subnet-id session) (:subnet-id state) "global"))
                 transport (str (or (get cmd-map "transport") (:transport cmd-map) "udp"))
                 explicit-cands-val (or (get cmd-map "candidates") (:candidates cmd-map)
                                        (get cmd-map "endpoint") (:endpoint cmd-map))
@@ -2753,7 +2813,7 @@
             session (get-in state [:sessions session-id])]
         (if-not (and session (= "open" (:state session)))
           {:state state :response {"ok" false "error" "session-not-open"} :net-envelopes [] :stdout-events []}
-          (let [sub-id (str (or (get cmd-map "subnet_id") (get cmd-map "subnet-id") (:subnet-id cmd-map) (:subnet-id state) "global"))
+          (let [sub-id (str (or (get cmd-map "subnet_id") (get cmd-map "subnet-id") (:subnet-id cmd-map) (:subnet-id session) (:subnet-id state) "global"))
                 transport (str (or (get cmd-map "transport") (:transport cmd-map) (get-in session [:p2p :remote-transport]) "udp"))
                 explicit-cands-val (or (get cmd-map "candidates") (:candidates cmd-map)
                                        (get cmd-map "endpoint") (:endpoint cmd-map))
@@ -3725,7 +3785,8 @@
       :else
       (let [session-id resolved-sid
             session (get-in state [:sessions session-id])]
-        (if-not (and session (= "open" (:state session)))
+        (cond
+          (not (and session (= "open" (:state session))))
           {:ok? false
            :state (record-eviction state :session-not-open {:session-id session-id
                                                             :ts-ms (long (or (parse-long-safe (or (get cmd-map "now_ms") (:now-ms cmd-map)) nil) 0))})
@@ -3733,6 +3794,19 @@
                       "mesh_submitted" false "p2p" false "peers_targeted" 0}
            :net-envelopes []
            :stdout-events []}
+
+          (or (true? (:tx-tainted? session)) (true? (:rekey-required? session)))
+          {:ok? false
+           :state state
+           :response {"ok" false "error" "session-key-tainted-rollback"
+                      "session_id" session-id
+                      "rekey_required" true
+                      "reoffer_recommended" true
+                      "mesh_submitted" false "p2p" false "peers_targeted" 0}
+           :net-envelopes []
+           :stdout-events []}
+
+          :else
           (let [pname (pubkey->petname state (:peer session))
                 text (or (get cmd-map "text") (get cmd-map "message")
                          (:text cmd-map) (:message cmd-map))
@@ -3752,10 +3826,12 @@
                     burn-amt (if p2p-open?
                                0
                                (long (or (get cmd-map "burn") (:burn cmd-map) (if (get state :economy-enabled? true) 500 0))))
-                    sub-id (str (or (get cmd-map "subnet_id") (get cmd-map "subnet-id") (:subnet-id cmd-map) (:subnet-id state) "global"))
+                    sub-id (str (or (get cmd-map "subnet_id") (get cmd-map "subnet-id") (:subnet-id cmd-map) (:subnet-id session) (:subnet-id state) "global"))
                     seq-num (inc (:tx-seq session 0))
                     suite (or (:suite session) sealed/suite-v1-chacha20poly1305)
                     sealed (sealed/seal-message (:tx-key session) seq-num payload-bytes (fressian/utf8->bytes session-id) suite)
+                    ct-hex (basalt/bytes->hex (:ciphertext sealed))
+                    ct-sha256 (crypto/sha256-hex ct-hex)
                     msg-payload {:protocol-version current-wire-version
                                  :wire-format current-wire-format
                                  :subnet-id sub-id
@@ -3767,7 +3843,7 @@
                                  :seq seq-num
                                  :suite suite
                                  :nonce (basalt/bytes->hex (:nonce sealed))
-                                 :ciphertext (basalt/bytes->hex (:ciphertext sealed))}
+                                 :ciphertext ct-hex}
                     raw-gossip-env (build-gossip-envelope (:pubkey state) privkey-bytes (freeze-payload msg-payload) burn-amt sub-id)
                     gossip-env (cond-> raw-gossip-env
                                  p2p-open? (assoc :p2p-direct? true
@@ -3782,6 +3858,7 @@
                     next-order (conj curr-order seq-num)
                     next-outbox (assoc curr-outbox seq-num {:seq seq-num
                                                             :msg-payload msg-payload
+                                                            :ciphertext-sha256 ct-sha256
                                                             :burn burn-amt
                                                             :gossip-env gossip-env
                                                             :sent-at-ms sent-at
@@ -4980,12 +5057,16 @@
                                           transport (or (:transport p2p) (:remote-transport p2p) (get-in s [:p2p-meta :preferred-transport]) "mesh")]]
                                 {"session_id" sid
                                  "peer" (:peer s)
+                                 "subnet_id" (or (:subnet-id s) (:subnet-id state) "global")
                                  "status" (:state s)
                                  "p2p_connected" connected?
                                  "p2p_transport" transport
                                  "acked_seq" (long (or (:acked-seq s) 0))
                                  "unacked_count" (count (:outbox s {}))
-                                 "outbox_evicted" (long (or (:outbox-evicted s) 0))}))
+                                 "outbox_evicted" (long (or (:outbox-evicted s) 0))
+                                 "tx_tainted" (boolean (:tx-tainted? s false))
+                                 "rekey_required" (boolean (:rekey-required? s false))
+                                 "reoffer_recommended" (boolean (:reoffer-recommended? s false))}))
          stalled? (boolean (get-in state [:auto-sync-stall-tracker :stalled?] false))
          stall-duration-ms (long (or (get-in state [:auto-sync-stall-tracker :stall-duration-ms]) 0))
          stalled-count (long (or (get-in state [:diagnostics :finalized-epoch-stalled]) 0))
@@ -5020,8 +5101,12 @@
                        "stalled" stalled?
                        "stall_duration_ms" stall-duration-ms
                        "finalized_epoch_stalled_count" stalled-count
-                       "transport_healthy" (and (boolean (:connected? state false))
-                                                (nil? (:connection-error state)))
+                       "transport_healthy" (if (contains? state :transport-healthy?)
+                                             (boolean (:transport-healthy? state))
+                                             (and (boolean (:connected? state false))
+                                                  (nil? (:connection-error state))))
+                       "mesh_open_peers" (long (or (:mesh-open-peers state) 0))
+                       "relay_fallback_active" (boolean (:relay-fallback-active? state false))
                        "pubkey" (:pubkey state)
                        "subnet_id" (or (:subnet-id state) "global")
                        "subscribed_subnets" (vec (sort (or (:subscribed-subnets state) #{})))
@@ -5097,6 +5182,10 @@
     "artifact-revoked"
     "governance-replicated"
     "broadcast-received"
+    "broadcast-rejected"
+    "subnet-id-reconciled"
+    "session-replay-detected"
+    "session-seq-mismatch"
     "transfer-received"
     "capability-published"})
 
@@ -5105,28 +5194,40 @@
     (let [ev-name (or (get ev "event") (:event ev))]
       (contains? actionable-event-types ev-name))))
 
+(defn- unauthenticated-sig-invalid-event? [ev]
+  (and (map? ev)
+       (= "broadcast-rejected" (or (get ev "event") (:event ev)))
+       (= "broadcast-sig-invalid" (or (get ev "reason") (:reason ev)))))
+
 (defn- tag-and-enqueue-event [state ev]
   (if (actionable-event? ev)
-    (let [next-id (inc (long (or (:last-event-id state) 0)))
-          tagged (cond-> ev
-                   (map? ev) (assoc "event_id" next-id :event-id next-id))
-          max-q (long (or (:max-event-queue-size state) 256))
-          q (conj (vec (or (:event-queue state) [])) tagged)
-          overflow? (> (count q) max-q)
-          dropped (if overflow? (- (count q) max-q) 0)
-          trimmed-q (if overflow? (subvec q dropped) q)
-          hist0 (conj (vec (or (:event-history state) [])) tagged)
-          trimmed-hist (if (> (count hist0) max-q)
-                         (subvec hist0 (- (count hist0) max-q))
-                         hist0)]
-      (-> state
-          (assoc :last-event-id next-id)
-          (assoc :event-queue trimmed-q)
-          (assoc :event-history trimmed-hist)
-          (cond-> overflow?
-            (-> (update-in [:diagnostics :event-queue-overflow] (fnil + 0) dropped)
-                (update-in [:diagnostics :dropped] (fnil + 0) dropped)
-                (record-suppression :queue-overflow dropped)))))
+    (let [cur-q (vec (or (:event-queue state) []))
+          ;; BIP-021 §2.3: isolate/rate-limit unauthenticated broadcast-sig-invalid events
+          ;; so floods cannot evict real messages from the 256-entry :event-queue.
+          sig-flood-suppressed? (and (unauthenticated-sig-invalid-event? ev)
+                                     (>= (count (filter unauthenticated-sig-invalid-event? cur-q)) 16))]
+      (if sig-flood-suppressed?
+        (update-in state [:diagnostics :broadcast-sig-invalid-queue-throttled] (fnil inc 0))
+        (let [next-id (inc (long (or (:last-event-id state) 0)))
+              tagged (cond-> ev
+                       (map? ev) (assoc "event_id" next-id :event-id next-id))
+              max-q (long (or (:max-event-queue-size state) 256))
+              q (conj cur-q tagged)
+              overflow? (> (count q) max-q)
+              dropped (if overflow? (- (count q) max-q) 0)
+              trimmed-q (if overflow? (subvec q dropped) q)
+              hist0 (conj (vec (or (:event-history state) [])) tagged)
+              trimmed-hist (if (> (count hist0) max-q)
+                             (subvec hist0 (- (count hist0) max-q))
+                             hist0)]
+          (-> state
+              (assoc :last-event-id next-id)
+              (assoc :event-queue trimmed-q)
+              (assoc :event-history trimmed-hist)
+              (cond-> overflow?
+                (-> (update-in [:diagnostics :event-queue-overflow] (fnil + 0) dropped)
+                    (update-in [:diagnostics :dropped] (fnil + 0) dropped)
+                    (record-suppression :queue-overflow dropped)))))))
     state))
 
 (defn enqueue-actionable-events
@@ -7464,7 +7565,7 @@
                      (and wire-dac (not (:ok? dac-check))))
                {:state state :net-envelopes [] :stdout-events []}
                (let [sid (:session-id msg)
-                     clean-offer (cond-> (select-keys msg [:bitecho/type :session-id :caller :callee :caller-ephemeral-pub :epoch :price :home-node :offer-hash :burn :signature :crypto-suites :network-uri])
+                     clean-offer (cond-> (select-keys msg [:bitecho/type :session-id :subnet-id :caller :callee :caller-ephemeral-pub :epoch :price :home-node :offer-hash :burn :signature :crypto-suites :network-uri])
                                    selected-suite (assoc :selected-suite selected-suite)
                                    (and wire-dac (:ok? dac-check)) (assoc :dac (:dac dac-check)))]
                  (cond
@@ -7600,36 +7701,76 @@
           (and (pos? horizon) (<= next-seq horizon)) (recur next-seq)
           :else curr)))))
 
+(def ^:private max-safe-js-seq 9007199254740991)
+
+(defn- ack-has-rollback-fields? [m]
+  (or (contains? m :replay-rejected?)
+      (contains? m :rejected-seq)
+      (contains? m :peer-high-seq)
+      (contains? m :accepted-ciphertext-sha256)))
+
+(defn- compute-ack-sign-bytes
+  "Computes canonical bytes signed in `:session-ack`.
+   BIP-021 §2.4: when ANY rollback field is present, binds all rollback fields with
+   ZERO legacy-signature fallback."
+  [session-id contiguous-ack-seq msg-seq seen-vec rollback-opts]
+  (let [base (str "ack-" session-id "-" contiguous-ack-seq "-" msg-seq "-" (str/join "," seen-vec))]
+    (if (ack-has-rollback-fields? (or rollback-opts {}))
+      (fressian/utf8->bytes
+       (str base "|rb:"
+            (boolean (:replay-rejected? rollback-opts)) ":"
+            (or (:rejected-seq rollback-opts) "") ":"
+            (or (:peer-high-seq rollback-opts) "") ":"
+            (or (:accepted-ciphertext-sha256 rollback-opts) "")))
+      (fressian/utf8->bytes base))))
+
 (defn build-session-ack-envelope
   "Builds and signs a :session-ack envelope wrapping Ed25519 signature."
   ([state session-id peer-pub contiguous-ack-seq msg-seq privkey-bytes]
-   (build-session-ack-envelope state session-id peer-pub contiguous-ack-seq msg-seq nil privkey-bytes))
+   (build-session-ack-envelope state session-id peer-pub contiguous-ack-seq msg-seq nil privkey-bytes nil))
   ([state session-id peer-pub contiguous-ack-seq msg-seq seen-seqs privkey-bytes]
+   (build-session-ack-envelope state session-id peer-pub contiguous-ack-seq msg-seq seen-seqs privkey-bytes nil))
+  ([state session-id peer-pub contiguous-ack-seq msg-seq seen-seqs privkey-bytes rollback-opts]
    (when privkey-bytes
      (let [seen-vec (vec (sort (or seen-seqs [])))
-           ack-sign-bytes (fressian/utf8->bytes (str "ack-" session-id "-" contiguous-ack-seq "-" msg-seq "-" (str/join "," seen-vec)))
+           ack-sign-bytes (compute-ack-sign-bytes session-id contiguous-ack-seq msg-seq seen-vec rollback-opts)
            sig (crypto/sign privkey-bytes ack-sign-bytes)
            sig-hex (if (string? sig) sig (basalt/bytes->hex sig))
-           p2p-open? (true? (get-in state [:sessions session-id :p2p :connected?]))
+           sess (get-in state [:sessions session-id])
+           p2p-open? (true? (get-in sess [:p2p :connected?]))
            burn-amt (if p2p-open? 0 100)
-           ack-payload {:protocol-version current-wire-version
-                        :wire-format current-wire-format
-                        :subnet-id (str (or (:subnet-id state) "global"))
-                        :bitecho/type :session-ack
-                        :session-id session-id
-                        :sender (:pubkey state)
-                        :recipient peer-pub
-                        :epoch (effective-session-wire-epoch state (get-in state [:sessions session-id]))
-                        :ack-seq contiguous-ack-seq
-                        :acked-seq msg-seq
-                        :seen-seqs seen-vec
-                        :signature sig-hex}
-           outer-sub (if (pos? burn-amt) "*" (str (or (:subnet-id state) "global")))
+           sub-id (str (or (:subnet-id sess) (:subnet-id state) "global"))
+           ack-payload (cond-> {:protocol-version current-wire-version
+                                :wire-format current-wire-format
+                                :subnet-id sub-id
+                                :bitecho/type :session-ack
+                                :session-id session-id
+                                :sender (:pubkey state)
+                                :recipient peer-pub
+                                :epoch (effective-session-wire-epoch state sess)
+                                :ack-seq contiguous-ack-seq
+                                :acked-seq msg-seq
+                                :seen-seqs seen-vec
+                                :signature sig-hex}
+                         (ack-has-rollback-fields? (or rollback-opts {}))
+                         (merge (select-keys rollback-opts [:replay-rejected? :rejected-seq :peer-high-seq :accepted-ciphertext-sha256])))
+           outer-sub (if (and (pos? burn-amt) (config/root-subnet-id? sub-id)) "*" sub-id)
            raw-env (build-gossip-envelope (:pubkey state) privkey-bytes (freeze-payload ack-payload) burn-amt outer-sub)]
        (cond-> raw-env
          p2p-open? (assoc :p2p-direct? true
                           :p2p-peer (normalize-pubkey-hex peer-pub)
                           :p2p-session-id session-id))))))
+
+(defn- prune-rx-ciphertext-hashes
+  "Retains at most 64 most recent seq -> ciphertext-sha256 entries in the replay window."
+  [hashes highest-seq]
+  (let [horizon (- (long highest-seq) 64)]
+    (reduce-kv (fn [acc k v]
+                 (if (> (long k) horizon)
+                   (assoc acc k v)
+                   acc))
+               {}
+               (or hashes {}))))
 
 (defn- handle-wire-sealed-msg [state msg privkey-bytes]
   (try
@@ -7656,117 +7797,229 @@
                                 (update-in [:diagnostics :early-sealed-message-buffered] (fnil inc 0)))
                             (update-in state [:diagnostics :early-sealed-message-dropped] (fnil inc 0)))]
             {:state new-state :net-envelopes [] :stdout-events []})
-          (let [chk (sealed/check-and-advance-replay-window (:replay-window session) (:seq msg))]
+          (let [msg-seq (long (:seq msg))
+                incoming-ct-sha256 (crypto/sha256-hex (:ciphertext msg))
+                prev-rx-high (long (:rx-high-seq session 0))
+                chk (sealed/check-and-advance-replay-window (:replay-window session) msg-seq)]
             (cond
               (:accepted? chk)
               (let [ct (try (basalt/hex->bytes (:ciphertext msg)) (catch #?(:clj Exception :cljs :default) _ nil))
-                    decrypted (when ct (sealed/open-message (:rx-key session) (:seq msg) ct (fressian/utf8->bytes session-id) (:suite session) (:suite msg)))]
+                    decrypted (when ct (sealed/open-message (:rx-key session) msg-seq ct (fressian/utf8->bytes session-id) (:suite session) (:suite msg)))]
                 (if-not decrypted
                   {:state state :net-envelopes [] :stdout-events []}
-                  (let [new-rx-high-seq (max (long (:rx-high-seq session 0)) (long (:seq msg)))
+                  (let [rx-gap? (> msg-seq (inc prev-rx-high))
+                        new-rx-high-seq (max prev-rx-high msg-seq)
                         new-contiguous (advance-contiguous-rx-seq (:contiguous-rx-seq session 0)
                                                                   (:seen (:window chk))
                                                                   (:highest-seq (:window chk) 0))
                         seen-seqs (vec (sort (:seen (:window chk))))
-                        ack-env (build-session-ack-envelope state session-id (:sender msg) new-contiguous (:seq msg) seen-seqs privkey-bytes)
+                        ack-env (build-session-ack-envelope state session-id (:sender msg) new-contiguous msg-seq seen-seqs privkey-bytes)
                         text (try (fressian/bytes->utf8 decrypted) (catch #?(:clj Exception :cljs :default) _ nil))
                         sender-pname (pubkey->petname state (:sender msg))
                         inbox-item {:type :direct
                                     :session-id session-id
                                     :session_id session-id
                                     :from (:sender msg)
-                                    :seq (:seq msg)
+                                    :seq msg-seq
                                     :text text
                                     :payload-hex (basalt/bytes->hex decrypted)
                                     :payload_hex (basalt/bytes->hex decrypted)}
+                        next-hashes (-> (or (:rx-ciphertext-hashes session) {})
+                                        (assoc msg-seq incoming-ct-sha256)
+                                        (prune-rx-ciphertext-hashes new-rx-high-seq))
                         updated-sess (assoc session
                                             :replay-window (:window chk)
                                             :rx-high-seq new-rx-high-seq
-                                            :contiguous-rx-seq new-contiguous)
-                        new-state (-> state
-                                      (assoc-in [:sessions session-id] updated-sess)
-                                      (update :inbox append-bounded-inbox inbox-item))
+                                            :contiguous-rx-seq new-contiguous
+                                            :rx-ciphertext-hashes next-hashes)
+                        new-state (cond-> (-> state
+                                              (assoc-in [:sessions session-id] updated-sess)
+                                              (update :inbox append-bounded-inbox inbox-item))
+                                    rx-gap? (update-in [:diagnostics :session-rx-gap-detected] (fnil inc 0)))
                         event (cond-> {"event" "message-received"
                                        "session_id" session-id
                                        "from" (:sender msg)
-                                       "seq" (:seq msg)}
+                                       "seq" msg-seq}
                                 text (assoc "text" text)
                                 sender-pname (assoc "from_petname" sender-pname))]
                     {:state new-state
                      :net-envelopes (if ack-env [ack-env] [])
                      :stdout-events [event]})))
 
-              (= :replayed-seq (:error chk))
-              (let [ct (try (basalt/hex->bytes (:ciphertext msg)) (catch #?(:clj Exception :cljs :default) _ nil))
-                    decrypted (when ct (sealed/open-message (:rx-key session) (:seq msg) ct (fressian/utf8->bytes session-id) (:suite session) (:suite msg)))]
-                (if-not decrypted
-                  {:state (record-suppression state :admission-drop) :net-envelopes [] :stdout-events []}
-                  (let [contig (:contiguous-rx-seq session 0)
-                        seen-seqs (vec (sort (:seen (:replay-window session))))
-                        ack-env (build-session-ack-envelope state session-id (:sender msg) contig (:seq msg) seen-seqs privkey-bytes)
+              (contains? #{:replayed-seq :stale-seq} (:error chk))
+              (let [err-kind (:error chk)
+                    stored-digest (get-in session [:rx-ciphertext-hashes msg-seq])
+                    identical-retransmit? (and (= err-kind :replayed-seq)
+                                               (some? stored-digest)
+                                               (= stored-digest incoming-ct-sha256))
+                    contig (:contiguous-rx-seq session 0)
+                    seen-seqs (vec (sort (:seen (:replay-window session))))]
+                (if identical-retransmit?
+                  ;; Benign duplicate retransmit of identical ciphertext (lost ACK retry)
+                  (let [ack-env (build-session-ack-envelope state session-id (:sender msg) contig msg-seq seen-seqs privkey-bytes)
                         new-state (-> state
                                       (update-in [:sessions session-id :replays-deduped] (fnil inc 0))
                                       (record-suppression :duplicate-replay))]
                     {:state new-state
                      :net-envelopes (if ack-env [ack-env] [])
-                     :stdout-events []})))
+                     :stdout-events []})
+                  ;; BIP-021 §2.4: Rollback / conflicting replay or >= 64 :stale-seq!
+                  ;; Never decrement :rx-high-seq or deliver to :inbox; emit signed rollback ACK.
+                  (let [rollback-opts (cond-> {:replay-rejected? true
+                                               :rejected-seq msg-seq
+                                               :peer-high-seq prev-rx-high}
+                                        stored-digest (assoc :accepted-ciphertext-sha256 stored-digest))
+                        ack-env (build-session-ack-envelope state session-id (:sender msg) contig msg-seq seen-seqs privkey-bytes rollback-opts)
+                        replay-evt {"event" "session-replay-detected"
+                                    "session_id" session-id
+                                    "from" (:sender msg)
+                                    "seq" msg-seq
+                                    "rx_high_seq" prev-rx-high
+                                    "reason" (name err-kind)}
+                        new-state (cond-> (-> state
+                                              (update-in [:sessions session-id :replays-deduped] (fnil inc 0))
+                                              (update-in [:diagnostics :session-replay-detected] (fnil inc 0))
+                                              (record-suppression :duplicate-replay))
+                                    (= err-kind :stale-seq)
+                                    (update-in [:diagnostics :session-stale-seq-detected] (fnil inc 0)))]
+                    {:state new-state
+                     :net-envelopes (if ack-env [ack-env] [])
+                     :stdout-events [replay-evt]})))
 
               :else
               {:state state :net-envelopes [] :stdout-events []})))))
     (catch #?(:clj Exception :cljs :default) _
       {:state state :net-envelopes [] :stdout-events []})))
 
-(defn- handle-wire-session-ack [state msg]
-  (try
-    (if-not (and (map? msg)
-                 (string? (:recipient msg)) (= (normalize-pubkey-hex (:recipient msg)) (normalize-pubkey-hex (:pubkey state)))
-                 (string? (:session-id msg))
-                 (string? (:signature msg))
-                 (integer? (:ack-seq msg))
-                 (integer? (:acked-seq msg))
-                 (coll? (:seen-seqs msg)))
-      {:state state :net-envelopes [] :stdout-events []}
-      (let [session-id (:session-id msg)
-            session (get-in state [:sessions session-id])]
-        (if-not (and session
-                     (= "open" (:state session))
-                     (= (:sender msg) (:peer session)))
-          {:state state :net-envelopes [] :stdout-events []}
-          (let [peer-pub (try (basalt/hex->bytes (:peer session)) (catch #?(:clj Exception :cljs :default) _ nil))
-                sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch #?(:clj Exception :cljs :default) _ nil))
-                ack-seq (long (or (:ack-seq msg) 0))
-                acked-seq (long (or (:acked-seq msg) 0))
-                seen-vec (vec (sort (or (:seen-seqs msg) [])))
-                canonical-bytes (fressian/utf8->bytes (str "ack-" session-id "-" ack-seq "-" acked-seq "-" (str/join "," seen-vec)))
-                valid-sig? (and peer-pub sig-bytes
-                                (crypto/verify peer-pub canonical-bytes sig-bytes))]
-            (if-not valid-sig?
-              {:state state :net-envelopes [] :stdout-events []}
-              (let [new-acked-seq (max (long (:acked-seq session 0)) ack-seq)
-                    curr-outbox (or (:outbox session) {})
-                    curr-order (or (:outbox-order session) [])
-                    seen-set (set (map long seen-vec))
-                    acked? (fn [s] (or (<= (long s) ack-seq) (= (long s) acked-seq) (contains? seen-set (long s))))
-                    purged-outbox (reduce-kv (fn [m s item]
-                                               (if (acked? s)
-                                                 m
-                                                 (assoc m s item)))
-                                             {}
-                                             curr-outbox)
-                    purged-order (filterv #(not (acked? %)) curr-order)
-                    newly-acked (max 0 (- (count curr-outbox) (count purged-outbox)))
-                    updated-sess (assoc session
-                                        :acked-seq new-acked-seq
-                                        :outbox purged-outbox
-                                        :outbox-order purged-order)
-                    new-state (cond-> (assoc-in state [:sessions session-id] updated-sess)
-                                (pos? newly-acked)
-                                (update-in [:delivery-telemetry :acked] (fnil + 0) newly-acked))]
-                {:state new-state
-                 :net-envelopes []
-                 :stdout-events []}))))))
-    (catch #?(:clj Exception :cljs :default) _
-      {:state state :net-envelopes [] :stdout-events []})))
+(defn- handle-wire-session-ack
+  ([state msg]
+   (handle-wire-session-ack state msg nil))
+  ([state msg privkey-bytes]
+   (try
+     (if-not (and (map? msg)
+                  (string? (:recipient msg)) (= (normalize-pubkey-hex (:recipient msg)) (normalize-pubkey-hex (:pubkey state)))
+                  (string? (:session-id msg))
+                  (string? (:signature msg))
+                  (integer? (:ack-seq msg))
+                  (integer? (:acked-seq msg))
+                  (coll? (:seen-seqs msg)))
+       {:state state :net-envelopes [] :stdout-events []}
+       (let [session-id (:session-id msg)
+             session (get-in state [:sessions session-id])]
+         (if-not (and session
+                      (= "open" (:state session))
+                      (= (:sender msg) (:peer session)))
+           {:state state :net-envelopes [] :stdout-events []}
+           (let [peer-pub (try (basalt/hex->bytes (:peer session)) (catch #?(:clj Exception :cljs :default) _ nil))
+                 sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch #?(:clj Exception :cljs :default) _ nil))
+                 ack-seq (long (or (:ack-seq msg) 0))
+                 acked-seq (long (or (:acked-seq msg) 0))
+                 raw-peer-high (:peer-high-seq msg)
+                 peer-high-seq (long (or raw-peer-high (max ack-seq acked-seq)))
+                 overflow? (or (> peer-high-seq max-safe-js-seq)
+                               (> ack-seq max-safe-js-seq)
+                               (> acked-seq max-safe-js-seq)
+                               (neg? peer-high-seq))
+                 seen-vec (vec (sort (or (:seen-seqs msg) [])))
+                 rollback-fields (select-keys msg [:replay-rejected? :rejected-seq :peer-high-seq :accepted-ciphertext-sha256])
+                 ;; BIP-021 §2.4: zero legacy-signature fallback when any rollback field is present
+                 canonical-bytes (compute-ack-sign-bytes session-id ack-seq acked-seq seen-vec rollback-fields)
+                 valid-sig? (and (not overflow?)
+                                 peer-pub sig-bytes
+                                 (crypto/verify peer-pub canonical-bytes sig-bytes))]
+             (if-not valid-sig?
+               {:state (if overflow?
+                         (update-in state [:diagnostics :session-ack-invalid] (fnil inc 0))
+                         state)
+                :net-envelopes []
+                :stdout-events []}
+               (let [local-tx-seq (long (:tx-seq session 0))
+                     curr-outbox (or (:outbox session) {})
+                     curr-order (or (:outbox-order session) [])
+                     rejected-seq (when (integer? (:rejected-seq msg)) (long (:rejected-seq msg)))
+                     accepted-ct (:accepted-ciphertext-sha256 msg)
+                     digest-mismatch? (boolean
+                                       (when (and accepted-ct rejected-seq)
+                                         (when-let [ob-item (get curr-outbox rejected-seq)]
+                                           (and (:ciphertext-sha256 ob-item)
+                                                (not= accepted-ct (:ciphertext-sha256 ob-item))))))
+                     rollback-detected? (or (> peer-high-seq local-tx-seq)
+                                            (true? (:replay-rejected? msg))
+                                            digest-mismatch?)]
+                 (if rollback-detected?
+                   ;; Strict ordering: evict colliding outbox entries BEFORE (acked? s) purge!
+                   (let [colliding-seqs (vec (sort (filter (fn [s]
+                                                             (let [sl (long s)]
+                                                               (or (<= sl peer-high-seq)
+                                                                   (and rejected-seq (= sl rejected-seq)))))
+                                                           (keys curr-outbox))))
+                         rem-outbox (apply dissoc curr-outbox colliding-seqs)
+                         colliding-set (set colliding-seqs)
+                         rem-order (filterv #(not (contains? colliding-set %)) curr-order)
+                         st-evicted (reduce (fn [s ev-sq]
+                                              (record-eviction s :rollback-collision
+                                                               {:session-id session-id :seq ev-sq}))
+                                            state
+                                            colliding-seqs)
+                         fence-seq (max local-tx-seq peer-high-seq)
+                         updated-sess (assoc session
+                                             :tx-seq fence-seq
+                                             :acked-seq (max (long (:acked-seq session 0)) ack-seq)
+                                             :tx-tainted? true
+                                             :rekey-required? true
+                                             :reoffer-recommended? true
+                                             :outbox rem-outbox
+                                             :outbox-order rem-order
+                                             :outbox-evicted (+ (long (:outbox-evicted session 0)) (count colliding-seqs)))
+                         mismatch-evt {"event" "session-seq-mismatch"
+                                       "session_id" session-id
+                                       "peer" (:peer session)
+                                       "local_tx_seq" local-tx-seq
+                                       "peer_high_seq" peer-high-seq
+                                       "affected_seqs" colliding-seqs
+                                       "rekey_required" true
+                                       "reoffer_recommended" true}
+                         st1 (-> st-evicted
+                                 (assoc-in [:sessions session-id] updated-sess)
+                                 (update-in [:diagnostics :session-tx-seq-rollback-detected] (fnil inc 0))
+                                 (update-in [:diagnostics :session-tx-seq-rollback-evicted] (fnil + 0) (count colliding-seqs)))
+                         ;; Autonomous mode: auto-initiate real X25519 key-rotating channel-offer (NEVER p2p-offer!)
+                         rekey-res (when (and (true? (:autonomous? st1)) privkey-bytes)
+                                     (exec-offer st1
+                                                 {"cmd" "offer"
+                                                  "callee" (:peer session)
+                                                  "subnet_id" (or (:subnet-id session) (:subnet-id st1) "global")
+                                                  "price" (long (or (:price session) 0))
+                                                  "burn" (if (get st1 :economy-enabled? true)
+                                                           (effective-signaling-burn-floor st1)
+                                                           0)}
+                                                 privkey-bytes))]
+                     {:state (if rekey-res (:state rekey-res) st1)
+                      :net-envelopes (if rekey-res (:net-envelopes rekey-res) [])
+                      :stdout-events (into [mismatch-evt] (when rekey-res (:stdout-events rekey-res)))})
+                   (let [new-acked-seq (max (long (:acked-seq session 0)) ack-seq)
+                         seen-set (set (map long seen-vec))
+                         acked? (fn [s] (or (<= (long s) ack-seq) (= (long s) acked-seq) (contains? seen-set (long s))))
+                         purged-outbox (reduce-kv (fn [m s item]
+                                                    (if (acked? s)
+                                                      m
+                                                      (assoc m s item)))
+                                                  {}
+                                                  curr-outbox)
+                         purged-order (filterv #(not (acked? %)) curr-order)
+                         newly-acked (max 0 (- (count curr-outbox) (count purged-outbox)))
+                         updated-sess (assoc session
+                                             :acked-seq new-acked-seq
+                                             :outbox purged-outbox
+                                             :outbox-order purged-order)
+                         new-state (cond-> (assoc-in state [:sessions session-id] updated-sess)
+                                     (pos? newly-acked)
+                                     (update-in [:delivery-telemetry :acked] (fnil + 0) newly-acked))]
+                     {:state new-state
+                      :net-envelopes []
+                      :stdout-events []}))))))))
+     (catch #?(:clj Exception :cljs :default) _
+       {:state state :net-envelopes [] :stdout-events []}))))
 
 (defn build-unacked-replay-envelopes
   "Extracts unacknowledged session outbox messages and returns signed gossip envelopes
@@ -8670,9 +8923,15 @@
                     (string? raw-msg-id) (not (str/blank? raw-msg-id))
                     (string? raw-text) (not (str/blank? raw-text))
                     (string? raw-sig) (not (str/blank? raw-sig)))
-         {:state (update-in state [:diagnostics :broadcast-rejected] (fnil inc 0))
-          :net-envelopes []
-          :stdout-events []}
+         (let [evt {"event" "broadcast-rejected"
+                    "reason" "broadcast-malformed"
+                    "local_epoch" (long (or (:epoch state) 0))}]
+           {:state (-> state
+                       (update-in [:diagnostics :broadcast-malformed] (fnil inc 0))
+                       (update-in [:diagnostics :broadcast-rejected] (fnil inc 0))
+                       (record-suppression :broadcast-malformed))
+            :net-envelopes []
+            :stdout-events [evt]})
          (let [norm-sender (normalize-pubkey-hex raw-sender)
                seq-num (long parsed-seq)
                msg-id raw-msg-id
@@ -8689,28 +8948,77 @@
                                sender-pub sig-bytes
                                (crypto/verify sender-pub (fressian/utf8->bytes sig-str) sig-bytes))
                trusted-anchors (into #{} (concat (:trusted-dac-anchors state) (get-in state [:account :trusted-dac-anchors])))
-               requires-dac? (seq trusted-anchors)
-               dac-valid? (if-not requires-dac?
-                            (if wire-dac
-                              (:ok? (verify-dac wire-dac {:expected-agent-pubkey norm-sender
-                                                          :current-epoch (:epoch state)
-                                                          :revoked-dac-ids (:revoked-dacs state)
-                                                          :required-scope "broadcast"}))
-                              true)
-                            (and (map? wire-dac)
-                                 (let [v (verify-dac wire-dac {:expected-agent-pubkey norm-sender
-                                                               :current-epoch (:epoch state)
-                                                               :revoked-dac-ids (:revoked-dacs state)
-                                                               :required-scope "broadcast"})]
-                                   (and (:ok? v)
-                                        (contains? trusted-anchors
-                                                   (normalize-pubkey-hex (get-in v [:dac :anchor-pubkey])))))))]
-           (if-not (and sig-valid? dac-valid?)
-             {:state (-> state
-                         (update-in [:diagnostics :broadcast-rejected] (fnil inc 0))
-                         (record-suppression :admission-drop))
-              :net-envelopes []
-              :stdout-events []}
+               requires-dac? (boolean (seq trusted-anchors))
+               dac-check (when (and sig-valid? (map? wire-dac))
+                           (verify-dac wire-dac {:expected-agent-pubkey norm-sender
+                                                 :current-epoch (:epoch state)
+                                                 :revoked-dac-ids (:revoked-dacs state)
+                                                 :required-scope "broadcast"}))
+               dac-anchor (when (map? wire-dac)
+                            (or (get-in dac-check [:dac :anchor-pubkey])
+                                (:anchor-pubkey wire-dac)
+                                (get wire-dac "anchor_pubkey")
+                                (get wire-dac "anchor-pubkey")))
+               dac-valid? (cond
+                            (nil? wire-dac) (not requires-dac?)
+                            (not (map? wire-dac)) false
+                            (not (:ok? dac-check)) false
+                            requires-dac? (contains? trusted-anchors (normalize-pubkey-hex dac-anchor))
+                            :else true)]
+           (cond
+             (not sig-valid?)
+             (let [evt {"event" "broadcast-rejected"
+                        "reason" "broadcast-sig-invalid"
+                        "subnet_id" sub-id
+                        "from" norm-sender
+                        "seq" seq-num
+                        "msg_id" msg-id
+                        "local_epoch" (long (or (:epoch state) 0))}]
+               {:state (-> state
+                           (update-in [:diagnostics :broadcast-sig-invalid] (fnil inc 0))
+                           (update-in [:diagnostics :broadcast-rejected] (fnil inc 0))
+                           (record-suppression :broadcast-sig-invalid))
+                :net-envelopes []
+                :stdout-events [evt]})
+
+             (and requires-dac? (nil? wire-dac))
+             (let [evt {"event" "broadcast-rejected"
+                        "reason" "dac-required-missing"
+                        "subnet_id" sub-id
+                        "from" norm-sender
+                        "seq" seq-num
+                        "msg_id" msg-id
+                        "local_epoch" (long (or (:epoch state) 0))}]
+               {:state (-> state
+                           (update-in [:diagnostics :broadcast-dac-missing] (fnil inc 0))
+                           (update-in [:diagnostics :broadcast-rejected] (fnil inc 0))
+                           (record-suppression :dac-required-missing))
+                :net-envelopes []
+                :stdout-events [evt]})
+
+             (and (some? wire-dac) (or (not (map? wire-dac)) (not dac-valid?)))
+             (let [dac-err (cond
+                             (not (map? wire-dac)) "malformed-dac-not-a-map"
+                             (not (:ok? dac-check)) (str (or (:error dac-check) "dac-verification-failed"))
+                             :else "untrusted-dac-anchor")
+                   evt (cond-> {"event" "broadcast-rejected"
+                                "reason" "broadcast-dac-invalid"
+                                "subnet_id" sub-id
+                                "from" norm-sender
+                                "seq" seq-num
+                                "msg_id" msg-id
+                                "local_epoch" (long (or (:epoch state) 0))
+                                "dac_error" dac-err}
+                         dac-id (assoc "dac_id" (str dac-id))
+                         dac-anchor (assoc "anchor_pubkey" (str dac-anchor)))]
+               {:state (-> state
+                           (update-in [:diagnostics :broadcast-dac-invalid] (fnil inc 0))
+                           (update-in [:diagnostics :broadcast-rejected] (fnil inc 0))
+                           (record-suppression :broadcast-dac-invalid))
+                :net-envelopes []
+                :stdout-events [evt]})
+
+             :else
              (let [dedup-key [norm-sender seq-num msg-id]
                    seen (:broadcast-seen state #{})]
                (if (contains? seen dedup-key)
@@ -9478,7 +9786,7 @@
                                     :channel-offer (handle-wire-offer state msg privkey-bytes)
                                     :channel-accept (handle-wire-accept state msg privkey-bytes)
                                     :sealed-message (handle-wire-sealed-msg state msg privkey-bytes)
-                                    :session-ack (handle-wire-session-ack state msg)
+                                    :session-ack (handle-wire-session-ack state msg privkey-bytes)
                                     :channel-close (handle-wire-close state msg)
                                     :rendezvous-offer-header (handle-wire-rendezvous-header state msg privkey-bytes)
                                     :rendezvous-ack-voucher (handle-wire-rendezvous-ack state msg privkey-bytes)
