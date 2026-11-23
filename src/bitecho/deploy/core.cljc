@@ -1597,6 +1597,158 @@
         raw (+ 5000 (* mib-ceil 3000))]
     (long (max 15000 (min 120000 raw)))))
 
+(def max-mesh-bundle-bytes
+  "Hard ceiling (64 MiB) for BIP-017a mesh-assembled bundle blobs."
+  (* 64 1024 1024))
+
+(defn- slice-bytes-compact
+  "Slices `[offset, end)` from `bs` as an exact-sized compact byte array
+   (`byte[]` on JVM, exact-sized `Uint8Array` via `crypto/compact-u8` on CLJS)."
+  [bs ^long offset ^long end]
+  #?(:clj (java.util.Arrays/copyOfRange ^bytes bs (int offset) (int end))
+     :cljs (crypto/compact-u8 (.subarray bs offset end))))
+
+(defn- concat-byte-chunks
+  "Concatenates a vector of byte-array chunks into a single exact-sized compact byte array."
+  [chunks ^long total-len]
+  #?(:clj (let [out (byte-array (int total-len))]
+            (loop [cs chunks
+                   pos 0]
+              (if-let [^bytes c (first cs)]
+                (let [n (alength c)]
+                  (System/arraycopy c 0 out (int pos) n)
+                  (recur (rest cs) (+ pos n)))
+                out)))
+     :cljs (let [out (js/Uint8Array. total-len)]
+             (loop [cs chunks
+                    pos 0]
+               (if-let [c (first cs)]
+                 (do
+                   (.set out c pos)
+                   (recur (rest cs) (+ pos (.-byteLength c))))
+                 out)))))
+
+(defn build-mesh-chunk-request
+  "Builds a BIP-017a mesh blob-chunk request frame (`<= 192 KiB` chunk size)."
+  ([cid offset length]
+   (build-mesh-chunk-request cid offset length nil))
+  ([cid offset length req-id]
+   (cond-> {:type :artifact-blob-chunk-req
+            :cid (normalize-hex cid)
+            :offset (max 0 (long (or offset 0)))
+            :length (max 1 (min default-mesh-chunk-size-bytes (long (or length default-mesh-chunk-size-bytes))))}
+     req-id (assoc :req-id (str req-id)))))
+
+(defn serve-mesh-blob-chunk
+  "Pure BIP-017a server-side blob chunk slicer (BIP-021 §2.6.2).
+   Slices `[offset, offset+length)` capped at `192 KiB` using exact-sized compact copies
+   (zero 64 KiB `Buffer.poolSize` slab pinning on Node.js)."
+  [blob-bytes req]
+  (let [cid (normalize-hex (:cid req))
+        req-id (:req-id req)
+        offset (long (or (:offset req) 0))
+        req-len (max 1 (min default-mesh-chunk-size-bytes (long (or (:length req) default-mesh-chunk-size-bytes))))]
+    (if-not (and blob-bytes (bytes? blob-bytes))
+      (cond-> {:type :artifact-blob-chunk-res
+               :ok? false
+               :error :not-found
+               :cid cid}
+        req-id (assoc :req-id req-id))
+      (let [total-len #?(:clj (long (alength ^bytes blob-bytes))
+                         :cljs (long (.-byteLength blob-bytes)))]
+        (if (or (neg? offset) (and (pos? total-len) (>= offset total-len)))
+          (cond-> {:type :artifact-blob-chunk-res
+                   :ok? false
+                   :error :offset-out-of-range
+                   :cid cid
+                   :total-bytes total-len}
+            req-id (assoc :req-id req-id))
+          (let [end (min total-len (+ offset req-len))
+                chunk-bs (slice-bytes-compact blob-bytes offset end)
+                actual-len (- end offset)]
+            (cond-> {:type :artifact-blob-chunk-res
+                     :ok? true
+                     :cid cid
+                     :offset offset
+                     :length actual-len
+                     :total-bytes total-len
+                     :eof? (>= end total-len)
+                     :bytes chunk-bs}
+              req-id (assoc :req-id req-id))))))))
+
+(defn init-mesh-chunk-assembly
+  "Initializes pure client-side BIP-017a mesh chunk reassembly state."
+  ([cid] (init-mesh-chunk-assembly cid default-mesh-chunk-size-bytes))
+  ([cid chunk-size-bytes]
+   {:cid (normalize-hex cid)
+    :chunk-size (max 1 (min default-mesh-chunk-size-bytes (long (or chunk-size-bytes default-mesh-chunk-size-bytes))))
+    :next-offset 0
+    :total-bytes nil
+    :chunks []
+    :received-bytes 0
+    :chunk-idx 0
+    :done? false
+    :error nil}))
+
+(defn reduce-mesh-chunk-response
+  "Pure client-side BIP-017a chunk reassembly reducer.
+   Returns `{:done? bool :ok? bool :bytes ... :error ... :next-req ... :state updated-asm}`.
+   Verifies `SHA-256 == cid` upon EOF, failing closed with `:mesh-cid-mismatch` on Byzantine peers."
+  [asm resp]
+  (let [expected-cid (:cid asm)
+        resp-cid (normalize-hex (:cid resp))]
+    (cond
+      (not (map? resp))
+      {:done? true :ok? false :error :malformed-chunk-response :state (assoc asm :done? true :error :malformed-chunk-response)}
+
+      (not= expected-cid resp-cid)
+      {:done? true :ok? false :error :cid-mismatch-chunk :state (assoc asm :done? true :error :cid-mismatch-chunk)}
+
+      (not (true? (:ok? resp)))
+      (let [err (or (:error resp) :mesh-chunk-not-found)]
+        {:done? true :ok? false :error err :state (assoc asm :done? true :error err)})
+
+      :else
+      (let [off (long (or (:offset resp) -1))
+            total (long (or (:total-bytes resp) -1))
+            chunk-bs (:bytes resp)
+            chunk-len (if (and chunk-bs (bytes? chunk-bs))
+                        #?(:clj (long (alength ^bytes chunk-bs))
+                           :cljs (long (.-byteLength chunk-bs)))
+                        -1)
+            prev-total (:total-bytes asm)]
+        (cond
+          (or (not= off (long (:next-offset asm)))
+              (neg? total)
+              (> total max-mesh-bundle-bytes)
+              (and (some? prev-total) (not= total (long prev-total)))
+              (neg? chunk-len)
+              (and (pos? total) (zero? chunk-len))
+              (> (+ off chunk-len) total))
+          {:done? true :ok? false :error :invalid-chunk-bounds :state (assoc asm :done? true :error :invalid-chunk-bounds)}
+
+          :else
+          (let [next-chunks (conj (vec (:chunks asm)) chunk-bs)
+                next-off (+ off chunk-len)
+                next-idx (inc (long (:chunk-idx asm 0)))
+                asm1 (assoc asm
+                            :total-bytes total
+                            :chunks next-chunks
+                            :next-offset next-off
+                            :received-bytes next-off
+                            :chunk-idx next-idx)]
+            (if (or (true? (:eof? resp)) (>= next-off total))
+              (let [full-bytes (concat-byte-chunks next-chunks total)
+                    actual-cid (sha256-hex full-bytes)]
+                (if (= actual-cid expected-cid)
+                  {:done? true :ok? true :cid expected-cid :bytes full-bytes :state (assoc asm1 :done? true)}
+                  {:done? true :ok? false :error :mesh-cid-mismatch :state (assoc asm1 :done? true :error :mesh-cid-mismatch)}))
+              {:done? false
+               :ok? true
+               :next-req (build-mesh-chunk-request expected-cid next-off (:chunk-size asm)
+                                                   (str (subs expected-cid 0 (min 8 (count expected-cid))) "-" next-idx))
+               :state asm1})))))))
+
 (defn init-light-updater-state
   "Initializes single-authority generation-tagged P-UPD-1 pointer auto-update state (`Rule 4`)
    shared across Node.js, JVM, and Browser light & full nodes."

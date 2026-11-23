@@ -7,6 +7,7 @@
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.config :as config]
             [bitecho.core.infra :as core-infra]
+            [bitecho.core.mesh :as core-mesh]
             [bitecho.core.protocol.relay :as relay]
             [bitecho.crypto :as crypto]
             [bitecho.deploy.core :as deploy]
@@ -1772,7 +1773,25 @@
              :diagnostics_buffered diag-count}
       (:last-diagnostic conn) (assoc :last_diagnostic (:last-diagnostic conn)))))
 
+(defonce ^:private mesh-chunk-handlers-atom (atom {}))
+
+(defn- try-dispatch-mesh-chunk-res!
+  "Intercepts inbound `:artifact-blob-chunk-res` frames for active BIP-017a mesh chunk fetches.
+   Returns true if handled, false otherwise."
+  [payload]
+  (when (seq @mesh-chunk-handlers-atom)
+    (let [decoded (try (light-core/thaw-payload payload) (catch :default _ nil))]
+      (when (and (map? decoded) (= :artifact-blob-chunk-res (:type decoded)))
+        (let [req-id (:req-id decoded)
+              cid (str (:cid decoded))
+              handler (or (when req-id (get @mesh-chunk-handlers-atom req-id))
+                          (get @mesh-chunk-handlers-atom cid))]
+          (when (fn? handler)
+            (try (handler decoded) (catch :default _ nil))
+            true))))))
+
 (defn- sync-conn-diagnostics!
+  "Synchronizes derived runtime liveness and diagnostics from `conn-atom` into `state-atom`."
   [state-atom conn-atom]
   (when (and state-atom conn-atom)
     (let [c @conn-atom
@@ -1914,29 +1933,30 @@
                        (when-let [cid (:channel-id evt)]
                          (reset! channel-id cid))
                        (when-let [payload (:payload evt)]
-                         (when state-atom
-                           (let [st @state-atom
-                                 res (light-core/handle-wire-payload st payload (:privkey-bytes identity))]
-                             (reset! state-atom (:state res))
-                             (when (and state-file (not= st (:state res)))
-                               (try
-                                 (save-light-state-async! state-file (:state res))
-                                 (catch :default e
-                                   (when conn-atom
-                                     (apply-conn-event! conn-atom
-                                                        {:type :persist-failed
-                                                         :error (or (ex-message e) "persist-failed")}
-                                                        cb-opts)
-                                     (sync-conn-diagnostics! state-atom conn-atom)))))
-                             (when (and event-out (seq (:stdout-events res)))
-                               (doseq [ev (:stdout-events res)]
-                                 (event-out ev)))
-                             (when-let [dial-info (:p2p-dial res)]
-                               (dial-p2p-peer! state-atom (:p2p-peers-atom ctx) (:ingress-peers-atom ctx) (:mdns-atom ctx) (:privkey-bytes identity) event-out dial-info))
-                             (when (seq (:net-envelopes res))
-                               (if (some #(or (:p2p-direct? %) (:p2p-broadcast? %)) (:net-envelopes res))
-                                 (send-routed-envelopes! (:net-envelopes res) send-fn-atom (:p2p-peers-atom ctx) (:ingress-peers-atom ctx) state-atom (:privkey-bytes identity))
-                                 (dispatch-auto-reply! (:net-envelopes res) send-fn-atom state-atom conn-atom event-out reconnect-fn cb-opts)))))))))
+                         (when-not (try-dispatch-mesh-chunk-res! payload)
+                           (when state-atom
+                             (let [st @state-atom
+                                   res (light-core/handle-wire-payload st payload (:privkey-bytes identity))]
+                               (reset! state-atom (:state res))
+                               (when (and state-file (not= st (:state res)))
+                                 (try
+                                   (save-light-state-async! state-file (:state res))
+                                   (catch :default e
+                                     (when conn-atom
+                                       (apply-conn-event! conn-atom
+                                                          {:type :persist-failed
+                                                           :error (or (ex-message e) "persist-failed")}
+                                                          cb-opts)
+                                       (sync-conn-diagnostics! state-atom conn-atom)))))
+                               (when (and event-out (seq (:stdout-events res)))
+                                 (doseq [ev (:stdout-events res)]
+                                   (event-out ev)))
+                               (when-let [dial-info (:p2p-dial res)]
+                                 (dial-p2p-peer! state-atom (:p2p-peers-atom ctx) (:ingress-peers-atom ctx) (:mdns-atom ctx) (:privkey-bytes identity) event-out dial-info))
+                               (when (seq (:net-envelopes res))
+                                 (if (some #(or (:p2p-direct? %) (:p2p-broadcast? %)) (:net-envelopes res))
+                                   (send-routed-envelopes! (:net-envelopes res) send-fn-atom (:p2p-peers-atom ctx) (:ingress-peers-atom ctx) state-atom (:privkey-bytes identity))
+                                   (dispatch-auto-reply! (:net-envelopes res) send-fn-atom state-atom conn-atom event-out reconnect-fn cb-opts))))))))))
      :on-error (fn [evt]
                  (when (str/includes? (str (:message evt)) "Fingerprint")
                    (settle-fn! :bad-fingerprint)))
@@ -3766,9 +3786,26 @@
         token (.toString (.randomBytes node-crypto 32) "hex")
         pid (.-pid js/process)
         ctrl-file (.join node-path state-dir "control.json")
+        record-ctl-sock-err! (fn [err]
+                               (when-let [st-atom (:state-atom ctx)]
+                                 (swap! st-atom update-in [:diagnostics :ctl-socket-error] (fnil inc 0)))
+                               (emit-json-line! {"event" "diagnostic"
+                                                 "reason" "ctl-socket-error"
+                                                 "code" (or (when err (.-code err)) "unknown")
+                                                 "detail" (or (when err (.-message err)) (str err))}
+                                                (:events-out ctx)))
+        safe-send-json! (fn [res status-code payload-map]
+                          (when (and res (not (.-writableEnded res)) (not (.-destroyed res)))
+                            (try
+                              (.writeHead res status-code #js {"Content-Type" "application/json"})
+                              (.end res (write-json-str payload-map))
+                              (catch :default e
+                                (record-ctl-sock-err! e)))))
         server (.createServer
                 node-http
                 (fn [req res]
+                  (.on req "error" record-ctl-sock-err!)
+                  (.on res "error" record-ctl-sock-err!)
                   (try
                     (let [url-str (str "http://127.0.0.1" (.-url req))
                           url-obj (js/URL. url-str)
@@ -3778,9 +3815,7 @@
                           expected-auth (str "Bearer " token)]
                       (cond
                         (not= auth-hdr expected-auth)
-                        (do
-                          (.writeHead res 401 #js {"Content-Type" "application/json"})
-                          (.end res (write-json-str {"ok" false "error" "unauthorized"})))
+                        (safe-send-json! res 401 {"ok" false "error" "unauthorized"})
 
                         (and (= method "POST") (= path "/ctl"))
                         (let [body-chunks #js []]
@@ -3790,26 +3825,21 @@
                                  (let [body-str (.toString (.concat (.-Buffer js/globalThis) body-chunks) "utf8")
                                        cmd-map (parse-json-safe body-str)]
                                    (if-not (and (map? cmd-map) (contains? cmd-map "cmd"))
-                                     (do
-                                       (.writeHead res 400 #js {"Content-Type" "application/json"})
-                                       (.end res (write-json-str {"ok" false "error" "malformed-command"})))
+                                     (safe-send-json! res 400 {"ok" false "error" "malformed-command"})
                                      (let [done-fn (fn [result]
-                                                     (let [payload (or result {"ok" true})]
-                                                       (.writeHead res 200 #js {"Content-Type" "application/json"})
-                                                       (.end res (write-json-str payload))))]
+                                                     (safe-send-json! res 200 (or result {"ok" true})))]
                                        (if (= (get cmd-map "cmd") "wait")
                                          (handle-ctl-wait! cmd-map ctx done-fn)
                                          (handle-serve-line! cmd-map ctx done-fn))))))))
 
                         :else
-                        (do
-                          (.writeHead res 404 #js {"Content-Type" "application/json"})
-                          (.end res (write-json-str {"ok" false "error" "not-found"})))))
+                        (safe-send-json! res 404 {"ok" false "error" "not-found"})))
                     (catch :default _
-                      (try
-                        (.writeHead res 500 #js {"Content-Type" "application/json"})
-                        (.end res (write-json-str {"ok" false "error" "internal-server-error"}))
-                        (catch :default _ nil))))))]
+                      (safe-send-json! res 500 {"ok" false "error" "internal-server-error"})))))]
+    (.on server "connection"
+         (fn [sock]
+           (when sock
+             (.on sock "error" record-ctl-sock-err!))))
     (let [write-ctrl-file!
           (fn []
             (let [actual-port (.-port (.address server))
@@ -4018,170 +4048,236 @@
    SHA-256 == CID, runs async pre-swap `--version` health check, atomically swaps bundle (with
    `.lkg` rollback backup), emits structured JSONL events, and exits cleanly (`0`) for
    supervisor/driver respawn."
-  [opts identity events-out stop-all! save-state-fn!]
-  (when-let [pointer-url (:auto-update-pointer opts)]
-    (let [bundle-path (when (exists? js/__filename) js/__filename)
-          current-cid (try
-                        (when (and bundle-path (.existsSync node-fs bundle-path))
-                          (let [h (.createHash node-crypto "sha256")]
-                            (.update h (.readFileSync node-fs bundle-path))
-                            (.digest h "hex")))
-                        (catch :default _ nil))
-          proxy-url (resolve-proxy-url (:proxy opts))
-          poll-ms (max 5000 (long (or (:auto-update-interval-ms opts) 60000)))
-          trusted-auths (or (not-empty (:trusted-deploy-authorities opts))
-                            #{config/infra-cold-root-pubkey})
-          updater-atom (atom (deploy/init-light-updater-state
-                              {:node-id (or (:peer-id identity) "light-node")
-                               :artifact-role :light-node
-                               :current-version "0.23.21"
-                               :current-cid current-cid
-                               :trusted-deploy-authorities trusted-auths
-                               :pinned-version (:pin-version opts)
-                               :proxy-url proxy-url
-                               :poll-interval-ms poll-ms}))
-          staged-bytes-atom (atom nil)
-          staged-path-atom (atom nil)
-          stage-write-promise-atom (atom nil)
-          dispatch! (fn dispatch! [ev]
-                      (let [effs-box (atom [])]
-                        (swap! updater-atom
-                               (fn [st]
-                                 (let [[st' effs] (deploy/reduce-light-update-tick st ev)]
-                                   (reset! effs-box effs)
-                                   st')))
-                        (doseq [eff @effs-box]
-                          (case (:effect eff)
-                            :fetch-pointer
-                            (let [gen (:generation eff)]
-                              (http-get-bytes!
-                               pointer-url (:proxy-url eff) 15000
-                               (fn [res]
-                                 (if (:ok? res)
-                                   (let [txt (fressian/bytes->utf8 (:bytes res))
-                                         ptr (try (edn/read-string txt) (catch :default _ nil))]
-                                     (if (map? ptr)
-                                       (dispatch! {:type :pointer-seen :pointer ptr :generation gen})
-                                       (emit-json-line! {"event" "auto-update-diagnose"
-                                                         "reason" "malformed-pointer-edn"
-                                                         "url" pointer-url}
-                                                        events-out)))
-                                   (emit-json-line! {"event" "auto-update-diagnose"
-                                                     "reason" "fetch-pointer-failed"
-                                                     "status" (:status res)
-                                                     "error" (:error res)}
-                                                    events-out)))))
+  ([opts identity events-out stop-all! save-state-fn!]
+   (start-light-node-auto-updater! opts identity events-out stop-all! save-state-fn! nil))
+  ([opts identity events-out stop-all! save-state-fn! conn-atom]
+   (when-let [pointer-url (:auto-update-pointer opts)]
+     (let [bundle-path (when (exists? js/__filename) js/__filename)
+           current-cid (try
+                         (when (and bundle-path (.existsSync node-fs bundle-path))
+                           (let [h (.createHash node-crypto "sha256")]
+                             (.update h (.readFileSync node-fs bundle-path))
+                             (.digest h "hex")))
+                         (catch :default _ nil))
+           proxy-url (resolve-proxy-url (:proxy opts))
+           poll-ms (max 5000 (long (or (:auto-update-interval-ms opts) 60000)))
+           trusted-auths (or (not-empty (:trusted-deploy-authorities opts))
+                             #{config/infra-cold-root-pubkey})
+           updater-atom (atom (deploy/init-light-updater-state
+                               {:node-id (or (:peer-id identity) "light-node")
+                                :artifact-role :light-node
+                                :current-version "0.23.21"
+                                :current-cid current-cid
+                                :trusted-deploy-authorities trusted-auths
+                                :pinned-version (:pin-version opts)
+                                :proxy-url proxy-url
+                                :poll-interval-ms poll-ms}))
+           staged-bytes-atom (atom nil)
+           staged-path-atom (atom nil)
+           stage-write-promise-atom (atom nil)
+           dispatch! (fn dispatch! [ev]
+                       (let [effs-box (atom [])]
+                         (swap! updater-atom
+                                (fn [st]
+                                  (let [[st' effs] (deploy/reduce-light-update-tick st ev)]
+                                    (reset! effs-box effs)
+                                    st')))
+                         (doseq [eff @effs-box]
+                           (case (:effect eff)
+                             :fetch-pointer
+                             (let [gen (:generation eff)]
+                               (http-get-bytes!
+                                pointer-url (:proxy-url eff) 15000
+                                (fn [res]
+                                  (if (:ok? res)
+                                    (let [txt (fressian/bytes->utf8 (:bytes res))
+                                          ptr (try (edn/read-string txt) (catch :default _ nil))]
+                                      (if (map? ptr)
+                                        (let [mesh-ok? (boolean (and conn-atom (fn? (:send-fn @conn-atom))))]
+                                          (dispatch! {:type :pointer-seen
+                                                      :pointer ptr
+                                                      :mesh-connected? mesh-ok?
+                                                      :generation gen}))
+                                        (emit-json-line! {"event" "auto-update-diagnose"
+                                                          "reason" "malformed-pointer-edn"
+                                                          "url" pointer-url}
+                                                         events-out)))
+                                    (emit-json-line! {"event" "auto-update-diagnose"
+                                                      "reason" "fetch-pointer-failed"
+                                                      "status" (:status res)
+                                                      "error" (:error res)}
+                                                     events-out)))))
 
-                            :fetch-bundle-mesh-chunks
-                            (let [gen (:generation eff)
-                                  cid (:cid eff)]
-                              ;; BIP-021 §2.6.2: when mesh chunk peer transport is unavailable or misses,
-                              ;; emit counted :mesh-fetch-failed -> :auto-update-mesh-fallback to HTTPS.
-                              (dispatch! {:type :mesh-fetch-failed
-                                          :cid cid
-                                          :reason :mesh-chunk-unavailable
-                                          :generation gen}))
+                             :fetch-bundle-mesh-chunks
+                             (let [gen (:generation eff)
+                                   cid (:cid eff)
+                                   chunk-bytes (or (:chunk-size-bytes eff) deploy/default-mesh-chunk-size-bytes)
+                                   probe-ms (or (:probe-timeout-ms eff) 3000)
+                                   chunk-ms (or (:chunk-timeout-ms eff) 5000)
+                                   total-ms (or (:total-timeout-ms eff) 15000)
+                                   send-fn (when conn-atom (:send-fn @conn-atom))]
+                               (if-not (fn? send-fn)
+                                 (dispatch! {:type :mesh-fetch-failed
+                                             :cid cid
+                                             :reason :mesh-disconnected
+                                             :generation gen})
+                                 (let [req-id (str "mesh-upd-" gen "-" (subs (str cid) 0 (min 8 (count (str cid)))) "-" (.now js/Date))
+                                       asm-atom (atom (deploy/init-mesh-chunk-assembly cid chunk-bytes))
+                                       settled? (atom false)
+                                       chunk-timer (atom nil)
+                                       total-timer (atom nil)
+                                       cleanup! (fn []
+                                                  (swap! mesh-chunk-handlers-atom dissoc req-id cid)
+                                                  (when-let [t @chunk-timer]
+                                                    (js/clearTimeout t)
+                                                    (reset! chunk-timer nil))
+                                                  (when-let [t @total-timer]
+                                                    (js/clearTimeout t)
+                                                    (reset! total-timer nil)))
+                                       fail! (fn [reason]
+                                               (when (compare-and-set! settled? false true)
+                                                 (cleanup!)
+                                                 (dispatch! {:type :mesh-fetch-failed
+                                                             :cid cid
+                                                             :reason reason
+                                                             :generation gen})))
+                                       send-chunk! (fn [offset length timeout-ms]
+                                                     (when-let [t @chunk-timer]
+                                                       (js/clearTimeout t))
+                                                     (reset! chunk-timer
+                                                             (js/setTimeout #(fail! :mesh-chunk-timeout) timeout-ms))
+                                                     (try
+                                                       (let [req (deploy/build-mesh-chunk-request cid offset length req-id)
+                                                             pk-hex (or (:pubkey-hex identity) (:pubkey identity))
+                                                             wire (core-mesh/wrap-agent-event req pk-hex (:privkey-bytes identity))]
+                                                         (send-fn wire))
+                                                       (catch :default _
+                                                         (fail! :mesh-send-failed))))
+                                       on-chunk-res (fn [res]
+                                                      (when-not @settled?
+                                                        (let [step (deploy/reduce-mesh-chunk-response @asm-atom res)]
+                                                          (case (:status step)
+                                                            :more
+                                                            (do
+                                                              (reset! asm-atom (:assembly step))
+                                                              (send-chunk! (:next-offset step) (:next-length step) chunk-ms))
 
-                            :fetch-bundle-blob
-                            (let [gen (:generation eff)
-                                  cid (:cid eff)
-                                  blob-url (deploy/build-blob-fetch-url pointer-url cid)]
-                              (http-get-bytes!
-                               blob-url (:proxy-url eff) 30000
-                               (fn [res]
-                                 (if (:ok? res)
-                                   (do
-                                     (reset! staged-bytes-atom (:bytes res))
-                                     (dispatch! {:type :blob-fetched :cid cid :bytes (:bytes res) :generation gen}))
-                                   (do
-                                     (emit-json-line! {"event" "auto-update-diagnose"
-                                                       "reason" "fetch-bundle-blob-failed"
-                                                       "cid" cid
-                                                       "status" (:status res)
-                                                       "error" (:error res)}
-                                                      events-out)
-                                     (dispatch! {:type :blob-fetch-failed :cid cid :reason (:error res) :generation gen}))))))
+                                                            :done
+                                                            (when (compare-and-set! settled? false true)
+                                                              (cleanup!)
+                                                              (reset! staged-bytes-atom (:bytes step))
+                                                              (dispatch! {:type :blob-fetched
+                                                                          :cid cid
+                                                                          :bytes (:bytes step)
+                                                                          :source :mesh
+                                                                          :generation gen}))
 
-                            :stage-light-bundle
-                            (when (and bundle-path @staged-bytes-atom)
-                              (let [dir (.dirname node-path bundle-path)
-                                    cid8 (subs (str (:cid eff)) 0 (min 8 (count (str (:cid eff)))))
-                                    tmp-p (.join node-path dir (str ".bitecho-update-" cid8 ".cjs.tmp"))
-                                    buf (.from js/Buffer (.-buffer @staged-bytes-atom)
-                                               (.-byteOffset @staged-bytes-atom)
-                                               (.-byteLength @staged-bytes-atom))]
-                                (reset! staged-path-atom tmp-p)
-                                (reset! stage-write-promise-atom
-                                        (-> (.writeFile node-fsp tmp-p buf #js {:mode 0755})
-                                            (.catch (fn [e]
-                                                      (emit-json-line! {"event" "auto-update-diagnose"
-                                                                        "reason" "stage-write-failed"
-                                                                        "detail" (.-message e)}
-                                                                       events-out)
-                                                      (throw e)))))))
+                                                            :error
+                                                            (fail! (or (:reason step) :mesh-chunk-error))))))]
+                                   (swap! mesh-chunk-handlers-atom assoc req-id on-chunk-res cid on-chunk-res)
+                                   (reset! total-timer (js/setTimeout #(fail! :mesh-total-timeout) total-ms))
+                                   (send-chunk! 0 chunk-bytes probe-ms))))
 
-                            :atomic-swap-and-restart-light-node
-                            (let [gen (:generation eff)
-                                  cid (:cid eff)
-                                  tmp-p @staged-path-atom
-                                  write-p (or @stage-write-promise-atom (js/Promise.resolve nil))]
-                              (when (and bundle-path tmp-p)
-                                (-> write-p
-                                    (.then (fn [_]
-                                             (.execFile node-child-process
-                                                        (.-execPath js/process)
-                                                        #js [tmp-p "--help"]
-                                                        #js {:timeout 10000}
-                                                        (fn [err _stdout _stderr]
-                                                          (if err
-                                                            (dispatch! {:type :health-check-result :healthy? false :generation gen})
-                                                            (let [lkg-p (str bundle-path ".lkg")]
-                                                              (-> (.copyFile node-fsp bundle-path lkg-p)
-                                                                  (.catch (fn [_] nil))
-                                                                  (.then (fn [_] (.rename node-fsp tmp-p bundle-path)))
-                                                                  (.then (fn [_]
-                                                                           (emit-json-line! {"event" "auto-update-applied"
-                                                                                             "cid" cid
-                                                                                             "restarting" true}
-                                                                                            events-out)
-                                                                           (when save-state-fn! (save-state-fn!))
-                                                                           (when stop-all! (stop-all!))
-                                                                           (.exit js/process 0)))
-                                                                  (.catch (fn [e]
-                                                                            (emit-json-line! {"event" "auto-update-diagnose"
-                                                                                              "reason" "atomic-swap-failed"
-                                                                                              "detail" (.-message e)}
+                             :fetch-bundle-blob
+                             (let [gen (:generation eff)
+                                   cid (:cid eff)
+                                   blob-url (deploy/build-blob-fetch-url pointer-url cid)]
+                               (http-get-bytes!
+                                blob-url (:proxy-url eff) 30000
+                                (fn [res]
+                                  (if (:ok? res)
+                                    (do
+                                      (reset! staged-bytes-atom (:bytes res))
+                                      (dispatch! {:type :blob-fetched :cid cid :bytes (:bytes res) :generation gen}))
+                                    (do
+                                      (emit-json-line! {"event" "auto-update-diagnose"
+                                                        "reason" "fetch-bundle-blob-failed"
+                                                        "cid" cid
+                                                        "status" (:status res)
+                                                        "error" (:error res)}
+                                                       events-out)
+                                      (dispatch! {:type :blob-fetch-failed :cid cid :reason (:error res) :generation gen}))))))
+
+                             :stage-light-bundle
+                             (when (and bundle-path @staged-bytes-atom)
+                               (let [dir (.dirname node-path bundle-path)
+                                     cid8 (subs (str (:cid eff)) 0 (min 8 (count (str (:cid eff)))))
+                                     tmp-p (.join node-path dir (str ".bitecho-update-" cid8 ".cjs.tmp"))
+                                     buf (.from js/Buffer (.-buffer @staged-bytes-atom)
+                                                (.-byteOffset @staged-bytes-atom)
+                                                (.-byteLength @staged-bytes-atom))]
+                                 (reset! staged-path-atom tmp-p)
+                                 (reset! stage-write-promise-atom
+                                         (-> (.writeFile node-fsp tmp-p buf #js {:mode 0755})
+                                             (.catch (fn [e]
+                                                       (emit-json-line! {"event" "auto-update-diagnose"
+                                                                         "reason" "stage-write-failed"
+                                                                         "detail" (.-message e)}
+                                                                        events-out)
+                                                       (throw e)))))))
+
+                             :atomic-swap-and-restart-light-node
+                             (let [gen (:generation eff)
+                                   cid (:cid eff)
+                                   tmp-p @staged-path-atom
+                                   write-p (or @stage-write-promise-atom (js/Promise.resolve nil))]
+                               (when (and bundle-path tmp-p)
+                                 (-> write-p
+                                     (.then (fn [_]
+                                              (.execFile node-child-process
+                                                         (.-execPath js/process)
+                                                         #js [tmp-p "--help"]
+                                                         #js {:timeout 10000}
+                                                         (fn [err _stdout _stderr]
+                                                           (if err
+                                                             (dispatch! {:type :health-check-result :healthy? false :generation gen})
+                                                             (let [lkg-p (str bundle-path ".lkg")]
+                                                               (-> (.copyFile node-fsp bundle-path lkg-p)
+                                                                   (.catch (fn [_] nil))
+                                                                   (.then (fn [_] (.rename node-fsp tmp-p bundle-path)))
+                                                                   (.then (fn [_]
+                                                                            (emit-json-line! {"event" "auto-update-applied"
+                                                                                              "cid" cid
+                                                                                              "restarting" true}
                                                                                              events-out)
-                                                                            (dispatch! {:type :health-check-result :healthy? false :generation gen}))))))))))
-                                    (.catch (fn [_]
-                                              (dispatch! {:type :health-check-result :healthy? false :generation gen}))))))
+                                                                            (when save-state-fn! (save-state-fn!))
+                                                                            (when stop-all! (stop-all!))
+                                                                            (.exit js/process 0)))
+                                                                   (.catch (fn [e]
+                                                                             (emit-json-line! {"event" "auto-update-diagnose"
+                                                                                               "reason" "atomic-swap-failed"
+                                                                                               "detail" (.-message e)}
+                                                                                              events-out)
+                                                                             (dispatch! {:type :health-check-result :healthy? false :generation gen}))))))))))
+                                     (.catch (fn [_]
+                                               (dispatch! {:type :health-check-result :healthy? false :generation gen}))))))
 
-                            :restore-lkg-light-bundle
-                            (do
-                              (when-let [tmp-p @staged-path-atom]
-                                (-> (.unlink node-fsp tmp-p) (.catch (fn [_] nil))))
-                              (emit-json-line! {"event" "auto-update-rolled-back"
-                                                "lkg_version" (:lkg-version eff)
-                                                "lkg_cid" (:lkg-cid eff)}
-                                               events-out))
+                             :restore-lkg-light-bundle
+                             (do
+                               (when-let [tmp-p @staged-path-atom]
+                                 (-> (.unlink node-fsp tmp-p) (.catch (fn [_] nil))))
+                               (emit-json-line! {"event" "auto-update-rolled-back"
+                                                 "lkg_version" (:lkg-version eff)
+                                                 "lkg_cid" (:lkg-cid eff)}
+                                                events-out))
 
-                            :diagnose
-                            (emit-json-line! {"event" "auto-update-diagnose"
-                                              "reason" (name (or (:reason eff) :unknown))
-                                              "cause" (when (:cause eff) (name (:cause eff)))}
-                                             events-out)
+                             :diagnose
+                             (emit-json-line! {"event" "auto-update-diagnose"
+                                               "reason" (name (or (:reason eff) :unknown))
+                                               "cause" (when (:cause eff) (name (:cause eff)))}
+                                              events-out)
 
-                            :obs-record
-                            (emit-json-line! {"event" "auto-update-obs"
-                                              "transition" (name (or (get-in eff [:record :data :transition]) :unknown))}
-                                             events-out)
+                             :obs-record
+                             (emit-json-line! {"event" "auto-update-obs"
+                                               "transition" (name (or (get-in eff [:record :data :transition]) :unknown))}
+                                              events-out)
 
-                            nil))))
-          t0 (js/setTimeout #(dispatch! {:type :poll-tick}) 15000)
-          iv (js/setInterval #(dispatch! {:type :poll-tick}) poll-ms)]
-      (fn []
-        (js/clearTimeout t0)
-        (js/clearInterval iv)))))
+                             nil))))
+           t0 (js/setTimeout #(dispatch! {:type :poll-tick}) 15000)
+           iv (js/setInterval #(dispatch! {:type :poll-tick}) poll-ms)]
+       (fn []
+         (js/clearTimeout t0)
+         (js/clearInterval iv))))))
 
 (defn run-serve!
   "Runs the Node.js light node in continuous JSONL `serve` mode reading STDIN (and optional `--cmd-file`)
@@ -4325,7 +4421,8 @@
                              (try (stop-ctrl) (catch :default _ nil))))
                _ (when-let [su (start-light-node-auto-updater!
                                 opts identity events-out stop-all!
-                                #(save-light-state! state-file @state-atom))]
+                                #(save-light-state! state-file @state-atom)
+                                conn-atom)]
                    (reset! stop-updater-atom su))
                _ (.on js/process "exit" (fn [_] (stop-all!)))
                _ (.on js/process "SIGINT" (fn [] (stop-all!) (.exit js/process 0)))

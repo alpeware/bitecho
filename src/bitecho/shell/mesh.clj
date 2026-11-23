@@ -6,6 +6,7 @@
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.config :as config]
             [bitecho.crypto :as crypto]
+            [bitecho.deploy.core :as deploy]
             [bitecho.economy.account :as account]
             [bitecho.economy.escrow :as escrow]
             [bitecho.economy.treasury :as treasury]
@@ -92,7 +93,8 @@
     :release-intent
     :refund-intent
     :reconfigure-membership
-    :query-chain-state})
+    :query-chain-state
+    :artifact-blob-chunk-req})
 
 (defn canonicalize-for-signing
   "Recursively converts a data structure into a content-deterministic
@@ -2166,8 +2168,10 @@
                                         :remote-ice-ufrag ufrag
                                         :remote-ice-pwd pwd)))))))
                      (let [sender (:sender unwrapped)
-                           query-only? (= (:type unwrapped) :query-chain-state)]
-                       (when (and sender (not query-only?) (anon-conn-key? @conn-key) (not= sender @conn-key))
+                           query-only? (= (:type unwrapped) :query-chain-state)
+                           chunk-req? (= (:type unwrapped) :artifact-blob-chunk-req)
+                           ephemeral-rpc? (or query-only? chunk-req?)]
+                       (when (and sender (not ephemeral-rpc?) (anon-conn-key? @conn-key) (not= sender @conn-key))
                          (let [old-key @conn-key]
                            (if agent-conns
                              (let [rebound (apply-agent-sender-rebind! agent-conns old-key sender cid (System/currentTimeMillis))]
@@ -2176,11 +2180,23 @@
                                  (reset! node-gen (long (or (:generation rebound) @node-gen)))
                                  (replay-cached-gossip-to-agent! shell-node agent-conns sender)))
                              (reset! conn-key sender))))
-                       (let [updated (when (and agent-conns (not query-only?))
+                       (let [updated (when (and agent-conns (not ephemeral-rpc?))
                                        (apply-mesh-conn-event! agent-conns @conn-key
                                                                {:type :on-message :generation @node-gen :node agent-node :channel-id cid}))]
-                         (when (or (nil? agent-conns) query-only? (= agent-node (:node updated)))
-                           (if query-only?
+                         (when (or (nil? agent-conns) ephemeral-rpc? (= agent-node (:node updated)))
+                           (cond
+                             chunk-req?
+                             (let [req-cid (str (:cid unwrapped))
+                                   st (or (when-let [sa (:state-atom shell-node)] @sa)
+                                          (when shell-node (query-node-state shell-node 500)))
+                                   blob-bs (get-in st [:data :blob-store :entries req-cid :bytes])
+                                   res-map (deploy/serve-mesh-blob-chunk blob-bs unwrapped)]
+                               (try
+                                 (api/send! agent-node (fressian/encode-wire res-map) cid)
+                                 (catch Exception e
+                                   (log-mesh-error "Failed to send artifact-blob-chunk-res to agent" e))))
+
+                             query-only?
                              (let [st (or (when-let [sa (:state-atom shell-node)] @sa)
                                           (when shell-node (query-node-state shell-node 500)))
                                    v-id (or validator-identity (:identity shell-node))
@@ -2196,6 +2212,8 @@
                                    (apply-mesh-conn-event! agent-conns @conn-key
                                                            {:type :on-close :generation @node-gen :node agent-node}))
                                  (try (api/close! agent-node) (catch Exception _ nil))))
+
+                             :else
                              (do
                                (async/put! (:network-in shell-node) unwrapped)
                                (when (and (= (:type unwrapped) :receive-gossip) agent-conns)

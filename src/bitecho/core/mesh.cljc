@@ -469,7 +469,8 @@
     :release-intent
     :refund-intent
     :reconfigure-membership
-    :query-chain-state})
+    :query-chain-state
+    :artifact-blob-chunk-req})
 
 (defn canonicalize-for-signing
   "Recursively converts a data structure into a content-deterministic
@@ -749,6 +750,23 @@
                                     :pubkey (str/lower-case (str/trim q-pk))
                                     :sender-pubkey-bytes agent-pub-bytes
                                     :rng (make-event-rng)))))
+
+                     :artifact-blob-chunk-req
+                     (let [req-cid (:cid base-event)
+                           req-off (long (or (:offset base-event) 0))
+                           req-len (long (or (:length base-event) 196608))]
+                       (when (and (string? req-cid)
+                                  (re-matches #"^[0-9a-fA-F]{64}$" (str/trim req-cid))
+                                  (>= req-off 0)
+                                  (pos? req-len)
+                                  (<= req-len 262144))
+                         (-> base-event
+                             (dissoc :sender :sender-pubkey-bytes :rng)
+                             (assoc :sender agent-pub-hex
+                                    :cid (str/lower-case (str/trim req-cid))
+                                    :offset req-off
+                                    :length req-len
+                                    :sender-pubkey-bytes agent-pub-bytes))))
 
                      :register-home-set
                      (let [callee (:callee base-event)
@@ -1773,6 +1791,7 @@
     :receive-request-checkpoint
     :receive-checkpoint
     :query-chain-state
+    :artifact-blob-chunk-req
     :submit-transcript
     :receive-transcript-sig})
 

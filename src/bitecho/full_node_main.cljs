@@ -3314,8 +3314,10 @@
                                          :remote-ice-ufrag ufrag
                                          :remote-ice-pwd pwd)))))))
                       (let [sender (:sender unwrapped)
-                            query-only? (= (:type unwrapped) :query-chain-state)]
-                        (when (and sender (not query-only?) (core-mesh/anon-conn-key? @conn-key) (not= sender @conn-key))
+                            query-only? (= (:type unwrapped) :query-chain-state)
+                            chunk-req? (= (:type unwrapped) :artifact-blob-chunk-req)
+                            ephemeral-rpc? (or query-only? chunk-req?)]
+                        (when (and sender (not ephemeral-rpc?) (core-mesh/anon-conn-key? @conn-key) (not= sender @conn-key))
                           (let [old-key @conn-key]
                             (if agent-conns
                               (let [rebound (apply-agent-sender-rebind! agent-conns old-key sender cid (.now js/Date))]
@@ -3324,11 +3326,31 @@
                                   (reset! node-gen (long (or (:generation rebound) @node-gen)))
                                   (replay-cached-gossip-to-agent! state-atom agent-conns sender)))
                               (reset! conn-key sender))))
-                        (let [updated (when (and agent-conns (not query-only?))
+                        (let [updated (when (and agent-conns (not ephemeral-rpc?))
                                         (apply-mesh-conn-event! agent-conns @conn-key
                                                                 {:type :on-message :generation @node-gen :node agent-node :channel-id cid}))]
-                          (when (or (nil? agent-conns) query-only? (= agent-node (:node updated)))
-                            (if query-only?
+                          (when (or (nil? agent-conns) ephemeral-rpc? (= agent-node (:node updated)))
+                            (cond
+                              chunk-req?
+                              (let [req-cid (str (:cid unwrapped))
+                                    st @state-atom
+                                    hot-bytes (get-in st [:data :blob-store :entries req-cid :bytes])
+                                    send-chunk-reply!
+                                    (fn [blob-bs]
+                                      (let [res-map (deploy/serve-mesh-blob-chunk blob-bs unwrapped)]
+                                        (try
+                                          (api/send! agent-node (fressian/encode-wire res-map) cid)
+                                          (catch :default e
+                                            (log-diagnostic! {:effect :diagnose :reason :mesh-chunk-send-failed :cid req-cid :detail (.-message e)})))))]
+                                (if (fressian/bytes? hot-bytes)
+                                  (send-chunk-reply! hot-bytes)
+                                  (if-let [sdir (:state-dir ctx)]
+                                    (read-disk-blob-async! sdir req-cid (:shell-atom ctx)
+                                                           (fn [disk-res]
+                                                             (send-chunk-reply! (when (:ok? disk-res) (:bytes disk-res)))))
+                                    (send-chunk-reply! nil))))
+
+                              query-only?
                               (let [st @state-atom
                                     snapshot (when (and (map? st) (seq st))
                                                (core-mesh/build-validator-chain-state-snapshot st identity (:pubkey unwrapped) (:nonce unwrapped)))]
@@ -3342,6 +3364,8 @@
                                     (apply-mesh-conn-event! agent-conns @conn-key
                                                             {:type :on-close :generation @node-gen :node agent-node}))
                                   (try (api/close! agent-node) (catch :default _ nil))))
+
+                              :else
                               (do
                                 (step-validator-event! ctx unwrapped true)
                                 (when (and (= (:type unwrapped) :receive-gossip) agent-conns)

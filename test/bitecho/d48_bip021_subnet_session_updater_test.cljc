@@ -583,7 +583,70 @@
       (is (contains? (:quarantined-cids st4) target-cid))
       (is (some #(= :restore-lkg-light-bundle (:effect %)) effs4))
       (is (= :watching (:phase st5)))
-      (is (some #(and (= :diagnose (:effect %)) (= :light-update-quarantined-cid (:reason %))) effs5)))))
+      (is (some #(and (= :diagnose (:effect %)) (= :light-update-quarantined-cid (:reason %))) effs5))))
+
+  (testing "Gate 5(a): connected mesh peer serves multi-chunk BIP-017a blob -> reassembled bytes match SHA-256 CID with 0 HTTPS requests"
+    (let [auth-kp (gen-kp 611)
+          ;; > 400 KiB payload requiring 3 chunks at 192 KiB/chunk
+          chunk-sz deploy/default-mesh-chunk-size-bytes
+          payload-len (+ (* 2 chunk-sz) 12345)
+          payload (fressian/utf8->bytes (apply str (repeat payload-len "A")))
+          target-cid (deploy/sha256-hex payload)
+          https-calls (atom 0)
+          ptr (deploy/sign-config-pointer (:priv auth-kp)
+                                          {:seq 5
+                                           :author-pubkey (:pub-hex auth-kp)
+                                           :target-version "0.23.23"
+                                           :light-node-cid target-cid
+                                           :artifact-size-bytes payload-len})
+          st0 (deploy/init-light-updater-state {:node-id "light-mesh-5a"
+                                                :artifact-role :light-node
+                                                :current-version "0.23.21"
+                                                :current-cid (deploy/sha256-hex (fressian/utf8->bytes "old"))
+                                                :trusted-deploy-authorities #{(:pub-hex auth-kp)}})
+          [st1 effs1] (deploy/reduce-light-update-tick st0 {:type :pointer-seen
+                                                            :pointer ptr
+                                                            :mesh-connected? true
+                                                            :generation 1})
+          mesh-eff (first (filter #(= :fetch-bundle-mesh-chunks (:effect %)) effs1))
+          ;; Execute pure multi-chunk request/serve/reassemble loop over mock mesh peer
+          loop-res (loop [asm (deploy/init-mesh-chunk-assembly (:cid mesh-eff) (:chunk-size-bytes mesh-eff))
+                          req (deploy/build-mesh-chunk-request (:cid mesh-eff) 0 (:chunk-size-bytes mesh-eff) "req-0")
+                          chunks-served 0]
+                     (let [srv-resp (deploy/serve-mesh-blob-chunk payload req)
+                           step (deploy/reduce-mesh-chunk-response asm srv-resp)]
+                       (if (:done? step)
+                         (assoc step :chunks-served (inc chunks-served))
+                         (recur (:state step) (:next-req step) (inc chunks-served)))))
+          [st2 effs2] (deploy/reduce-light-update-tick st1 {:type :blob-fetched
+                                                            :cid target-cid
+                                                            :bytes (:bytes loop-res)
+                                                            :generation (:generation st1)})]
+      (is (= :fetching-mesh (:phase st1)))
+      (is (true? (:ok? loop-res)))
+      (is (= 3 (:chunks-served loop-res)) "400+ KiB blob must be fetched in 3 chunks <= 192 KiB each")
+      (is (= target-cid (deploy/sha256-hex (:bytes loop-res))))
+      (is (zero? @https-calls) "Gate 5(a): 0 HTTPS requests when mesh peer serves the blob")
+      (is (not-any? #(= :fetch-bundle-blob (:effect %)) effs1))
+      (is (= :health-checking (:phase st2)))
+      (is (some #(= :stage-light-bundle (:effect %)) effs2))
+      (is (some #(= :atomic-swap-and-restart-light-node (:effect %)) effs2))))
+
+  (testing "Gate 5(b): mesh peer missing/Byzantine corruption -> emits :auto-update-mesh-fallback and falls back to HTTPS"
+    (let [payload (fressian/utf8->bytes "real-bundle-content")
+          target-cid (deploy/sha256-hex payload)
+          req (deploy/build-mesh-chunk-request target-cid 0 deploy/default-mesh-chunk-size-bytes "req-miss")
+          miss-resp (deploy/serve-mesh-blob-chunk nil req)
+          miss-step (deploy/reduce-mesh-chunk-response (deploy/init-mesh-chunk-assembly target-cid) miss-resp)
+          bad-resp (deploy/serve-mesh-blob-chunk (fressian/utf8->bytes "corrupted-byzantine-bytes") req)
+          bad-step (deploy/reduce-mesh-chunk-response (deploy/init-mesh-chunk-assembly target-cid) bad-resp)]
+      (is (false? (:ok? miss-resp)))
+      (is (= :not-found (:error miss-resp)))
+      (is (true? (:done? miss-step)))
+      (is (false? (:ok? miss-step)))
+      (is (true? (:done? bad-step)))
+      (is (false? (:ok? bad-step)))
+      (is (= :mesh-cid-mismatch (:error bad-step))))))
 
 ;; =============================================================================
 ;; §2.7 Node.js Buffer.poolSize Slab-Pinning Compact-Copy & Cold-Demotion
@@ -622,3 +685,23 @@
       (is (nil? (:bytes entry)) "Off-heap byte reference must be released on cold demotion")
       (is (true? (:cold? entry)))
       (is (zero? (long (:hot-bytes bs2 0)))))))
+
+#?(:clj
+   (deftest bip021-mesh-chunk-rpc-and-ctl-socket-error-wiring-test
+     (testing "Real BIP-017a chunked mesh fetch RPC is wired across full_node_main.cljs, node_main.cljs, shell/mesh.clj, and shell/updater.clj"
+       (let [full-src (slurp "src/bitecho/full_node_main.cljs")
+             node-src (slurp "src/bitecho/node_main.cljs")
+             mesh-src (slurp "src/bitecho/shell/mesh.clj")
+             upd-src (slurp "src/bitecho/shell/updater.clj")]
+         (is (str/includes? full-src ":artifact-blob-chunk-req"))
+         (is (str/includes? full-src "deploy/serve-mesh-blob-chunk"))
+         (is (str/includes? mesh-src ":artifact-blob-chunk-req"))
+         (is (str/includes? mesh-src "deploy/serve-mesh-blob-chunk"))
+         (is (str/includes? node-src ":artifact-blob-chunk-res"))
+         (is (str/includes? node-src "deploy/init-mesh-chunk-assembly"))
+         (is (str/includes? node-src "deploy/reduce-mesh-chunk-response"))
+         (is (str/includes? upd-src "mesh-chunk-fetch-fn"))))
+     (testing "/ctl HTTP server in node_main.cljs attaches socket error handlers emitting counted :ctl-socket-error (zero ECONNRESET crash)"
+       (let [node-src (slurp "src/bitecho/node_main.cljs")]
+         (is (str/includes? node-src ":ctl-socket-error")
+             "/ctl server socket error handler must emit counted :ctl-socket-error diagnostic")))))
