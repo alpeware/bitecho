@@ -525,6 +525,57 @@
       expected-subnet (conj expected-subnet)
       (config/equivalent-subnet-id? "global" expected-subnet active-net-uri) (conj "global"))))
 
+(declare enqueue-actionable-events)
+
+(defn reconcile-startup-subnet-id
+  "Pure Sans-IO startup `--subnet-id` authority reconciler (`v0.23.22` / `Rule 2`, `Rule 5`).
+   - Preserves persisted `:subnet-id` with 0 spurious diagnostics when `explicit-subnet-id` is nil/blank or equal.
+   - When `explicit-subnet-id` differs from persisted `:subnet-id`, overrides `:subnet-id`, merges
+     `explicit-subscribe-subnets` and the new `:subnet-id` into `:subscribed-subnets`, increments
+     `[:diagnostics :subnet-id-startup-override]`, emits a counted Rule 5 `:diagnose` effect
+     (`:subnet-id-startup-override`), and emits a `subnet-id-startup-override` event."
+  ([state explicit-subnet-id]
+   (reconcile-startup-subnet-id state explicit-subnet-id nil nil))
+  ([state explicit-subnet-id explicit-subscribe-subnets]
+   (reconcile-startup-subnet-id state explicit-subnet-id explicit-subscribe-subnets nil))
+  ([state explicit-subnet-id explicit-subscribe-subnets _opts]
+   (let [persisted-sub (str (or (:subnet-id state) "global"))
+         trimmed-explicit (when (and (some? explicit-subnet-id)
+                                     (not (str/blank? (str explicit-subnet-id))))
+                            (str/trim (str explicit-subnet-id)))
+         extra-subs (->> (cond
+                           (coll? explicit-subscribe-subnets) explicit-subscribe-subnets
+                           (string? explicit-subscribe-subnets) (str/split explicit-subscribe-subnets #",")
+                           :else [])
+                         (map (comp str/trim str))
+                         (remove str/blank?)
+                         set)
+         merged-subs (into (into #{} (map str (or (:subscribed-subnets state) #{}))) extra-subs)]
+     (if (or (nil? trimmed-explicit) (= trimmed-explicit persisted-sub))
+       {:ok? true
+        :reconciled? false
+        :state (assoc state :subscribed-subnets merged-subs)
+        :effects []
+        :stdout-events []}
+       (let [evt {"event" "subnet-id-startup-override"
+                  "from" persisted-sub
+                  "to" trimmed-explicit}
+             diag {:effect :diagnose
+                   :type :diagnose
+                   :reason :subnet-id-startup-override
+                   :from persisted-sub
+                   :to trimmed-explicit}
+             st0 (-> state
+                     (assoc :subnet-id trimmed-explicit
+                            :subscribed-subnets (conj merged-subs trimmed-explicit))
+                     (update-in [:diagnostics :subnet-id-startup-override] (fnil inc 0)))
+             st1 (enqueue-actionable-events st0 [evt])]
+         {:ok? true
+          :reconciled? true
+          :state st1
+          :effects [diag]
+          :stdout-events [evt]})))))
+
 (defn effective-signaling-burn-floor
   "Computes the effective signaling burn floor for P2P signaling envelopes.
    Delegates directly to `burn/effective-signaling-burn-floor`."
@@ -4960,6 +5011,7 @@
                                   "ring_buffer_count" (count ring-buf)
                                   "ring_buffer_max" delivery-ring-max-entries}
          resp (cond-> {"ok" true
+                       "version" config/version
                        "connected" (boolean (:connected? state false))
                        "connection_error" (:connection-error state)
                        "auto_sync_last_error" (or (:auto-sync-last-error state)
@@ -9285,22 +9337,36 @@
                                         (= msg-type :capability-replicate)
                                         (= msg-type :governance-replicate)
                                         (= msg-type :transfer)
-                                        (= msg-type :p2p-link-bind))
+                                        (= msg-type :p2p-link-bind)
+                                        (= msg-type :chain-state-snapshot))
                     eff-inner (or inner-subnet outer-subnet "global")
                     sub-set (effective-subscribed-subnets state)
+                    sub-wildcard? (contains? sub-set "*")
+                    admitted-subnet? (fn [s]
+                                       (or sub-wildcard?
+                                           (contains? sub-set s)
+                                           (boolean (some #(config/equivalent-subnet-id? s % active-net-uri) sub-set))))
                     sub-bcast? (when (= msg-type :p2p-broadcast)
-                                 (or (contains? sub-set "*")
-                                     (contains? sub-set eff-inner)
-                                     (config/equivalent-subnet-id? eff-inner expected-subnet active-net-uri)))
+                                 (admitted-subnet? eff-inner))
+                    unsolicited-direct? (contains? #{:channel-offer :rendezvous-offer-header} msg-type)
+                    eff-direct-sub (or inner-subnet (when (not= outer-subnet "*") outer-subnet))
+                    spoofed-direct? (and (not storage-or-cap?)
+                                         (not= msg-type :p2p-broadcast)
+                                         (not sub-wildcard?)
+                                         (or (= inner-subnet "*")
+                                             (and (nil? inner-subnet) (= outer-subnet "*"))
+                                             (and unsolicited-direct?
+                                                  (nil? outer-subnet)
+                                                  (nil? inner-subnet)
+                                                  (not= expected-subnet "global"))))
                     subnet-mismatch? (or (and outer-subnet inner-subnet (not= outer-subnet "*") (not= inner-subnet "*")
                                               (not (config/equivalent-subnet-id? outer-subnet inner-subnet active-net-uri)))
+                                         spoofed-direct?
                                          (if (= msg-type :p2p-broadcast)
                                            (not sub-bcast?)
                                            (and (not storage-or-cap?)
-                                                (or (and outer-subnet (not= outer-subnet "*") (not= expected-subnet "*")
-                                                         (not (config/equivalent-subnet-id? outer-subnet expected-subnet active-net-uri)))
-                                                    (and inner-subnet (not= inner-subnet "*") (not= expected-subnet "*")
-                                                         (not (config/equivalent-subnet-id? inner-subnet expected-subnet active-net-uri)))))))]
+                                                (some? eff-direct-sub)
+                                                (not (admitted-subnet? eff-direct-sub)))))]
                 (if subnet-mismatch?
                   (let [eff-subnet (or outer-subnet inner-subnet "unknown")
                         new-state (-> state

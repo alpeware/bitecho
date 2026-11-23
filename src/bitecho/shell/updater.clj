@@ -67,7 +67,7 @@
    `deploy/reduce-light-update-tick` (`:artifact-role :jvm-jar`).
    Returns a zero-arg stop function, or nil when `pointer-url` is blank."
   [{:keys [node-id pointer-url poll-interval-ms current-version pinned-version
-           trusted-deploy-authorities on-event stop-node-fn!]}]
+           trusted-deploy-authorities last-applied-seq on-event stop-node-fn!]}]
   (when (and (string? pointer-url) (not (str/blank? pointer-url)))
     (let [jar-path (current-jar-path)
           cur-cid (file-sha256-hex jar-path)
@@ -76,13 +76,14 @@
                      (.connectTimeout (Duration/ofSeconds 10))
                      (.build))
           updater-atom (atom (deploy/init-light-updater-state
-                              {:node-id (or node-id "jvm-node")
-                               :artifact-role :jvm-jar
-                               :current-version (or current-version "0.23.21")
-                               :current-cid cur-cid
-                               :trusted-deploy-authorities trusted-deploy-authorities
-                               :pinned-version pinned-version
-                               :poll-interval-ms poll-ms}))
+                              (cond-> {:node-id (or node-id "jvm-node")
+                                       :artifact-role :jvm-jar
+                                       :current-version (or current-version "0.23.22")
+                                       :current-cid cur-cid
+                                       :trusted-deploy-authorities trusted-deploy-authorities
+                                       :pinned-version pinned-version
+                                       :poll-interval-ms poll-ms}
+                                (some? last-applied-seq) (assoc :last-applied-seq (long last-applied-seq)))))
           staged-bytes-atom (atom nil)
           staged-path-atom (atom nil)
           emit! (fn [m] (when on-event (try (on-event m) (catch Exception _ nil))))

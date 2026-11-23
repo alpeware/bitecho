@@ -134,7 +134,7 @@
       (is (str/includes? jvm-main "updater/start-jvm-auto-updater!"))
       (is (str/includes? browser-src "deploy/reduce-light-update-tick"))
       (is (str/includes? browser-src "\"startAutoUpdater\""))))
-  (testing "S-D40-2: equal version with different CID upgrades cleanly while equal version + equal CID and downgrade still refuse"
+  (testing "S-D40-2 / RELEASE.md §5: monotonic :seq gate accepts higher :seq + distinct CID regardless of semver, no-ops equal :seq + same CID, and refuses lower :seq"
     (let [kp (crypto/generate-keypair "d40-same-ver-cid-seed")
           pub-hex (str/lower-case (basalt/bytes->hex (:public kp)))
           cur-cid "0000000000000000000000000000000000000000000000000000000000000001"
@@ -142,16 +142,17 @@
           st0 (deploy/init-light-updater-state {:node-id "axiom"
                                                 :current-version "0.23.17"
                                                 :current-cid cur-cid
+                                                :last-applied-seq 2
                                                 :trusted-deploy-authorities #{pub-hex}})
-          ptr-same-cid (make-signed-update-pointer kp {:seq 2 :target-version "0.23.17" :code-target-cid cur-cid})
-          ptr-new-cid  (make-signed-update-pointer kp {:seq 3 :target-version "0.23.17" :code-target-cid new-cid})
-          ptr-downgrade (make-signed-update-pointer kp {:seq 4 :target-version "0.23.16" :code-target-cid new-cid})
-          [st-noop effs-noop] (deploy/reduce-light-update-tick st0 {:type :pointer-seen :pointer ptr-same-cid :generation 1})
-          [st-hotfix effs-hotfix] (deploy/reduce-light-update-tick st0 {:type :pointer-seen :pointer ptr-new-cid :generation 1})
-          [st-down effs-down] (deploy/reduce-light-update-tick st0 {:type :pointer-seen :pointer ptr-downgrade :generation 1})]
+          ptr-same-seq-same-cid (make-signed-update-pointer kp {:seq 2 :target-version "0.23.17" :code-target-cid cur-cid})
+          ptr-hotfix (make-signed-update-pointer kp {:seq 3 :target-version "0.23.17" :code-target-cid new-cid})
+          ptr-lower-seq (make-signed-update-pointer kp {:seq 1 :target-version "0.23.18" :code-target-cid new-cid})
+          [st-noop effs-noop] (deploy/reduce-light-update-tick st0 {:type :pointer-seen :pointer ptr-same-seq-same-cid :generation 1})
+          [st-hotfix effs-hotfix] (deploy/reduce-light-update-tick st0 {:type :pointer-seen :pointer ptr-hotfix :generation 1})
+          [st-down effs-down] (deploy/reduce-light-update-tick st0 {:type :pointer-seen :pointer ptr-lower-seq :generation 1})]
       (is (= :watching (:phase st-noop)))
-      (is (some #(= :light-update-non-monotonic-version (:reason %)) effs-noop))
+      (is (empty? effs-noop))
       (is (= :fetching (:phase st-hotfix)))
       (is (some #(= :fetch-bundle-blob (:effect %)) effs-hotfix))
       (is (= :watching (:phase st-down)))
-      (is (some #(= :light-update-non-monotonic-version (:reason %)) effs-down)))))
+      (is (some #(= :light-update-non-monotonic-seq (:reason %)) effs-down)))))

@@ -25,6 +25,7 @@
             [bitecho.storage.app-release-test]
             [bitecho.storage.chunk-fetch-test]
             [bitecho.streamlet.core-test]
+            [bitecho.v02322-hotfix-test]
             [bitecho.wire-negotiation-test]
             [cljs.test :as test :refer-macros [run-tests]]))
 
@@ -71,6 +72,7 @@
              'bitecho.core.subnet-test
              'bitecho.d45-bip018-hardening-and-failover-test
              'bitecho.d46-bip019-fepoch1-test
-             'bitecho.d47-bip020-delivery-telemetry-test))
+             'bitecho.d47-bip020-delivery-telemetry-test
+             'bitecho.v02322-hotfix-test))
 
 (set! *main-cli-fn* -main)

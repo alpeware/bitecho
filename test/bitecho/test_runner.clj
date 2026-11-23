@@ -80,6 +80,7 @@
             [bitecho.stress.monte-carlo-test]
             [bitecho.stress.release-proof-test]
             [bitecho.tokenomics-v2-e2e-test]
+            [bitecho.v02322-hotfix-test]
             [bitecho.wire-negotiation-test]
             [clojure.string :as str]
             [clojure.test :as t]))

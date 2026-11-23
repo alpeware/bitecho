@@ -3369,8 +3369,17 @@
             identity (load-or-create-light-identity! state-dir)
             bootstrap (discovery/load-bootstrap-descriptor! (:bootstrap opts))
             loaded-state (load-light-state! state-file)
-            base-state (or (when loaded-state
-                             (cond-> loaded-state
+            reconciled-res (when loaded-state
+                             (light-core/reconcile-startup-subnet-id
+                              loaded-state
+                              (:subnet-id opts)
+                              (:subscribe-subnets opts)))
+            _ (when (and reconciled-res (:reconciled? reconciled-res))
+                (doseq [ev (:stdout-events reconciled-res)]
+                  (emit-json-line! out-writer ev (:events-out opts))))
+            loaded-reconciled (if reconciled-res (:state reconciled-res) loaded-state)
+            base-state (or (when loaded-reconciled
+                             (cond-> loaded-reconciled
                                (some? (:autonomous? opts)) (assoc :autonomous? (boolean (:autonomous? opts)))
                                (seq (:nodes bootstrap)) (assoc :bootstrap bootstrap)
                                (:directory-pubkey bootstrap) (assoc :trusted-directory-pubkey (:directory-pubkey bootstrap))
@@ -3391,6 +3400,8 @@
                             (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
                             (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
                             (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap))))
+            _ (when (and reconciled-res (:reconciled? reconciled-res))
+                (try (save-light-state! state-file initial-state) (catch Exception _ nil)))
             state-atom (atom initial-state)
             conn-atom (atom (init-conn-state))
             event-out (fn [ev] (emit-json-line! out-writer ev events-out))
@@ -3839,8 +3850,17 @@
             identity (load-or-create-light-identity! state-dir)
             bootstrap (discovery/load-bootstrap-descriptor! (:bootstrap opts))
             loaded-state (load-light-state! state-file)
-            base-state (or (when loaded-state
-                             (cond-> loaded-state
+            reconciled-res (when loaded-state
+                             (light-core/reconcile-startup-subnet-id
+                              loaded-state
+                              (:subnet-id opts)
+                              (:subscribe-subnets opts)))
+            _ (when (and reconciled-res (:reconciled? reconciled-res))
+                (doseq [ev (:stdout-events reconciled-res)]
+                  (emit-json-line! out-writer ev (:events-out opts))))
+            loaded-reconciled (if reconciled-res (:state reconciled-res) loaded-state)
+            base-state (or (when loaded-reconciled
+                             (cond-> loaded-reconciled
                                (some? (:autonomous? opts)) (assoc :autonomous? (boolean (:autonomous? opts)))
                                (seq (:nodes bootstrap)) (assoc :bootstrap bootstrap)
                                (:directory-pubkey bootstrap) (assoc :trusted-directory-pubkey (:directory-pubkey bootstrap))
@@ -3861,6 +3881,8 @@
                             (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
                             (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
                             (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap))))
+            _ (when (and reconciled-res (:reconciled? reconciled-res))
+                (try (save-light-state! state-file initial-state) (catch Exception _ nil)))
             state-atom (atom initial-state)
             verb (when (map? raw-cmd-map) (get raw-cmd-map "cmd"))
             cmd-map (-> (if (and (contains? #{"directory-lookup" "directory-verify"} verb)

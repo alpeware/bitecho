@@ -3727,9 +3727,26 @@
         token (.toString (.randomBytes node-crypto 32) "hex")
         pid (.-pid js/process)
         ctrl-file (.join node-path state-dir "control.json")
+        record-ctl-sock-err! (fn [err]
+                               (when-let [st-atom (:state-atom ctx)]
+                                 (swap! st-atom update-in [:diagnostics :ctl-socket-error] (fnil inc 0)))
+                               (emit-json-line! {"event" "diagnostic"
+                                                 "reason" "ctl-socket-error"
+                                                 "code" (or (when err (.-code err)) "unknown")
+                                                 "detail" (or (when err (.-message err)) (str err))}
+                                                (:events-out ctx)))
+        safe-send-json! (fn [res status-code payload-map]
+                          (when (and res (not (.-writableEnded res)) (not (.-destroyed res)))
+                            (try
+                              (.writeHead res status-code #js {"Content-Type" "application/json"})
+                              (.end res (write-json-str payload-map))
+                              (catch :default e
+                                (record-ctl-sock-err! e)))))
         server (.createServer
                 node-http
                 (fn [req res]
+                  (.on req "error" record-ctl-sock-err!)
+                  (.on res "error" record-ctl-sock-err!)
                   (try
                     (let [url-str (str "http://127.0.0.1" (.-url req))
                           url-obj (js/URL. url-str)
@@ -3739,9 +3756,7 @@
                           expected-auth (str "Bearer " token)]
                       (cond
                         (not= auth-hdr expected-auth)
-                        (do
-                          (.writeHead res 401 #js {"Content-Type" "application/json"})
-                          (.end res (write-json-str {"ok" false "error" "unauthorized"})))
+                        (safe-send-json! res 401 {"ok" false "error" "unauthorized"})
 
                         (and (= method "POST") (= path "/ctl"))
                         (let [body-chunks #js []]
@@ -3751,26 +3766,21 @@
                                  (let [body-str (.toString (.concat (.-Buffer js/globalThis) body-chunks) "utf8")
                                        cmd-map (parse-json-safe body-str)]
                                    (if-not (and (map? cmd-map) (contains? cmd-map "cmd"))
-                                     (do
-                                       (.writeHead res 400 #js {"Content-Type" "application/json"})
-                                       (.end res (write-json-str {"ok" false "error" "malformed-command"})))
+                                     (safe-send-json! res 400 {"ok" false "error" "malformed-command"})
                                      (let [done-fn (fn [result]
-                                                     (let [payload (or result {"ok" true})]
-                                                       (.writeHead res 200 #js {"Content-Type" "application/json"})
-                                                       (.end res (write-json-str payload))))]
+                                                     (safe-send-json! res 200 (or result {"ok" true})))]
                                        (if (= (get cmd-map "cmd") "wait")
                                          (handle-ctl-wait! cmd-map ctx done-fn)
                                          (handle-serve-line! cmd-map ctx done-fn))))))))
 
                         :else
-                        (do
-                          (.writeHead res 404 #js {"Content-Type" "application/json"})
-                          (.end res (write-json-str {"ok" false "error" "not-found"})))))
+                        (safe-send-json! res 404 {"ok" false "error" "not-found"})))
                     (catch :default _
-                      (try
-                        (.writeHead res 500 #js {"Content-Type" "application/json"})
-                        (.end res (write-json-str {"ok" false "error" "internal-server-error"}))
-                        (catch :default _ nil))))))]
+                      (safe-send-json! res 500 {"ok" false "error" "internal-server-error"})))))]
+    (.on server "connection"
+         (fn [sock]
+           (when sock
+             (.on sock "error" record-ctl-sock-err!))))
     (let [write-ctrl-file!
           (fn []
             (let [actual-port (.-port (.address server))
@@ -3991,13 +4001,14 @@
           proxy-url (resolve-proxy-url (:proxy opts))
           poll-ms (max 5000 (long (or (:auto-update-interval-ms opts) 60000)))
           updater-atom (atom (deploy/init-light-updater-state
-                              {:node-id (or (:peer-id identity) "light-node")
-                               :artifact-role :light-node
-                               :current-version "0.23.21"
-                               :current-cid current-cid
-                               :pinned-version (:pin-version opts)
-                               :proxy-url proxy-url
-                               :poll-interval-ms poll-ms}))
+                              (cond-> {:node-id (or (:peer-id identity) "light-node")
+                                       :artifact-role :light-node
+                                       :current-version "0.23.22"
+                                       :current-cid current-cid
+                                       :pinned-version (:pin-version opts)
+                                       :proxy-url proxy-url
+                                       :poll-interval-ms poll-ms}
+                                (some? (:last-applied-seq opts)) (assoc :last-applied-seq (long (:last-applied-seq opts))))))
           staged-bytes-atom (atom nil)
           staged-path-atom (atom nil)
           dispatch! (fn dispatch! [ev]
@@ -4139,8 +4150,17 @@
            (.exit js/process 1))
          (let [bootstrap (:descriptor b-res)
                loaded-state (load-light-state! state-file)
-               base-state (or (when loaded-state
-                                (cond-> loaded-state
+               reconciled-res (when loaded-state
+                                (light-core/reconcile-startup-subnet-id
+                                 loaded-state
+                                 (:subnet-id opts)
+                                 (:subscribe-subnets opts)))
+               _ (when (and reconciled-res (:reconciled? reconciled-res))
+                   (doseq [ev (:stdout-events reconciled-res)]
+                     (emit-json-line! ev events-out)))
+               loaded-reconciled (if reconciled-res (:state reconciled-res) loaded-state)
+               base-state (or (when loaded-reconciled
+                                (cond-> loaded-reconciled
                                   (some? (:autonomous? opts)) (assoc :autonomous? (boolean (:autonomous? opts)))
                                   (seq (:nodes bootstrap)) (assoc :bootstrap bootstrap)
                                   (:directory-pubkey bootstrap) (assoc :trusted-directory-pubkey (:directory-pubkey bootstrap))
@@ -4161,6 +4181,8 @@
                                (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
                                (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
                                (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap))))
+               _ (when (and reconciled-res (:reconciled? reconciled-res))
+                   (try (save-light-state! state-file initial-state) (catch :default _ nil)))
                state-atom (atom initial-state)
                conn-atom (atom (init-conn-state))
                event-out (fn [ev] (emit-json-line! ev events-out))
@@ -4606,8 +4628,14 @@
                   (.exit js/process 0))
                 (let [bootstrap (:descriptor b-res)
                       loaded-state (load-light-state! state-file)
-                      base-state (or (when loaded-state
-                                       (cond-> loaded-state
+                      reconciled-res (when loaded-state
+                                       (light-core/reconcile-startup-subnet-id
+                                        loaded-state
+                                        (:subnet-id opts)
+                                        (:subscribe-subnets opts)))
+                      loaded-reconciled (if reconciled-res (:state reconciled-res) loaded-state)
+                      base-state (or (when loaded-reconciled
+                                       (cond-> loaded-reconciled
                                          (some? (:autonomous? opts)) (assoc :autonomous? (boolean (:autonomous? opts)))
                                          (seq (:nodes bootstrap)) (assoc :bootstrap bootstrap)
                                          (:directory-pubkey bootstrap) (assoc :trusted-directory-pubkey (:directory-pubkey bootstrap))
@@ -4628,6 +4656,8 @@
                                       (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
                                       (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
                                       (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap))))
+                      _ (when (and reconciled-res (:reconciled? reconciled-res))
+                          (try (save-light-state! state-file initial-state) (catch :default _ nil)))
                       state-atom (atom initial-state)
                       verb (when (map? raw-cmd-map) (get raw-cmd-map "cmd"))
                       run-cmd-with-map!

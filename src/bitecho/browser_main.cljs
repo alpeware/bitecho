@@ -253,20 +253,32 @@
                                        browser/normalize-restored-light-state
                                        #{"bitecho.org/dev" "bitecho.org/team" "bitecho.org/infra"
                                          "chat/simon-nexus-axiom" "devnet.bitecho.org" "global"}))]
-          (swap! node-atom
-                 (fn [curr]
-                   (let [curr-kp (:keypair curr)
-                         curr-pub (when (and curr-kp (:public-key curr-kp))
-                                    (fressian/bytes->hex (:public-key curr-kp)))
-                         same-pub? (= curr-pub saved-pub)]
-                     (-> curr
-                         (merge clean-loaded)
-                         (assoc-in [:light-state :pubkey] saved-pub)
-                         (assoc :keypair (if same-pub?
-                                           curr-kp
-                                           {:public-key pub-bytes
-                                            :private-key nil}))
-                         (assoc :x25519 (when same-pub? (:x25519 curr)))))))
+          (let [reconciled? (atom false)]
+            (swap! node-atom
+                   (fn [curr]
+                     (let [curr-kp (:keypair curr)
+                           curr-pub (when (and curr-kp (:public-key curr-kp))
+                                      (fressian/bytes->hex (:public-key curr-kp)))
+                           same-pub? (= curr-pub saved-pub)
+                           explicit-sub (:explicit-subnet-id curr)
+                           base-light (assoc (:light-state clean-loaded) :pubkey saved-pub)
+                           rec (light-core/reconcile-startup-subnet-id base-light explicit-sub)
+                           final-light (:state rec)
+                           final-sub (or (:subnet-id final-light) (:subnet-id curr) "global")]
+                       (when (:reconciled? rec)
+                         (reset! reconciled? true))
+                       (-> curr
+                           (merge clean-loaded)
+                           (assoc :subnet-id final-sub)
+                           (assoc-in [:conn :subnet-id] final-sub)
+                           (assoc :light-state final-light)
+                           (assoc :keypair (if same-pub?
+                                             curr-kp
+                                             {:public-key pub-bytes
+                                              :private-key nil}))
+                           (assoc :x25519 (when same-pub? (:x25519 curr)))))))
+            (when @reconciled?
+              (browser/persist-state! (browser/sanitize-state-for-persistence @node-atom))))
           (if @anchor-state-atom
             (swap! anchor-state-atom
                    (fn [st]
@@ -606,8 +618,9 @@
    (let [opts-map (when opts (if (map? opts) opts (js->clj opts :keywordize-keys true)))
          node-id (or (:peer-id opts-map) (:peerId opts-map)
                      (str "browser-" (fressian/bytes->hex (crypto/random-bytes 4))))
-         subnet-id (or (:subnet-id opts-map) (:subnetId opts-map)
-                       "global")
+         explicit-subnet-id (or (:explicit-subnet-id opts-map) (:explicitSubnetId opts-map)
+                                (:subnet-id opts-map) (:subnetId opts-map))
+         subnet-id (or explicit-subnet-id "global")
          relay-url (or (:relay-url opts-map) (:relayUrl opts-map)
                        (when (and (exists? js/window) (exists? js/URLSearchParams) (some? (.-location js/window)))
                          (try
@@ -629,6 +642,7 @@
          mesh-conns (browser/initial-mesh-conns-state)
          node-atom (atom {:peer-id node-id
                           :subnet-id subnet-id
+                          :explicit-subnet-id explicit-subnet-id
                           :relay-url relay-url
                           :keypair keypair
                           :x25519 x25519
@@ -2689,7 +2703,7 @@
         st0 (deploy/init-light-updater-state
              {:node-id "browser"
               :artifact-role :browser
-              :current-version "0.23.21"
+              :current-version "0.23.22"
               :current-cid (:currentCid opts)
               :pinned-version (:pinVersion opts)
               :trusted-deploy-authorities (:trustedAuthorities opts)
@@ -2810,13 +2824,13 @@
        "checkBundleFreshness" (fn [remote-ver]
                                 (let [na @active-node-atom
                                       st (if na @na {:diagnostics {}})
-                                      res (browser/check-browser-bundle-freshness st "0.23.21" remote-ver)]
+                                      res (browser/check-browser-bundle-freshness st "0.23.22" remote-ver)]
                                   (when (and na (not (:fresh? res)))
                                     (swap! na update-in [:conn :diagnostics :stale-browser-bundle] (fnil inc 0)))
                                   (clj->js res)))
        "startAutoUpdater" start-browser-auto-updater!
        "getAutoUpdaterStatus" (fn [] (clj->js (or @browser-updater-atom {})))
-       "version" "0.23.21"})
+       "version" "0.23.22"})
 
 (defn- js-params->clj-map
   "Safely converts a JS object (including null-prototype or cross-realm objects) or CLJ map
@@ -3783,7 +3797,7 @@
                  "sendMessage" send-message-v1
                  "sendBroadcast" send-broadcast-v1
                  "getArtifact" get-artifact-v1
-                 "version" "0.23.21"}]
+                 "version" "0.23.22"}]
     ;; Attach every recognized CLI verb as a Closure :advanced-safe camelCase JS method
     (doseq [[verb {:keys [js-method]}] browser-cli/browser-cli-verb-inventory]
       (gobj/set obj js-method
