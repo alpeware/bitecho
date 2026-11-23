@@ -5,6 +5,7 @@
    with the JVM `bitecho.shell.light-node` shell, backed by `bitecho.light-node.core`,
    `bitecho.fressian`, and `datachannel.api`."
   (:require [bitecho.basalt.core :as basalt]
+            [bitecho.config :as config]
             [bitecho.core.infra :as core-infra]
             [bitecho.core.protocol.relay :as relay]
             [bitecho.crypto :as crypto]
@@ -587,7 +588,7 @@
                                                  (.on res "data" (fn [c] (.push chunks c)))
                                                  (.on res "end" (fn []
                                                                   (let [buf (js/Buffer.concat chunks)
-                                                                        u8 (js/Uint8Array. (.-buffer buf) (.-byteOffset buf) (.-byteLength buf))]
+                                                                        u8 (crypto/compact-u8 buf)]
                                                                     (done! {:ok? (and (>= status-code 200) (< status-code 300))
                                                                             :status status-code
                                                                             :bytes u8
@@ -1168,6 +1169,7 @@
          relay-cli (extract-flag-value clean-args "--relay-url" nil)
          relay-url (resolve-relay-url relay-cli getenv-fn)
          subnet-id (extract-flag-value clean-args "--subnet-id" nil)
+         reset-network-state? (boolean (some #(= % "--reset-network-state") clean-args))
          trusted-dac-anchors-raw (extract-flag-value clean-args "--trusted-dac-anchors" nil)
          trusted-dac-anchors (when (and (string? trusted-dac-anchors-raw) (not (str/blank? trusted-dac-anchors-raw)))
                                (let [raw-items (if (or (str/starts-with? (str/trim trusted-dac-anchors-raw) "[")
@@ -1236,6 +1238,7 @@
        min-balance (assoc :min-balance min-balance)
        after-ts (assoc :after-ts after-ts)
        subnet-id (assoc :subnet-id subnet-id)
+       reset-network-state? (assoc :reset-network-state? true)
        timeout-ms (assoc :timeout-ms timeout-ms)
        ingress-tcp-port (assoc :ingress-tcp-port ingress-tcp-port)
        (seq trusted-dac-anchors) (assoc :trusted-dac-anchors trusted-dac-anchors)
@@ -1380,6 +1383,42 @@
       (write-bytes-atomic! (str state-file) encoded)
       true)))
 
+(defonce ^:private light-state-barrier-chains-atom (atom {}))
+
+(defn save-light-state-barrier!
+  "BIP-021 §2.4: Non-blocking generation-ordered async write-barrier (`write-temp` + async `fh.sync()` + `rename`)
+   serialized per `state-file` via `fs.promises` (NEVER blocking `.fsyncSync` on Node.js's event loop).
+   Returns a Promise that resolves once state is durably flushed."
+  [state-file state]
+  (if-not (and (some? state-file) (not (str/blank? (str state-file))))
+    (js/Promise.resolve false)
+    (let [path-key (str state-file)
+          encoded (light-core/encode-light-state state)
+          buf (if (.isBuffer js/Buffer encoded)
+                encoded
+                (.from js/Buffer (.-buffer encoded) (.-byteOffset encoded) (.-byteLength encoded)))
+          tmp-path (str path-key ".barrier." (.now js/Date) ".tmp")
+          prev-p (or (get @light-state-barrier-chains-atom path-key) (js/Promise.resolve true))
+          next-p (-> prev-p
+                     (.catch (fn [_] nil))
+                     (.then (fn [_]
+                              (-> (.open node-fsp tmp-path "w" 0600)
+                                  (.then (fn [fh]
+                                           (-> (.writeFile fh buf)
+                                               (.then (fn [_] (.sync fh)))
+                                               (.then (fn [_] (.close fh))
+                                                      (fn [err]
+                                                        (-> (.close fh)
+                                                            (.catch (fn [_] nil))
+                                                            (.then (fn [_] (throw err)))))))))
+                                  (.then (fn [_] (.rename node-fsp tmp-path path-key)))
+                                  (.then (fn [_] true))
+                                  (.catch (fn [err]
+                                            (try (.unlink node-fsp tmp-path) (catch :default _ nil))
+                                            (throw err)))))))]
+      (swap! light-state-barrier-chains-atom assoc path-key next-p)
+      next-p)))
+
 (defn load-light-state!
   "Loads persisted light-node state from `state.fressian`, returning nil if absent."
   [state-file]
@@ -1387,7 +1426,7 @@
              (not (str/blank? (str state-file)))
              (.existsSync node-fs (str state-file)))
     (let [buf (.readFileSync node-fs (str state-file))
-          u8 (js/Uint8Array. (.-buffer buf) (.-byteOffset buf) (.-byteLength buf))]
+          u8 (crypto/compact-u8 buf)]
       (when (pos? (.-byteLength u8))
         (let [decoded (light-core/decode-light-state u8)]
           (when (light-core/legacy-v0238-state? decoded)
@@ -3990,16 +4029,20 @@
                         (catch :default _ nil))
           proxy-url (resolve-proxy-url (:proxy opts))
           poll-ms (max 5000 (long (or (:auto-update-interval-ms opts) 60000)))
+          trusted-auths (or (not-empty (:trusted-deploy-authorities opts))
+                            #{config/infra-cold-root-pubkey})
           updater-atom (atom (deploy/init-light-updater-state
                               {:node-id (or (:peer-id identity) "light-node")
                                :artifact-role :light-node
                                :current-version "0.23.21"
                                :current-cid current-cid
+                               :trusted-deploy-authorities trusted-auths
                                :pinned-version (:pin-version opts)
                                :proxy-url proxy-url
                                :poll-interval-ms poll-ms}))
           staged-bytes-atom (atom nil)
           staged-path-atom (atom nil)
+          stage-write-promise-atom (atom nil)
           dispatch! (fn dispatch! [ev]
                       (let [effs-box (atom [])]
                         (swap! updater-atom
@@ -4029,6 +4072,16 @@
                                                      "error" (:error res)}
                                                     events-out)))))
 
+                            :fetch-bundle-mesh-chunks
+                            (let [gen (:generation eff)
+                                  cid (:cid eff)]
+                              ;; BIP-021 §2.6.2: when mesh chunk peer transport is unavailable or misses,
+                              ;; emit counted :mesh-fetch-failed -> :auto-update-mesh-fallback to HTTPS.
+                              (dispatch! {:type :mesh-fetch-failed
+                                          :cid cid
+                                          :reason :mesh-chunk-unavailable
+                                          :generation gen}))
+
                             :fetch-bundle-blob
                             (let [gen (:generation eff)
                                   cid (:cid eff)
@@ -4040,12 +4093,14 @@
                                    (do
                                      (reset! staged-bytes-atom (:bytes res))
                                      (dispatch! {:type :blob-fetched :cid cid :bytes (:bytes res) :generation gen}))
-                                   (emit-json-line! {"event" "auto-update-diagnose"
-                                                     "reason" "fetch-bundle-blob-failed"
-                                                     "cid" cid
-                                                     "status" (:status res)
-                                                     "error" (:error res)}
-                                                    events-out)))))
+                                   (do
+                                     (emit-json-line! {"event" "auto-update-diagnose"
+                                                       "reason" "fetch-bundle-blob-failed"
+                                                       "cid" cid
+                                                       "status" (:status res)
+                                                       "error" (:error res)}
+                                                      events-out)
+                                     (dispatch! {:type :blob-fetch-failed :cid cid :reason (:error res) :generation gen}))))))
 
                             :stage-light-bundle
                             (when (and bundle-path @staged-bytes-atom)
@@ -4056,43 +4111,50 @@
                                                (.-byteOffset @staged-bytes-atom)
                                                (.-byteLength @staged-bytes-atom))]
                                 (reset! staged-path-atom tmp-p)
-                                (-> (.writeFile node-fsp tmp-p buf #js {:mode 0755})
-                                    (.catch (fn [e]
-                                              (emit-json-line! {"event" "auto-update-diagnose"
-                                                                "reason" "stage-write-failed"
-                                                                "detail" (.-message e)}
-                                                               events-out))))))
+                                (reset! stage-write-promise-atom
+                                        (-> (.writeFile node-fsp tmp-p buf #js {:mode 0755})
+                                            (.catch (fn [e]
+                                                      (emit-json-line! {"event" "auto-update-diagnose"
+                                                                        "reason" "stage-write-failed"
+                                                                        "detail" (.-message e)}
+                                                                       events-out)
+                                                      (throw e)))))))
 
                             :atomic-swap-and-restart-light-node
                             (let [gen (:generation eff)
                                   cid (:cid eff)
-                                  tmp-p @staged-path-atom]
+                                  tmp-p @staged-path-atom
+                                  write-p (or @stage-write-promise-atom (js/Promise.resolve nil))]
                               (when (and bundle-path tmp-p)
-                                (.execFile node-child-process
-                                           (.-execPath js/process)
-                                           #js [tmp-p "--help"]
-                                           #js {:timeout 10000}
-                                           (fn [err _stdout _stderr]
-                                             (if err
-                                               (dispatch! {:type :health-check-result :healthy? false :generation gen})
-                                               (let [lkg-p (str bundle-path ".lkg")]
-                                                 (-> (.copyFile node-fsp bundle-path lkg-p)
-                                                     (.catch (fn [_] nil))
-                                                     (.then (fn [_] (.rename node-fsp tmp-p bundle-path)))
-                                                     (.then (fn [_]
-                                                              (emit-json-line! {"event" "auto-update-applied"
-                                                                                "cid" cid
-                                                                                "restarting" true}
-                                                                               events-out)
-                                                              (when save-state-fn! (save-state-fn!))
-                                                              (when stop-all! (stop-all!))
-                                                              (.exit js/process 0)))
-                                                     (.catch (fn [e]
-                                                               (emit-json-line! {"event" "auto-update-diagnose"
-                                                                                 "reason" "atomic-swap-failed"
-                                                                                 "detail" (.-message e)}
-                                                                                events-out)
-                                                               (dispatch! {:type :health-check-result :healthy? false :generation gen}))))))))))
+                                (-> write-p
+                                    (.then (fn [_]
+                                             (.execFile node-child-process
+                                                        (.-execPath js/process)
+                                                        #js [tmp-p "--help"]
+                                                        #js {:timeout 10000}
+                                                        (fn [err _stdout _stderr]
+                                                          (if err
+                                                            (dispatch! {:type :health-check-result :healthy? false :generation gen})
+                                                            (let [lkg-p (str bundle-path ".lkg")]
+                                                              (-> (.copyFile node-fsp bundle-path lkg-p)
+                                                                  (.catch (fn [_] nil))
+                                                                  (.then (fn [_] (.rename node-fsp tmp-p bundle-path)))
+                                                                  (.then (fn [_]
+                                                                           (emit-json-line! {"event" "auto-update-applied"
+                                                                                             "cid" cid
+                                                                                             "restarting" true}
+                                                                                            events-out)
+                                                                           (when save-state-fn! (save-state-fn!))
+                                                                           (when stop-all! (stop-all!))
+                                                                           (.exit js/process 0)))
+                                                                  (.catch (fn [e]
+                                                                            (emit-json-line! {"event" "auto-update-diagnose"
+                                                                                              "reason" "atomic-swap-failed"
+                                                                                              "detail" (.-message e)}
+                                                                                             events-out)
+                                                                            (dispatch! {:type :health-check-result :healthy? false :generation gen}))))))))))
+                                    (.catch (fn [_]
+                                              (dispatch! {:type :health-check-result :healthy? false :generation gen}))))))
 
                             :restore-lkg-light-bundle
                             (do
@@ -4139,8 +4201,26 @@
            (.exit js/process 1))
          (let [bootstrap (:descriptor b-res)
                loaded-state (load-light-state! state-file)
-               base-state (or (when loaded-state
-                                (cond-> loaded-state
+               reconciled-res (when loaded-state
+                                (light-core/reconcile-startup-subnet-id
+                                 loaded-state
+                                 (:subnet-id opts)
+                                 (:subscribe-subnets opts)
+                                 {:reset-network-state? (boolean (:reset-network-state? opts))}))
+               _ (when (and reconciled-res (false? (:ok? reconciled-res)))
+                   (emit-json-line! {"event" "cross-network-subnet-switch-blocked"
+                                     "ok" false
+                                     "error" "cross-network-subnet-switch-blocked"
+                                     "from" (:subnet-id loaded-state)
+                                     "to" (:subnet-id opts)}
+                                    events-out)
+                   (.exit js/process 1))
+               _ (when (and reconciled-res (:reconciled? reconciled-res))
+                   (doseq [ev (:stdout-events reconciled-res)]
+                     (emit-json-line! ev events-out)))
+               loaded-reconciled (if reconciled-res (:state reconciled-res) loaded-state)
+               base-state (or (when loaded-reconciled
+                                (cond-> loaded-reconciled
                                   (some? (:autonomous? opts)) (assoc :autonomous? (boolean (:autonomous? opts)))
                                   (seq (:nodes bootstrap)) (assoc :bootstrap bootstrap)
                                   (:directory-pubkey bootstrap) (assoc :trusted-directory-pubkey (:directory-pubkey bootstrap))

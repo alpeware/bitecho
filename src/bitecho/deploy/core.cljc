@@ -305,10 +305,16 @@
     (cond-> (assoc canon
                    :config-hash (sha256-hex canon)
                    :signature sig-hex)
-      (:target-version pointer-map) (assoc :target-version (:target-version pointer-map)))))
+      (:target-version pointer-map) (assoc :target-version (:target-version pointer-map))
+      (:light-node-cid pointer-map) (assoc :light-node-cid (:light-node-cid pointer-map))
+      (:full-node-cid pointer-map) (assoc :full-node-cid (:full-node-cid pointer-map))
+      (:jvm-jar-cid pointer-map) (assoc :jvm-jar-cid (:jvm-jar-cid pointer-map))
+      (:browser-cid pointer-map) (assoc :browser-cid (:browser-cid pointer-map))
+      (:artifact-size-bytes pointer-map) (assoc :artifact-size-bytes (:artifact-size-bytes pointer-map)))))
 
 (defn verify-config-pointer
-  "Verifies authority membership (when `:trusted-deploy-authorities` is non-empty) and Ed25519 signature on `pointer-map`."
+  "Verifies authority membership and Ed25519 signature on `pointer-map`.
+   BIP-021 §2.6.2: fails CLOSED when `:trusted-deploy-authorities` is empty."
   [state pointer-map]
   (if-not (map? pointer-map)
     {:ok? false :error :malformed-config-pointer}
@@ -318,7 +324,8 @@
           trusted (set (map normalize-hex (or (:trusted-deploy-authorities state)
                                               (get-in state [:config :trusted-deploy-authorities])
                                               [])))
-          auth-allowed? (or (empty? trusted) (contains? trusted author))
+          has-trusted? (boolean (seq trusted))
+          auth-allowed? (and has-trusted? (contains? trusted author))
           cur-seq (long (or (:active-config-seq state) 0))
           seq-ok? (> (long (:seq canon 0)) cur-seq)
           sig-ok? (boolean
@@ -332,6 +339,9 @@
                         (basalt/hex->bytes sig))
                        (catch #?(:clj Exception :cljs :default) _ false))))]
       (cond
+        (not has-trusted?)
+        {:ok? false :error :no-trusted-deploy-authorities}
+
         (not auth-allowed?)
         {:ok? false :error :unauthorized-config-authority}
 
@@ -1564,11 +1574,34 @@
                      "https://bitecho.org")]
         (str origin "/artifact/v1/blob/" norm-cid)))))
 
+(def default-mesh-chunk-size-bytes
+  "BIP-017a / BIP-021 §2.6.2 chunk size (192 KiB), strictly <= WebRTC SCTP 256 KiB cap."
+  196608)
+
+(def default-mesh-probe-timeout-ms
+  "Initial probe / TTFB timeout (ms) for mesh-first auto-updater (BIP-021 §2.6.2)."
+  3000)
+
+(def default-mesh-chunk-timeout-ms
+  "Per-chunk stall timeout (ms) for mesh-first auto-updater (BIP-021 §2.6.2)."
+  5000)
+
+(defn compute-mesh-fetch-ceiling-ms
+  "Size-scaled total mesh fetch ceiling (BIP-021 §2.6.2):
+   `clamp(15000, 120000, 5000 + ceil(size_MiB) * 3000)`."
+  [size-bytes]
+  (let [bytes-val (max 0 (long (or size-bytes 0)))
+        mib-ceil (if (zero? bytes-val)
+                   1
+                   (long (quot (+ bytes-val 1048575) 1048576)))
+        raw (+ 5000 (* mib-ceil 3000))]
+    (long (max 15000 (min 120000 raw)))))
+
 (defn init-light-updater-state
   "Initializes single-authority generation-tagged P-UPD-1 pointer auto-update state (`Rule 4`)
    shared across Node.js, JVM, and Browser light & full nodes."
   [{:keys [node-id artifact-role current-version current-cid trusted-deploy-authorities
-           pinned-version proxy-url poll-interval-ms]}]
+           pinned-version proxy-url poll-interval-ms quarantined-cids]}]
   {:node-id (str (or node-id "light-node"))
    :artifact-role (keyword (or artifact-role :light-node))
    :phase :watching
@@ -1584,6 +1617,7 @@
    :poll-interval-ms (max 5000 (long (or poll-interval-ms 60000)))
    :active-config-seq 0
    :pending-update nil
+   :quarantined-cids (set (keep normalize-hex (or quarantined-cids #{})))
    :trusted-deploy-authorities (set (map normalize-hex (or trusted-deploy-authorities #{})))
    :next-obs-seq 1
    :dropped 0
@@ -1607,13 +1641,14 @@
                :data (assoc (or data {}) :transition transition)}}]))
 
 (defn reduce-light-update-tick
-  "Pure P-UPD-1 light-node pointer auto-update state machine (`Rule 2`, `Rule 4`, `Rule 5`):
+  "Pure P-UPD-1 / BIP-021 §2.6.2 light-node pointer auto-update state machine (`Rule 2`, `Rule 4`, `Rule 5`):
    `(reduce-light-update-tick state event) -> [new-state effects]`.
    - Enforces generation tagging (ignores stale callbacks with counted `:diagnose`).
-   - Enforces `--pin-version` opt-out (`pinned` node stays put and emits telemetry).
-   - Verifies pointer authority signature, version monotonicity (no downgrades/re-applies), and CID == SHA-256.
-   - Propagates `:proxy-url` (honoring `--proxy` / `HTTPS_PROXY` / `HTTP_PROXY`) on pointer/blob fetch effects.
-   - Auto-rolls back to LKG bundle on health-check failure and emits P-OBS-1 telemetry on every transition."
+   - Guards `:poll-tick` and `:pointer-seen` with `(= :watching (:phase state))` (zero generation livelock).
+   - Enforces `--pin-version` opt-out (`pinned` node stays put and emits telemetry) and failed-CID quarantine.
+   - Verifies pointer authority signature (fail-closed on empty `:trusted-deploy-authorities`), version monotonicity, and CID == SHA-256.
+   - Supports two-phase waterfall: `:watching -> :fetching-mesh -> :fetching-https -> :health-checking -> :watching`.
+   - Auto-rolls back to LKG bundle on health-check failure and quarantines the failed CID."
   [state event]
   (let [cur-gen (long (:generation state 1))
         ev-gen (:generation event)
@@ -1630,71 +1665,153 @@
         [st' [diag]])
       (case (:type event)
         :poll-tick
-        (let [eff {:effect :fetch-pointer
-                   :proxy-url (:proxy-url state)
-                   :generation cur-gen}]
-          [state [eff]])
+        (if (not= :watching (:phase state))
+          (let [diag {:effect :diagnose
+                      :type :diagnose
+                      :reason :update-poll-suppressed
+                      :phase (:phase state)
+                      :generation cur-gen}
+                st' (update-in state [:diagnostics :update-poll-suppressed] (fnil inc 0))]
+            [st' [diag]])
+          (let [eff {:effect :fetch-pointer
+                     :proxy-url (:proxy-url state)
+                     :generation cur-gen}]
+            [state [eff]]))
 
         :pointer-seen
-        (let [ptr (:pointer event)
-              target-ver (str (or (:target-version ptr) ""))
-              target-cid (resolve-bundle-target-cid ptr (:artifact-role state))]
-          (cond
-            (some? (:pinned-version state))
-            (let [[st1 obs-eff] (light-update-obs-record
-                                 state ep :pinned
-                                 {:pinned-version (:pinned-version state)
-                                  :skipped-version target-ver
-                                  :skipped-cid target-cid})]
-              [st1 [obs-eff]])
+        (if (not= :watching (:phase state))
+          (let [diag {:effect :diagnose
+                      :type :diagnose
+                      :reason :update-poll-suppressed
+                      :phase (:phase state)
+                      :generation cur-gen}
+                st' (update-in state [:diagnostics :update-poll-suppressed] (fnil inc 0))]
+            [st' [diag]])
+          (let [ptr (:pointer event)
+                target-ver (str (or (:target-version ptr) ""))
+                target-cid (resolve-bundle-target-cid ptr (:artifact-role state))]
+            (cond
+              (some? (:pinned-version state))
+              (let [[st1 obs-eff] (light-update-obs-record
+                                   state ep :pinned
+                                   {:pinned-version (:pinned-version state)
+                                    :skipped-version target-ver
+                                    :skipped-cid target-cid})]
+                [st1 [obs-eff]])
 
-            :else
-            (let [v (verify-config-pointer state ptr)]
-              (if-not (:ok? v)
-                (let [diag {:effect :diagnose
-                            :type :diagnose
-                            :reason :light-update-pointer-rejected
-                            :cause (:error v)}
-                      st1 (-> state
-                              (assoc :last-error (:error v))
-                              (update-in [:diagnostics :light-update-pointer-rejected] (fnil inc 0)))
-                      [st2 obs-eff] (light-update-obs-record st1 ep :refused {:cause (:error v)})]
-                  [st2 [diag obs-eff]])
-                (let [cmp (if (str/blank? target-ver)
-                            (if (and target-cid (not= target-cid (:current-cid state))) 1 0)
-                            (let [v-cmp (compare-semver target-ver (:current-version state))]
-                              (if (and (zero? v-cmp)
-                                       target-cid
-                                       (:current-cid state)
-                                       (not= target-cid (:current-cid state)))
-                                1
-                                v-cmp)))]
-                  (if (<= cmp 0)
-                    (let [diag {:effect :diagnose
-                                :type :diagnose
-                                :reason :light-update-non-monotonic-version
-                                :current-version (:current-version state)
-                                :target-version target-ver}
-                          st1 (update-in state [:diagnostics :light-update-non-monotonic-version] (fnil inc 0))
-                          [st2 obs-eff] (light-update-obs-record st1 ep :refused {:reason :non-monotonic-version
-                                                                                  :target-version target-ver})]
-                      [st2 [diag obs-eff]])
-                    (let [next-gen (inc cur-gen)
-                          st1 (assoc state
-                                     :phase :fetching
-                                     :generation next-gen
-                                     :pending-update {:pointer ptr
-                                                      :target-version target-ver
-                                                      :target-cid target-cid})
-                          [st2 obs-eff] (light-update-obs-record st1 ep :seen {:target-version target-ver
-                                                                               :target-cid target-cid
-                                                                               :proxy-url (:proxy-url state)})]
-                      [st2 [{:effect :fetch-bundle-blob
-                             :cid target-cid
-                             :target-version target-ver
-                             :proxy-url (:proxy-url state)
-                             :generation next-gen}
-                            obs-eff]])))))))
+              (and target-cid (contains? (or (:quarantined-cids state) #{}) target-cid))
+              (let [diag {:effect :diagnose
+                          :type :diagnose
+                          :reason :light-update-quarantined-cid
+                          :cid target-cid
+                          :target-version target-ver}
+                    st1 (update-in state [:diagnostics :light-update-quarantined-cid] (fnil inc 0))
+                    [st2 obs-eff] (light-update-obs-record st1 ep :refused {:reason :quarantined-cid
+                                                                            :cid target-cid})]
+                [st2 [diag obs-eff]])
+
+              :else
+              (let [v (verify-config-pointer state ptr)]
+                (if-not (:ok? v)
+                  (let [diag {:effect :diagnose
+                              :type :diagnose
+                              :reason :light-update-pointer-rejected
+                              :cause (:error v)}
+                        st1 (-> state
+                                (assoc :last-error (:error v))
+                                (update-in [:diagnostics :light-update-pointer-rejected] (fnil inc 0)))
+                        [st2 obs-eff] (light-update-obs-record st1 ep :refused {:cause (:error v)})]
+                    [st2 [diag obs-eff]])
+                  (let [cmp (if (str/blank? target-ver)
+                              (if (and target-cid (not= target-cid (:current-cid state))) 1 0)
+                              (let [v-cmp (compare-semver target-ver (:current-version state))]
+                                (if (and (zero? v-cmp)
+                                         target-cid
+                                         (:current-cid state)
+                                         (not= target-cid (:current-cid state)))
+                                  1
+                                  v-cmp)))]
+                    (if (<= cmp 0)
+                      (let [diag {:effect :diagnose
+                                  :type :diagnose
+                                  :reason :light-update-non-monotonic-version
+                                  :current-version (:current-version state)
+                                  :target-version target-ver}
+                            st1 (update-in state [:diagnostics :light-update-non-monotonic-version] (fnil inc 0))
+                            [st2 obs-eff] (light-update-obs-record st1 ep :refused {:reason :non-monotonic-version
+                                                                                    :target-version target-ver})]
+                        [st2 [diag obs-eff]])
+                      (let [next-gen (inc cur-gen)
+                            mesh-connected? (true? (:mesh-connected? event))
+                            size-bytes (long (or (:artifact-size-bytes ptr) (:size-bytes event) 0))
+                            next-phase (if mesh-connected? :fetching-mesh :fetching-https)
+                            st1 (assoc state
+                                       :phase next-phase
+                                       :generation next-gen
+                                       :pending-update {:pointer ptr
+                                                        :target-version target-ver
+                                                        :target-cid target-cid
+                                                        :size-bytes size-bytes})
+                            [st2 obs-eff] (light-update-obs-record st1 ep :seen {:target-version target-ver
+                                                                                 :target-cid target-cid
+                                                                                 :fetch-mode (if mesh-connected? :mesh :https)
+                                                                                 :proxy-url (:proxy-url state)})
+                            fetch-eff (if mesh-connected?
+                                        {:effect :fetch-bundle-mesh-chunks
+                                         :cid target-cid
+                                         :target-version target-ver
+                                         :chunk-size-bytes default-mesh-chunk-size-bytes
+                                         :probe-timeout-ms default-mesh-probe-timeout-ms
+                                         :chunk-timeout-ms default-mesh-chunk-timeout-ms
+                                         :total-timeout-ms (compute-mesh-fetch-ceiling-ms size-bytes)
+                                         :generation next-gen}
+                                        {:effect :fetch-bundle-blob
+                                         :cid target-cid
+                                         :target-version target-ver
+                                         :proxy-url (:proxy-url state)
+                                         :generation next-gen})]
+                        [st2 [fetch-eff obs-eff]]))))))))
+
+        :mesh-fetch-failed
+        (let [pending (:pending-update state)
+              target-cid (:target-cid pending)
+              target-ver (:target-version pending)
+              cause (or (:reason event) :mesh-fetch-failed)
+              next-gen (inc cur-gen)
+              diag {:effect :diagnose
+                    :type :diagnose
+                    :reason :auto-update-mesh-fallback
+                    :cause cause
+                    :cid target-cid
+                    :generation next-gen}
+              st1 (-> state
+                      (assoc :phase :fetching-https
+                             :generation next-gen
+                             :last-error cause)
+                      (update-in [:diagnostics :auto-update-mesh-fallback] (fnil inc 0)))
+              [st2 obs-eff] (light-update-obs-record st1 ep :mesh-fallback {:cause cause :cid target-cid})]
+          [st2 [diag
+                {:effect :fetch-bundle-blob
+                 :cid target-cid
+                 :target-version target-ver
+                 :proxy-url (:proxy-url state)
+                 :generation next-gen}
+                obs-eff]])
+
+        :blob-fetch-failed
+        (let [cause (or (:reason event) (:error event) :blob-fetch-failed)
+              diag {:effect :diagnose
+                    :type :diagnose
+                    :reason :light-update-blob-fetch-failed
+                    :cause cause}
+              st1 (-> state
+                      (assoc :phase :watching
+                             :pending-update nil
+                             :last-error cause)
+                      (update :generation inc)
+                      (update-in [:diagnostics :light-update-blob-fetch-failed] (fnil inc 0)))
+              [st2 obs-eff] (light-update-obs-record st1 ep :refused {:reason :blob-fetch-failed :cause cause})]
+          [st2 [diag obs-eff]])
 
         :blob-fetched
         (let [pending (:pending-update state)
@@ -1756,24 +1873,29 @@
               [st2 [obs-eff]])
             (let [lkg-ver (:lkg-version state)
                   lkg-cid (:lkg-cid state)
+                  failed-cid (or (:verified-cid pending) (:target-cid pending))
                   diag {:effect :diagnose
                         :type :diagnose
                         :reason :light-update-health-check-failed-rollback
                         :lkg-version lkg-ver
-                        :lkg-cid lkg-cid}
+                        :lkg-cid lkg-cid
+                        :quarantined-cid failed-cid}
                   st1 (-> state
                           (assoc :phase :rolled-back
                                  :current-version lkg-ver
                                  :current-cid lkg-cid
                                  :pending-update nil
                                  :last-error :light-update-health-check-failed-rollback)
+                          (cond-> failed-cid (update :quarantined-cids (fnil conj #{}) failed-cid))
                           (update :generation inc)
                           (update-in [:diagnostics :light-update-health-check-failed-rollback] (fnil inc 0)))
                   [st2 obs-eff] (light-update-obs-record st1 ep :rolled-back {:lkg-version lkg-ver
-                                                                              :lkg-cid lkg-cid})]
+                                                                              :lkg-cid lkg-cid
+                                                                              :quarantined-cid failed-cid})]
               [st2 [{:effect :restore-lkg-light-bundle
                      :lkg-version lkg-ver
-                     :lkg-cid lkg-cid}
+                     :lkg-cid lkg-cid
+                     :quarantined-cid failed-cid}
                     diag
                     obs-eff]])))
 

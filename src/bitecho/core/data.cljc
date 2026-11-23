@@ -178,6 +178,37 @@
                       (conj effs diag)))
              [st effs])))))))
 
+(defn demote-blob-to-cold
+  "BIP-021 §2.7: Demotes an unpinned (or superseded) hot blob in `store` to cold metadata,
+   releasing off-heap `:bytes` references while retaining CID metadata for disk-backed reload.
+   Refuses to demote pinned blobs unless `:force? true` is passed."
+  ([store cid]
+   (demote-blob-to-cold store cid nil))
+  ([store cid opts]
+   (let [entry (get-in store [:entries cid])]
+     (cond
+       (nil? entry)
+       {:demoted? false :reason :not-found :store store}
+
+       (nil? (:bytes entry))
+       {:demoted? false :reason :already-cold :store store}
+
+       (and (not (:force? opts))
+            (or (pos? (long (:pins entry 0))) (true? (:app-pinned? entry))))
+       {:demoted? false :reason :pinned :store store}
+
+       :else
+       (let [sz (long (:size entry 0))
+             was-app-pinned? (boolean (:app-pinned? entry))
+             st' (-> store
+                     (assoc-in [:entries cid :bytes] nil)
+                     (assoc-in [:entries cid :cold?] true)
+                     (update :hot-bytes #(max 0 (- (long (or % 0)) sz)))
+                     (cond-> was-app-pinned?
+                       (update :pinned-app-bytes #(max 0 (- (long (or % 0)) sz))))
+                     (update-in [:diagnostics :blob-demoted-cold] (fnil inc 0)))]
+         {:demoted? true :cid cid :freed-bytes sz :store st'})))))
+
 (defn put-blob
   "Purely inserts or warms a Blob in store after verifying `sha256(:blob/bytes) == :blob/cid`.
    Idempotent if CID is already hot in store. Fails closed with counted `:diagnose` on hash mismatch.

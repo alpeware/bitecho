@@ -93,7 +93,7 @@
           [st3 effs3] (deploy/reduce-light-update-tick st2 {:type :health-check-result :healthy? false :generation (:generation st2)})]
       (is (= :watching (:phase st-pin')))
       (is (= :pinned (get-in (first effs-pin) [:record :data :transition])))
-      (is (= :fetching (:phase st1)))
+      (is (= :fetching-https (:phase st1)))
       (is (some #(= :fetch-bundle-blob (:effect %)) effs1))
       (is (= 1 (:dropped st-stale)))
       (is (= :stale-generation-callback (:reason (first effs-stale))))
@@ -151,7 +151,7 @@
           [st-down effs-down] (deploy/reduce-light-update-tick st0 {:type :pointer-seen :pointer ptr-downgrade :generation 1})]
       (is (= :watching (:phase st-noop)))
       (is (some #(= :light-update-non-monotonic-version (:reason %)) effs-noop))
-      (is (= :fetching (:phase st-hotfix)))
+      (is (= :fetching-https (:phase st-hotfix)))
       (is (some #(= :fetch-bundle-blob (:effect %)) effs-hotfix))
       (is (= :watching (:phase st-down)))
       (is (some #(= :light-update-non-monotonic-version (:reason %)) effs-down)))))

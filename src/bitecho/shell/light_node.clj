@@ -306,6 +306,7 @@
          relay-cli (extract-flag-value clean-args "--relay-url" nil)
          relay-url (resolve-relay-url relay-cli getenv-fn)
          subnet-id (extract-flag-value clean-args "--subnet-id" nil)
+         reset-network-state? (boolean (some #(= % "--reset-network-state") clean-args))
          trusted-dac-anchors-raw (extract-flag-value clean-args "--trusted-dac-anchors" nil)
          trusted-dac-anchors (when (and (string? trusted-dac-anchors-raw) (not (str/blank? trusted-dac-anchors-raw)))
                                (let [raw-items (if (or (str/starts-with? (str/trim trusted-dac-anchors-raw) "[")
@@ -378,6 +379,7 @@
        min-balance (assoc :min-balance min-balance)
        after-ts (assoc :after-ts after-ts)
        subnet-id (assoc :subnet-id subnet-id)
+       reset-network-state? (assoc :reset-network-state? true)
        timeout-ms (assoc :timeout-ms timeout-ms)
        ingress-tcp-port (assoc :ingress-tcp-port (int ingress-tcp-port))
        (seq trusted-dac-anchors) (assoc :trusted-dac-anchors trusted-dac-anchors)
@@ -3369,8 +3371,28 @@
             identity (load-or-create-light-identity! state-dir)
             bootstrap (discovery/load-bootstrap-descriptor! (:bootstrap opts))
             loaded-state (load-light-state! state-file)
-            base-state (or (when loaded-state
-                             (cond-> loaded-state
+            reconciled-res (when loaded-state
+                             (light-core/reconcile-startup-subnet-id
+                              loaded-state
+                              (:subnet-id opts)
+                              (:subscribe-subnets opts)
+                              {:reset-network-state? (boolean (:reset-network-state? opts))}))
+            _ (when (and reconciled-res (false? (:ok? reconciled-res)))
+                (emit-json-line! out-writer
+                                 {"event" "cross-network-subnet-switch-blocked"
+                                  "ok" false
+                                  "error" "cross-network-subnet-switch-blocked"
+                                  "from" (:subnet-id loaded-state)
+                                  "to" (:subnet-id opts)}
+                                 (:events-out opts))
+                (throw (ex-info "Cross-network subnet switch blocked (pass --reset-network-state to override)"
+                                {:error :cross-network-subnet-switch-blocked})))
+            _ (when (and reconciled-res (:reconciled? reconciled-res))
+                (doseq [ev (:stdout-events reconciled-res)]
+                  (emit-json-line! out-writer ev (:events-out opts))))
+            loaded-reconciled (if reconciled-res (:state reconciled-res) loaded-state)
+            base-state (or (when loaded-reconciled
+                             (cond-> loaded-reconciled
                                (some? (:autonomous? opts)) (assoc :autonomous? (boolean (:autonomous? opts)))
                                (seq (:nodes bootstrap)) (assoc :bootstrap bootstrap)
                                (:directory-pubkey bootstrap) (assoc :trusted-directory-pubkey (:directory-pubkey bootstrap))
@@ -3839,8 +3861,28 @@
             identity (load-or-create-light-identity! state-dir)
             bootstrap (discovery/load-bootstrap-descriptor! (:bootstrap opts))
             loaded-state (load-light-state! state-file)
-            base-state (or (when loaded-state
-                             (cond-> loaded-state
+            reconciled-res (when loaded-state
+                             (light-core/reconcile-startup-subnet-id
+                              loaded-state
+                              (:subnet-id opts)
+                              (:subscribe-subnets opts)
+                              {:reset-network-state? (boolean (:reset-network-state? opts))}))
+            _ (when (and reconciled-res (false? (:ok? reconciled-res)))
+                (emit-json-line! out-writer
+                                 {"event" "cross-network-subnet-switch-blocked"
+                                  "ok" false
+                                  "error" "cross-network-subnet-switch-blocked"
+                                  "from" (:subnet-id loaded-state)
+                                  "to" (:subnet-id opts)}
+                                 (:events-out opts))
+                (throw (ex-info "Cross-network subnet switch blocked (pass --reset-network-state to override)"
+                                {:error :cross-network-subnet-switch-blocked})))
+            _ (when (and reconciled-res (:reconciled? reconciled-res))
+                (doseq [ev (:stdout-events reconciled-res)]
+                  (emit-json-line! out-writer ev (:events-out opts))))
+            loaded-reconciled (if reconciled-res (:state reconciled-res) loaded-state)
+            base-state (or (when loaded-reconciled
+                             (cond-> loaded-reconciled
                                (some? (:autonomous? opts)) (assoc :autonomous? (boolean (:autonomous? opts)))
                                (seq (:nodes bootstrap)) (assoc :bootstrap bootstrap)
                                (:directory-pubkey bootstrap) (assoc :trusted-directory-pubkey (:directory-pubkey bootstrap))

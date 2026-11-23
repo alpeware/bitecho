@@ -967,7 +967,16 @@
     "broadcast-gap-detected" "foreign-unicast-dropped" "events-out-mismatch"
     ;; BIP-018 blob-store persistence keys
     "blob-hot-evicted" "max-pinned-app-bytes" "max-hot-blob-bytes"
-    "pinned-app-bytes" "pinned-app-cap-exceeded" "blob-stored-cold"})
+    "pinned-app-bytes" "pinned-app-cap-exceeded" "blob-stored-cold"
+    ;; BIP-021 non-liveness persisted keys (Rule 4: :connected?, :connection-error, :auto-sync-in-flight? strictly excluded)
+    "rekey-required?" "rekey-required" "reoffer-recommended?" "reoffer-recommended"
+    "tx-tainted?" "tx-tainted" "auto-sync-last-error" "rx-ciphertext-hashes" "ciphertext-sha256"
+    "subnet-id-reconciled" "cross-network-subnet-switch-blocked"
+    "broadcast-malformed" "broadcast-sig-invalid" "broadcast-dac-missing" "broadcast-dac-invalid"
+    "broadcast-sig-invalid-queue-throttled" "dac-required-missing"
+    "session-replay-detected" "session-stale-seq-detected" "session-rx-gap-detected"
+    "session-tx-seq-rollback-detected" "session-tx-seq-rollback-evicted" "session-ack-invalid"
+    "rollback-collision" "auto-update-mesh-fallback" "update-poll-suppressed"})
 
 (def ^:private allowed-persistence-keys-compact
   (into #{} (map #(str/replace % #"[-?]" "") allowed-persistence-keys)))
@@ -1597,6 +1606,126 @@
      :diagnostics (:diagnostics bob-final)}))
 
 ;; =============================================================================
+;; 10b. BIP-021 §2.5.1-§2.5.2 Honest Liveness Projection & Visibility Auto-Sync
+;; =============================================================================
+
+(defn project-light-state-liveness
+  "Pure Rule 4 liveness projector (BIP-021 §2.5.1).
+   Overlays live transient mesh/relay liveness onto `light-state` for status queries
+   WITHOUT persisting `:connected?`, `:connection-error`, or `:auto-sync-in-flight?`.
+   Preserves Hive DEGRADED honesty: when `mesh-open-peers == 0` and only HTTPS relay
+   fallback is active, keeps `:transport-healthy? false` and preserves `:connection-error`."
+  [light-state {:keys [mesh-open-peers relay-fallback-active? connection-error mesh-connected?]}]
+  (let [open-peers (long (or mesh-open-peers 0))
+        mesh-live? (or (pos? open-peers) (true? mesh-connected?))
+        relay-fallback? (and (not mesh-live?) (boolean relay-fallback-active?))
+        healthy? (and mesh-live? (nil? connection-error))]
+    (assoc (or light-state {})
+           :connected? mesh-live?
+           :mesh-open-peers open-peers
+           :relay-fallback-active? relay-fallback?
+           :connection-error connection-error
+           :transport-healthy? healthy?)))
+
+(def auto-sync-visible-interval-ms
+  "Active browser background auto-sync interval when tab is visible (30,000 ms, BIP-021 §2.5.2)."
+  30000)
+
+(def auto-sync-hidden-interval-ms
+  "Throttled browser background auto-sync interval when tab is hidden (>= 180,000 ms, BIP-021 §2.5.2)."
+  180000)
+
+(def auto-sync-fetch-timeout-ms
+  "Per-tick fetch timeout (< interval) for browser background auto-sync (10,000 ms, BIP-021 §2.5.2)."
+  10000)
+
+(defn auto-sync-interval-ms
+  "Returns the bounded auto-sync interval (ms) for a browser visibility state (:visible or :hidden)."
+  [visibility]
+  (if (= (keyword (or visibility :visible)) :hidden)
+    auto-sync-hidden-interval-ms
+    auto-sync-visible-interval-ms))
+
+(defn init-auto-sync-state
+  "Initializes single-authority generation-tagged browser auto-sync state (BIP-021 §2.5.2, Rule 4)."
+  ([] (init-auto-sync-state nil))
+  ([opts]
+   {:generation (long (or (:generation opts) 1))
+    :visibility (keyword (or (:visibility opts) :visible))
+    :auto-sync-in-flight? false
+    :last-error nil
+    :ignored-stale 0
+    :diagnostics {}}))
+
+(defn transition-auto-sync
+  "Pure generation-tagged reducer `(transition-auto-sync st event) -> [new-st effects]`
+   for bounded periodic browser auto-sync (BIP-021 §2.5.2, Rules 2, 4, 5)."
+  [st event]
+  (let [st (merge (init-auto-sync-state) st)
+        cur-gen (long (:generation st 1))
+        ev-gen (:generation event)]
+    (if (and (some? ev-gen) (< (long ev-gen) cur-gen))
+      [(-> st
+           (update :ignored-stale (fnil inc 0))
+           (update-in [:diagnostics :stale-auto-sync-callback] (fnil inc 0)))
+       [{:effect :diagnose
+         :type :diagnose
+         :reason :stale-auto-sync-callback
+         :event-generation (long ev-gen)
+         :current-generation cur-gen}]]
+      (case (:type event)
+        :tick
+        (let [vis (keyword (or (:visibility event) (:visibility st) :visible))
+              active? (boolean (:mesh-or-relay-active? event))]
+          (cond
+            (:auto-sync-in-flight? st)
+            [st [{:effect :diagnose :type :diagnose :reason :auto-sync-tick-skipped-in-flight}]]
+
+            (not active?)
+            [(assoc st :visibility vis) []]
+
+            :else
+            [(assoc st :visibility vis :auto-sync-in-flight? true)
+             [{:effect :run-auto-sync
+               :generation cur-gen
+               :timeout-ms auto-sync-fetch-timeout-ms}]]))
+
+        :visibility-change
+        (let [vis (keyword (or (:visibility event) :visible))
+              prev-vis (keyword (or (:prev-visibility event) (:visibility st) :visible))
+              resume? (and (= prev-vis :hidden) (= vis :visible))]
+          (if (and resume? (not (:auto-sync-in-flight? st)))
+            [(assoc st :visibility vis :auto-sync-in-flight? true)
+             [{:effect :reschedule-auto-sync :interval-ms (auto-sync-interval-ms vis) :generation cur-gen}
+              {:effect :run-auto-sync :generation cur-gen :timeout-ms auto-sync-fetch-timeout-ms :reason :visibility-resume}]]
+            [(assoc st :visibility vis)
+             [{:effect :reschedule-auto-sync :interval-ms (auto-sync-interval-ms vis) :generation cur-gen}]]))
+
+        :online
+        (if (:auto-sync-in-flight? st)
+          [st []]
+          [(assoc st :auto-sync-in-flight? true)
+           [{:effect :run-auto-sync :generation cur-gen :timeout-ms auto-sync-fetch-timeout-ms :reason :network-online}]])
+
+        :complete
+        [(assoc st :auto-sync-in-flight? false :last-error (:error event)) []]
+
+        :timeout
+        [(-> st
+             (assoc :auto-sync-in-flight? false :last-error "auto-sync-timeout")
+             (update-in [:diagnostics :auto-sync-timeout] (fnil inc 0)))
+         [{:effect :diagnose
+           :type :diagnose
+           :reason :auto-sync-timeout
+           :generation cur-gen}]]
+
+        :stop
+        [(assoc st :generation (inc cur-gen) :auto-sync-in-flight? false)
+         [{:effect :cancel-auto-sync-timer :generation cur-gen}]]
+
+        [st []]))))
+
+;; =============================================================================
 ;; 11. Pure Browser CLI Execution Interface (Priority 4 / Rules 1, 2, 5, 6)
 ;; =============================================================================
 
@@ -1614,11 +1743,29 @@
        :response {"ok" false "error" (name (or (:error parse-res) :invalid-verb))}
        :net-envelopes []
        :stdout-events []}
-      (let [target-state (if (map? (:light-state state)) (:light-state state) state)
-            res (light-node/handle-command target-state (:cmd-map parse-res) privkey-bytes)
-            updated-state (if (map? (:light-state state))
-                            (assoc state :light-state (:state res))
-                            (:state res))]
+      (let [has-light-state? (map? (:light-state state))
+            base-target (if has-light-state? (:light-state state) state)
+            liveness-target (if (and has-light-state? (= "status" (:verb parse-res)))
+                              (let [open-peers (long (or (:mesh-open-peers state)
+                                                         (count (filter (fn [[_ v]] (= :open (:phase v))) (:mesh-conns state)))
+                                                         (when (= :open (get-in state [:conn :phase])) 1)
+                                                         0))
+                                    conn-err (or (get-in state [:conn :last-error]) (:connection-error state))
+                                    relay-active? (boolean (or (:relay-fallback-healthy? state)
+                                                               (:relay-fallback-active? state)))]
+                                (project-light-state-liveness base-target
+                                                              {:mesh-open-peers open-peers
+                                                               :relay-fallback-active? relay-active?
+                                                               :connection-error conn-err}))
+                              base-target)
+            res (light-node/handle-command liveness-target (:cmd-map parse-res) privkey-bytes)
+            ;; Rule 4: never write projected liveness back into persisted :light-state
+            next-light (if (= "status" (:verb parse-res))
+                         base-target
+                         (:state res))
+            updated-state (if has-light-state?
+                            (assoc state :light-state next-light)
+                            next-light)]
         {:ok? (boolean (get-in res [:response "ok"] true))
          :state updated-state
          :verb (:verb parse-res)

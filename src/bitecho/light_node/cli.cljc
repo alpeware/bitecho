@@ -221,6 +221,7 @@
 (def known-command-flags
   "Inventory of all supported CLI flags across Bitecho shells (Rule 6)."
   ["--state-dir" "--control-port" "--bootstrap" "--relay-url" "--relay-urls" "--quorum" "--subnet-id" "--subnet"
+   "--reset-network-state"
    "--subscribe-subnets" "--subnets" "--transport" "--proxy" "--timeout-ms" "--max-epoch-skew"
    "--cmd-file" "--events-out" "--session-id" "--session" "--min-seq" "--min-broadcast-seq"
    "--cursor" "--after-ts" "--min-balance" "--non-destructive"

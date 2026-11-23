@@ -202,9 +202,8 @@
 
 (defn- buf->u8 ^js [buf]
   (if (instance? js/Uint8Array buf)
-    (js/Uint8Array. (.-buffer buf) (.-byteOffset buf) (.-byteLength buf))
-    (let [b (.from js/Buffer buf)]
-      (js/Uint8Array. (.-buffer b) (.-byteOffset b) (.-byteLength b)))))
+    (crypto/compact-u8 buf)
+    (crypto/compact-u8 (.from js/Buffer buf))))
 
 (defn- u8->buf ^js [u8]
   (if (.isBuffer js/Buffer u8)
@@ -1049,6 +1048,28 @@
         rt-ep (long (or @(:epoch-atom rt) 0))]
     (max v-fin rt-ep)))
 
+(defonce ^:private passthrough-registry-atom
+  (atom {:next-id 1
+         :active-pairs {}
+         :draining-order []
+         :active-timers 0}))
+
+(defn- count-proc-self-fds []
+  (try
+    (when (.existsSync node-fs "/proc/self/fd")
+      (alength (.readdirSync node-fs "/proc/self/fd")))
+    (catch :default _ nil)))
+
+(defn- count-tcp-socket-wraps []
+  (try
+    (when (fn? (aget js/process "_getActiveHandles"))
+      (let [handles (.call (aget js/process "_getActiveHandles") js/process)]
+        (count (filter (fn [h]
+                         (let [ctor (some-> h .-constructor .-name)]
+                           (or (= ctor "Socket") (= ctor "TCPSocketWrap"))))
+                       (array-seq handles)))))
+    (catch :default _ nil)))
+
 (defn- build-statusz-payload
   [rt limiter-atom http-shell-atom dns-shell-atom smtp-shell-atom]
   (let [sub @(:subnet-atom rt)
@@ -1063,7 +1084,8 @@
                      :external-bytes (.-external m)
                      :array-buffers-bytes (.-arrayBuffers m)})
                   (catch :default _ nil))
-        memory (core-infra/normalize-memory-telemetry mem-raw)]
+        memory (core-infra/normalize-memory-telemetry mem-raw)
+        pt-reg @passthrough-registry-atom]
     {:ok true
      :runtime "nodejs"
      :version full-node-version
@@ -1077,6 +1099,11 @@
      :egress_bytes egress
      :pointer_count (count (get-in sub [:data :pointers]))
      :memory memory
+     :passthrough {:active_pairs (count (:active-pairs pt-reg))
+                   :draining_pairs (count (:draining-order pt-reg))
+                   :active_drain_timers (long (:active-timers pt-reg 0))
+                   :tcp_socket_wraps (count-tcp-socket-wraps)
+                   :open_fds (count-proc-self-fds)}
      :diagnostics {:runtime (core-infra/shell-status-summary @(:shell-atom rt))
                    :http (when http-shell-atom (core-infra/shell-status-summary @http-shell-atom))
                    :dns (when dns-shell-atom (core-infra/shell-status-summary @dns-shell-atom))
@@ -2297,23 +2324,66 @@
    paused sockets with unread TLS `close_notify` buffers are always destroyed cleanly
    (fixing the live `TCPSocketWrap`/`ArrayBuffer` leak, BIP-018-SOAK-F1)."
   [client-sock backend-sock shell-atom]
-  (let [pair-atom (atom (core-infra/init-passthrough-pair {:generation 1}))
+  (let [pair-id (str "pt-" (:next-id (swap! passthrough-registry-atom update :next-id inc)))
+        pair-atom (atom (core-infra/init-passthrough-pair {:generation 1 :pair-id pair-id}))
+        drain-started-at-atom (atom nil)
         drain-timer-atom (atom nil)
         clear-timer! (fn []
                        (when-let [t @drain-timer-atom]
                          (reset! drain-timer-atom nil)
+                         (swap! passthrough-registry-atom update :active-timers #(max 0 (dec (long (or % 0)))))
                          (js/clearTimeout t)))
+        cleanup-pair! (fn []
+                        (clear-timer!)
+                        (try (.unpipe client-sock backend-sock) (catch :default _ nil))
+                        (try (.unpipe backend-sock client-sock) (catch :default _ nil))
+                        (swap! passthrough-registry-atom
+                               (fn [reg]
+                                 (-> reg
+                                     (update :active-pairs dissoc pair-id)
+                                     (update :draining-order #(vec (remove (fn [id] (= id pair-id)) %)))))))
         sock-for (fn [side] (if (= side :client) client-sock backend-sock))
+        force-destroy-both! (fn []
+                              (cleanup-pair!)
+                              (when (and client-sock (not (.-destroyed client-sock)))
+                                (try (.destroy client-sock) (catch :default _ nil)))
+                              (when (and backend-sock (not (.-destroyed backend-sock)))
+                                (try (.destroy backend-sock) (catch :default _ nil))))
+        _ (swap! passthrough-registry-atom assoc-in [:active-pairs pair-id] force-destroy-both!)
         step! (fn step! [ev]
-                (let [effs-box (atom [])]
+                (let [effs-box (atom [])
+                      prev-phase (:phase @pair-atom)]
                   (swap! pair-atom
                          (fn [st]
                            (let [[st' effs] (core-infra/transition-passthrough-pair st ev)]
                              (reset! effs-box effs)
                              st')))
+                  (let [next-phase (:phase @pair-atom)]
+                    (when (and (not= prev-phase :draining) (= next-phase :draining))
+                      (reset! drain-started-at-atom (.now js/Date))
+                      (let [cap-res-box (atom nil)]
+                        (swap! passthrough-registry-atom
+                               (fn [reg]
+                                 (let [r (core-infra/enforce-draining-pair-cap
+                                          (:draining-order reg)
+                                          pair-id
+                                          core-infra/default-max-draining-pairs)]
+                                   (reset! cap-res-box r)
+                                   (assoc reg :draining-order (:draining-order r)))))
+                        (when-let [cap-res @cap-res-box]
+                          (doseq [ce (:effects cap-res)]
+                            (case (:effect ce)
+                              :diagnose
+                              (apply-shell-event! shell-atom {:type :drop :reason (:reason ce) :detail (str (:evicted-pair-id ce))})
+                              :force-destroy-pair
+                              (when-let [f (get-in @passthrough-registry-atom [:active-pairs (:pair-id ce)])]
+                                (f))
+                              nil)))))
+                    (when (= next-phase :closed)
+                      (cleanup-pair!)))
                   (doseq [eff @effs-box]
                     (case (:effect eff)
-                      :clear-drain-timeout
+                      (:clear-drain-timeout :cancel-drain-timeout)
                       (clear-timer!)
 
                       :end-socket
@@ -2324,6 +2394,7 @@
                       :destroy-socket
                       (let [s (sock-for (:side eff))]
                         (when (and s (not (.-destroyed s)))
+                          (try (.removeAllListeners s "drain") (catch :default _ nil))
                           (try (.destroy s) (catch :default _ nil))))
 
                       :schedule-drain-timeout
@@ -2333,10 +2404,13 @@
                               ms (long (or (:timeout-ms eff) core-infra/default-passthrough-drain-timeout-ms))
                               t (js/setTimeout
                                  (fn []
-                                   (reset! drain-timer-atom nil)
+                                   (when @drain-timer-atom
+                                     (reset! drain-timer-atom nil)
+                                     (swap! passthrough-registry-atom update :active-timers #(max 0 (dec (long (or % 0))))))
                                    (step! {:type :drain-timeout :side side :generation 1}))
                                  ms)]
                           (when (.-unref t) (.unref t))
+                          (swap! passthrough-registry-atom update :active-timers (fnil inc 0))
                           (reset! drain-timer-atom t)))
 
                       :diagnose
@@ -2346,6 +2420,20 @@
                                             (:side eff) (assoc :side (:side eff))))
 
                       nil))))]
+    (.on client-sock "drain"
+         (fn []
+           (when (= :draining (:phase @pair-atom))
+             (step! {:type :drain-progress
+                     :side :client
+                     :elapsed-ms (- (.now js/Date) (long (or @drain-started-at-atom (.now js/Date))))
+                     :generation 1}))))
+    (.on backend-sock "drain"
+         (fn []
+           (when (= :draining (:phase @pair-atom))
+             (step! {:type :drain-progress
+                     :side :backend
+                     :elapsed-ms (- (.now js/Date) (long (or @drain-started-at-atom (.now js/Date))))
+                     :generation 1}))))
     (.on client-sock "error"
          (fn [e] (step! {:type :socket-error :side :client :detail (.-message e) :generation 1})))
     (.on backend-sock "error"
@@ -3548,7 +3636,7 @@
                               (.on res "data" (fn [c] (.push chunks c)))
                               (.on res "end" (fn []
                                                (let [buf (js/Buffer.concat chunks)
-                                                     u8 (js/Uint8Array. (.-buffer buf) (.-byteOffset buf) (.-byteLength buf))]
+                                                     u8 (crypto/compact-u8 buf)]
                                                  (done! {:ok? (and (>= status-code 200) (< status-code 300))
                                                          :status status-code
                                                          :bytes u8}))))
@@ -3570,16 +3658,19 @@
     (let [nid (if (keyword? node-id) (name node-id) (str node-id))
           bundle-path (when (exists? js/__filename) js/__filename)
           poll-ms (max 5000 (long (or (:auto-update-interval-ms config) 60000)))
+          trusted-auths (or (not-empty (:trusted-deploy-authorities config))
+                            #{config/infra-cold-root-pubkey})
           updater-atom (atom (deploy/init-light-updater-state
                               {:node-id nid
                                :artifact-role :full-node
                                :current-version full-node-version
                                :current-cid (running-bundle-sha256)
-                               :trusted-deploy-authorities (:trusted-deploy-authorities config)
+                               :trusted-deploy-authorities trusted-auths
                                :pinned-version (:pin-version config)
                                :poll-interval-ms poll-ms}))
           staged-bytes-atom (atom nil)
           staged-path-atom (atom nil)
+          stage-write-promise-atom (atom nil)
           fsp (.-promises node-fs)
           dispatch! (fn dispatch! [ev]
                       (let [effs-box (atom [])]
@@ -3614,7 +3705,9 @@
                                    (do
                                      (reset! staged-bytes-atom (:bytes res))
                                      (dispatch! {:type :blob-fetched :cid cid :bytes (:bytes res) :generation gen}))
-                                   (log-diagnostic! {:effect :diagnose :reason :full-update-fetch-blob-failed :node-id nid :cid cid :error (:error res)})))))
+                                   (do
+                                     (log-diagnostic! {:effect :diagnose :reason :full-update-fetch-blob-failed :node-id nid :cid cid :error (:error res)})
+                                     (dispatch! {:type :blob-fetch-failed :cid cid :reason (:error res) :generation gen}))))))
 
                             :stage-light-bundle
                             (when (and bundle-path @staged-bytes-atom)
@@ -3623,37 +3716,44 @@
                                     tmp-p (.join node-path dir (str ".bitecho-full-update-" cid8 ".cjs.tmp"))
                                     buf (u8->buf @staged-bytes-atom)]
                                 (reset! staged-path-atom tmp-p)
-                                (-> (.writeFile fsp tmp-p buf #js {:mode 0755})
-                                    (.catch (fn [e]
-                                              (log-diagnostic! {:effect :diagnose :reason :full-update-stage-failed :node-id nid :detail (.-message e)}))))))
+                                (reset! stage-write-promise-atom
+                                        (-> (.writeFile fsp tmp-p buf #js {:mode 0755})
+                                            (.catch (fn [e]
+                                                      (log-diagnostic! {:effect :diagnose :reason :full-update-stage-failed :node-id nid :detail (.-message e)})
+                                                      (throw e)))))))
 
                             :atomic-swap-and-restart-light-node
                             (let [gen (:generation eff)
                                   cid (:cid eff)
-                                  tmp-p @staged-path-atom]
+                                  tmp-p @staged-path-atom
+                                  write-p (or @stage-write-promise-atom (js/Promise.resolve nil))]
                               (when (and bundle-path tmp-p)
-                                (.execFile node-child-process
-                                           (.-execPath js/process)
-                                           #js [tmp-p "--self-test"]
-                                           #js {:timeout 15000}
-                                           (fn [err stdout _stderr]
-                                             (let [ok? (and (nil? err)
-                                                            (try
-                                                              (true? (aget (js/JSON.parse (str stdout)) "ok"))
-                                                              (catch :default _ false)))]
-                                               (if-not ok?
-                                                 (dispatch! {:type :health-check-result :healthy? false :generation gen})
-                                                 (let [lkg-p (str bundle-path ".lkg")]
-                                                   (-> (.copyFile fsp bundle-path lkg-p)
-                                                       (.catch (fn [_] nil))
-                                                       (.then (fn [_] (.rename fsp tmp-p bundle-path)))
-                                                       (.then (fn [_]
-                                                                (log-diagnostic! {:effect :auto-update-applied :node-id nid :cid cid :restarting true})
-                                                                (when stop-fn! (try (stop-fn!) (catch :default _ nil)))
-                                                                (.exit js/process 0)))
-                                                       (.catch (fn [e]
-                                                                 (log-diagnostic! {:effect :diagnose :reason :full-update-swap-failed :node-id nid :detail (.-message e)})
-                                                                 (dispatch! {:type :health-check-result :healthy? false :generation gen})))))))))))
+                                (-> write-p
+                                    (.then (fn [_]
+                                             (.execFile node-child-process
+                                                        (.-execPath js/process)
+                                                        #js [tmp-p "--self-test"]
+                                                        #js {:timeout 15000}
+                                                        (fn [err stdout _stderr]
+                                                          (let [ok? (and (nil? err)
+                                                                         (try
+                                                                           (true? (aget (js/JSON.parse (str stdout)) "ok"))
+                                                                           (catch :default _ false)))]
+                                                            (if-not ok?
+                                                              (dispatch! {:type :health-check-result :healthy? false :generation gen})
+                                                              (let [lkg-p (str bundle-path ".lkg")]
+                                                                (-> (.copyFile fsp bundle-path lkg-p)
+                                                                    (.catch (fn [_] nil))
+                                                                    (.then (fn [_] (.rename fsp tmp-p bundle-path)))
+                                                                    (.then (fn [_]
+                                                                             (log-diagnostic! {:effect :auto-update-applied :node-id nid :cid cid :restarting true})
+                                                                             (when stop-fn! (try (stop-fn!) (catch :default _ nil)))
+                                                                             (.exit js/process 0)))
+                                                                    (.catch (fn [e]
+                                                                              (log-diagnostic! {:effect :diagnose :reason :full-update-swap-failed :node-id nid :detail (.-message e)})
+                                                                              (dispatch! {:type :health-check-result :healthy? false :generation gen})))))))))))
+                                    (.catch (fn [_]
+                                              (dispatch! {:type :health-check-result :healthy? false :generation gen}))))))
 
                             :restore-lkg-light-bundle
                             (do

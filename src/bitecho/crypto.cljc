@@ -125,12 +125,26 @@
                    (aset out (+ (* i 4) 3) (bit-and hv 0xff))))
                out)))))))
 
+#?(:cljs
+   (defn compact-u8
+     "BIP-021 §2.7: Returns an exact-sized compact `Uint8Array` copy from a Node.js `Buffer`
+      or pooled `Uint8Array` view so `(.-byteLength (.-buffer u8)) == (.-byteLength u8)` and
+      `(.-byteOffset u8) == 0`, preventing 64 KiB `Buffer.poolSize` slab pinning."
+     ^js [buf-or-u8]
+     (let [u8 (if (instance? js/Uint8Array buf-or-u8)
+                buf-or-u8
+                (js/Uint8Array. (or buf-or-u8 0)))]
+       (if (and (zero? (.-byteOffset u8))
+                (= (.-byteLength (.-buffer u8)) (.-byteLength u8)))
+         u8
+         (.slice (js/Uint8Array. (.-buffer u8) (.-byteOffset u8) (.-byteLength u8)))))))
+
 (defn sha256
   "Computes the SHA-256 hash of the given byte array or string.
    Pure and synchronous on both JVM and ClojureScript.
    Uses native `node:crypto` on Node.js (avoiding transient 512 KiB Uint32Array allocations
    under large chunk bursts, BIP-018-SOAK-F1) and falls back to `pure-cljs-sha256` in browsers.
-   Returns a 32-byte array (byte[] on JVM, Uint8Array on CLJS)."
+   Returns a 32-byte array (byte[] on JVM, exact-sized compact Uint8Array on CLJS)."
   [input]
   (let [ba (if (string? input)
              (fressian/utf8->bytes input)
@@ -141,7 +155,7 @@
                (let [digest (-> (.createHash node-crypto "sha256")
                                 (.update ba)
                                 (.digest))]
-                 (js/Uint8Array. (.-buffer digest) (.-byteOffset digest) (.-byteLength digest)))
+                 (compact-u8 digest))
                (pure-cljs-sha256 ba)))))
 
 (defn sha256-hex

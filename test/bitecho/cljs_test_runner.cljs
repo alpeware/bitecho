@@ -12,6 +12,7 @@
             [bitecho.d45-bip018-hardening-and-failover-test]
             [bitecho.d46-bip019-fepoch1-test]
             [bitecho.d47-bip020-delivery-telemetry-test]
+            [bitecho.d48-bip021-subnet-session-updater-test]
             [bitecho.economy.account-test]
             [bitecho.economy.burn-test]
             [bitecho.economy.treasury-test]
@@ -71,6 +72,7 @@
              'bitecho.core.subnet-test
              'bitecho.d45-bip018-hardening-and-failover-test
              'bitecho.d46-bip019-fepoch1-test
-             'bitecho.d47-bip020-delivery-telemetry-test))
+             'bitecho.d47-bip020-delivery-telemetry-test
+             'bitecho.d48-bip021-subnet-session-updater-test))
 
 (set! *main-cli-fn* -main)

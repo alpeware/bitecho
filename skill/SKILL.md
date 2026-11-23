@@ -69,7 +69,7 @@ Every flag in `bitecho.light-node.cli/known-command-flags` is automatically veri
 | Category | Live Flags |
 | :--- | :--- |
 | **State, Daemon & Control** | `--state-dir`, `--control-port`, `--cmd-file`, `--events-out`, `--help`, `--mcp` |
-| **Network, Relay & Subnets** | `--bootstrap`, `--relay-url`, `--relay-urls`, `--quorum`, `--subnet-id`, `--subnet`, `--subscribe-subnets`, `--subnets`, `--transport`, `--proxy`, `--ingress-tcp-port`, `--trusted-dac-anchors`, `--max-epoch-skew` |
+| **Network, Relay & Subnets** | `--bootstrap`, `--relay-url`, `--relay-urls`, `--quorum`, `--subnet-id`, `--subnet`, `--reset-network-state`, `--subscribe-subnets`, `--subnets`, `--transport`, `--proxy`, `--ingress-tcp-port`, `--trusted-dac-anchors`, `--max-epoch-skew` |
 | **TURN & P2P Signaling** | `--turn-server`, `--turn-username`, `--turn-password`, `--turn-realm`, `--turn-force-relay`, `--endpoint`, `--candidates`, `--wait-open-ms` |
 | **Auto-Sync & `P-UPD-1` Auto-Update (`D40.2.1`)** | `--autonomous`, `--auto-sync`, `--sync-interval-ms`, `--auto-register-home-set`, `--no-auto-register-home-set`, `--sync`, `--poll`, `--no-poll`, `--auto-update-pointer`, `--auto-update-interval-ms`, `--pin-version` |
 | **Addressing, Sessions & Messaging** | `--to`, `--from`, `--callee`, `--peer`, `--receiver`, `--recipient`, `--session-id`, `--session`, `--text`, `--message`, `--payload-hex`, `--peek` |

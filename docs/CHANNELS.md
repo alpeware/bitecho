@@ -58,3 +58,9 @@ To prevent missed broadcasts (as observed on 2026-11-20), `chat/simon-nexus-axio
 - **Unconditional Dual-Fanout (N-1 Wire Compatible):** Broadcasts fan out unconditionally to both open P2P channels and validator mesh/relay using byte-identical signed envelopes (route metadata stays strictly local in `delivery_telemetry` and never enters signed wire bytes).
 - **Inner Subnet Filtering on `burn > 0`:** `/relay/v1/poll` filters broadcasts against the inner signed `:subnet-id` even when `burn > 0` wraps the outer gossip envelope as `"*"`.
 - **Catchup Gap & Cursor Honesty:** `/relay/v1/poll` returns `min_available_broadcast_seq` and `relay_id` (including parked wakeups); waking peers emit counted `:broadcast-gap-detected` diagnostics if their cursor fell behind evicted slots. `broadcast-received` events emit `broadcast_seq`, and `ctl wait --cursor <id> --non-destructive --subnet-id <sub` reads non-destructively across concurrent/restarting watchers using `config/equivalent-subnet-id?`.
+
+## 5. Subscribed-Subnet Direct Admission & Startup Authority (`BIP-021`)
+
+- **Startup `subnet_id` Reconciliation & Cross-Network Fence:** Passing `--subnet-id <sub` explicitly overrides stale persisted `:subnet-id` within the same canonical network (emitting `subnet-id-reconciled`), while cross-network-URI switches (`devnet` ↔ `testnet` ↔ `mainnet`) fail closed unless `--reset-network-state` is explicitly passed.
+- **Direct Envelopes & Session Replies on Subscribed Subnets:** Direct offers, sealed messages, ACKs, and P2P answers on subscribed subnets are admitted cleanly and stamped with `(:subnet-id session)`; untagged (`nil`) and wildcard (`"*"`) direct-envelope spoofing is rejected loudly with counted `:subnet-mismatch-dropped`.
+- **Encrypted On-Network Rolodex (`bitecho.org/rolodex`):** Cleanly deferred to `BIP-022`.

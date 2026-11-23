@@ -4,7 +4,8 @@
    (`bitecho.main`), delegating all pointer verification, monotonic version checks,
    SHA-256 == CID checks, pin-version opt-out, stale-generation guards, and LKG rollback
    decisions to pure `.cljc` `bitecho.deploy.core/reduce-light-update-tick`."
-  (:require [bitecho.deploy.core :as deploy]
+  (:require [bitecho.config :as config]
+            [bitecho.deploy.core :as deploy]
             [clojure.edn :as edn]
             [clojure.string :as str])
   (:import [java.net URI]
@@ -75,12 +76,14 @@
           client (-> (HttpClient/newBuilder)
                      (.connectTimeout (Duration/ofSeconds 10))
                      (.build))
+          eff-trusted (or (not-empty trusted-deploy-authorities)
+                          #{config/infra-cold-root-pubkey})
           updater-atom (atom (deploy/init-light-updater-state
                               {:node-id (or node-id "jvm-node")
                                :artifact-role :jvm-jar
                                :current-version (or current-version "0.23.21")
                                :current-cid cur-cid
-                               :trusted-deploy-authorities trusted-deploy-authorities
+                               :trusted-deploy-authorities eff-trusted
                                :pinned-version pinned-version
                                :poll-interval-ms poll-ms}))
           staged-bytes-atom (atom nil)
@@ -107,6 +110,12 @@
                           (emit! {"event" "auto-update-diagnose" "reason" "malformed-pointer-edn"})))
                       (emit! {"event" "auto-update-diagnose" "reason" "fetch-pointer-failed" "error" (:error res)})))
 
+                  :fetch-bundle-mesh-chunks
+                  (dispatch! {:type :mesh-fetch-failed
+                              :cid (:cid eff)
+                              :reason :mesh-chunk-unavailable-jvm
+                              :generation (:generation eff)})
+
                   :fetch-bundle-blob
                   (let [gen (:generation eff)
                         cid (:cid eff)
@@ -116,7 +125,9 @@
                       (do
                         (reset! staged-bytes-atom (:bytes res))
                         (dispatch! {:type :blob-fetched :cid cid :bytes (:bytes res) :generation gen}))
-                      (emit! {"event" "auto-update-diagnose" "reason" "fetch-bundle-blob-failed" "cid" cid "error" (:error res)})))
+                      (do
+                        (emit! {"event" "auto-update-diagnose" "reason" "fetch-bundle-blob-failed" "cid" cid "error" (:error res)})
+                        (dispatch! {:type :blob-fetch-failed :cid cid :reason (:error res) :generation gen}))))
 
                   :stage-light-bundle
                   (when (and jar-path @staged-bytes-atom)
