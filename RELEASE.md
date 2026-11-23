@@ -188,3 +188,19 @@ If any canary or rolling upgrade fails `/healthz`, stalls `finalized_epoch` (`F-
    ./scripts/cluster.sh audit --include-infra
    ```
    Post an incident report with affected node, epoch, and diagnostic counts to `bitecho.org/ops` and `bitecho.org/team`.
+
+---
+
+## 9. Host-Layer Update Cadence & Exposed-Path CVE Triage (`BIP-023`)
+
+Per 5/5-consented [`docs/bips/bip-023-gentoo-host-update-policy.md`](docs/bips/bip-023-gentoo-host-update-policy.md) (Draft 2 CID `1cee2b45cd08080f2628c8cbf644734891a05320c24802deffa70ff88d1cc79c`) and the version-controlled manifest [`config/gentoo/pinned-packages.txt`](config/gentoo/pinned-packages.txt), Gentoo host updates follow five normative rules:
+
+1. **Exposed-Path-Only Urgent CVE Triage (Rule 1):** An out-of-band / urgent host update is triggered **only** when a vulnerability affects a package in the `[exposed-surface]` section of `config/gentoo/pinned-packages.txt` (`sys-kernel/gentoo-kernel-bin`, `net-misc/openssh`, `dev-libs/openssl`, `app-misc/ca-certificates`, `sys-libs/glibc`, `net-libs/nodejs`) **and** is reachable on a code path exposed to untrusted input. Every other CVE rides the next scheduled monthly binhost refresh.
+2. **Monthly Nominal Cadence Floor, Staging-First, Zero Auto-Emerge (Rule 2):**
+   - **Never** run unattended `emerge @world` or compile packages on fleet nodes (`ns1..ns3`, `node1..node3`); `--usepkgonly` is strictly enforced.
+   - Run an operator-initiated **monthly** cadence floor on `bitecho-gentoo-lab` (`35.208.41.134`). A monthly tick may close as a **verified no-op report** when nothing in `config/gentoo/pinned-packages.txt` changed upstream.
+   - Before signing a binhost pointer, run a staging soak on `bitecho-gentoo-lab` verifying OpenRC service health, Bitecho full-node self-test, and **comparing post-GC `/statusz` `{rss, external, arrayBuffers}` against the prior binhost baseline**.
+   - Publish the signed binhost manifest/pointer on-network (verified 3/3 HTTP 200 + `SHA-256 == CID` across `ns1..ns3`) and roll followers-before-leader (`ns3 -> ns2 -> ns1`, `node3 -> node2 -> node1`) via `--usepkgonly`, retaining the prior binpkg/kernel snapshot for instant rollback.
+3. **Read-Only Filtered GLSA Visibility (Rule 3):** Any GLSA check (`glsa-check --test affected` filtered strictly against `[exposed-surface]`) is a **read-only advisory report**, never an automated `emerge` trigger.
+4. **Zero Compliance-Scanner Theater (Rule 4):** Do not gate releases on generic CVE/compliance scanners divorced from deployment context.
+5. **Binhost Integrity & Signatures as Trust Anchor (Rule 5):** Fleet host security anchors on signed binpkg manifests/pointers, fail-closed `SHA-256 == CID` verification prior to `--usepkgonly` install, and LKG snapshot rollback on any post-update health regression.

@@ -1,0 +1,39 @@
+# Bitecho Fleet Gentoo Pinned Package Manifest (BIP-023)
+#
+# Single source of truth for BIP-023 Rules 1, 2, and 3:
+#   - [exposed-surface]: Packages directly exposed to untrusted network input.
+#     Drives Rule 1 (urgent out-of-band CVE triage ONLY when a vulnerability
+#     affects a package here AND is reachable on an exposed code path) and
+#     Rule 3 (read-only advisory GLSA filtering).
+#   - [base-pinned]: Minimal fleet base system packages updated on Rule 2's
+#     nominal monthly operator-initiated binhost cadence on bitecho-gentoo-lab.
+#
+# Populated from live Gentoo host atoms on ns1.bitecho.org & bitecho-gentoo-lab
+# (kernel 6.18.63-gentoo-dist-bin, Node.js v26.13.1, OpenRC 0.64.1-r1).
+# Fleet nodes strictly consume signed binpkgs via --usepkgonly (zero on-node compilation).
+
+[exposed-surface]
+=sys-kernel/gentoo-kernel-bin-6.18.63
+=net-misc/openssh-10.6_p2
+=dev-libs/openssl-3.5.9
+=app-misc/ca-certificates-20260816.3.131.1-r1
+=sys-libs/glibc-2.43-r4
+=net-libs/nodejs-26.13.1-r1
+
+[base-pinned]
+=sys-apps/openrc-0.64.1-r1
+=sys-apps/baselayout-2.18-r1
+=sys-apps/portage-3.0.83-r1
+=sys-apps/coreutils-9.12
+=sys-apps/util-linux-2.42.3
+=sys-apps/iproute2-7.0.0
+=sys-process/procps-4.0.6
+=app-shells/bash-5.3_p20-r1
+=net-misc/curl-8.23.0-r1
+=net-misc/dhcpcd-10.5.2
+=net-firewall/iptables-1.8.13
+=app-arch/tar-1.35-r1
+=app-arch/gzip-1.15
+=app-editors/nano-9.2
+=sys-apps/shadow-4.20.2
+=sys-auth/pambase-20251104-r1

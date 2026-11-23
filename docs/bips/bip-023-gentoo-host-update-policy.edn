@@ -1,0 +1,23 @@
+{:bip-id "BIP-023"
+ :bip/id "BIP-023"
+ :title "BIP-023: Gentoo Host Update Cadence & Exposed-Path CVE Triage Policy"
+ :bip/title "BIP-023: Gentoo Host Update Cadence & Exposed-Path CVE Triage Policy"
+ :version "v0.23.21"
+ :bip/version "0.23.21"
+ :milestone "BIP-023"
+ :bip/milestone "BIP-023"
+ :bip/status :consented
+ :date "2026-11-23"
+ :subnet-id "bitecho.org/dev"
+ :bip/subnet-id "bitecho.org/dev"
+ :change-class :docs-governance-runbooks
+ :proposal-cid "21641d1400e59538496636e80204c65f210da643918b4d27c960b434992323ef"
+ :draft-2-cid "1cee2b45cd08080f2628c8cbf644734891a05320c24802deffa70ff88d1cc79c"
+ :consensus-impact :none
+ :consensus-impact-note "Docs, Governance, and Host Runbooks only (no runtime protocol changes). Codifies 5 normative Gentoo host-layer rules: exposed-path-only urgent CVE triage, monthly staging-first binhost cadence floor (no-op allowed, post-GC /statusz {rss, external, arrayBuffers} baseline comparison), read-only filtered GLSA advisory visibility, zero compliance-scanner theater, and binhost signature integrity as trust anchor. Checks in config/gentoo/pinned-packages.txt split into [exposed-surface] and [base-pinned]."
+ :consent-records [{:agent "simon" :role :human-anchor :verdict :consented :pubkey "302a300506032b657003210023f2014ffc18439ebf8731ba7906f03628c336b22327f91f1ec8739d8e570c3d" :note "Real Stage 2 CONSENT on Draft 2 (1cee2b45..., session seq 11, 2026-11-23T17:31:38Z)"}
+                   {:agent "axiom" :role :architect :verdict :consented :pubkey "302a300506032b6570032100b53afd55492fe17fca9d0ef0e07b367bf8333490e43b4ecd3610c12c8e6a79f8" :note "Real Stage 2 CONSENT on Draft 2 (1cee2b45..., team seq 624)"}
+                   {:agent "vector" :role :soak-tester :verdict :consented :pubkey "302a300506032b6570032100365bd3dc35b4f609d6ac147c129c5b791798765b181d53341e58d6fcf1c6cd62" :note "Real Stage 2 CONSENT on Draft 2 (1cee2b45..., team seq 289)"}
+                   {:agent "lumen" :role :steward :verdict :consented :pubkey "302a300506032b6570032100ccc35a321c00d0f05a056228a5d0682038235aea817a4a0bd4d6c681f5c970de" :note "Real Stage 2 CONSENT on Draft 2 (1cee2b45..., session seq 11)"}
+                   {:agent "nexus" :role :builder-lead :verdict :consented :pubkey "302a300506032b65700321009b33a9ebd1866d6db419edabe2de9ee74c884dc86b4214f60e3a26f04cbd9cfc" :note "Proposer + Real Stage 2 CONSENT on Draft 2 (1cee2b45..., 5/5 unanimous consent closed)"}]
+ :open-findings []}

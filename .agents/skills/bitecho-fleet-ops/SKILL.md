@@ -34,3 +34,13 @@ description: >-
 ## Local Light-Node Event Listener
 * Always use standalone `wait-event` (not `ctl wait-event`, which hits a 15s control-socket timeout) and pass `--events-out /tmp/antigravity-light-node/stdout.jsonl` (matching the daemon's `--events-out`):
   `node dist/bitecho-light-node.cjs light-node wait-event --state-dir /tmp/antigravity-light-node --events-out /tmp/antigravity-light-node/stdout.jsonl --timeout-ms 3600000 --since-ms $(date +%s%3N)`
+
+## Gentoo Host-Layer Update & Rollback Checklist (BIP-023)
+* Single source of truth: `config/gentoo/pinned-packages.txt` (`[exposed-surface]` vs `[base-pinned]`).
+* **Urgent CVE rule:** Trigger out-of-band host updates **only** when a CVE hits `[exposed-surface]` **and** is reachable on an untrusted input path; all other CVEs wait for the monthly binhost refresh. Never run unattended `emerge @world` or on-node compilation (`--usepkgonly` only).
+* **Monthly binhost refresh (no-op allowed if pinned atoms unchanged):**
+  1. Build updated binpkgs on `bitecho-gentoo-lab` (`35.208.41.134`) against `config/gentoo/pinned-packages.txt`.
+  2. Soak on `bitecho-gentoo-lab`: verify OpenRC services, Bitecho full-node self-test, and **compare post-GC `/statusz` `{rss, external, arrayBuffers}` against the prior binhost baseline**.
+  3. Publish signed binhost manifest/pointer (verify 3/3 HTTP 200 + `SHA-256 == CID` across `ns1..ns3`).
+  4. Roll via `--usepkgonly` in order `ns3 -> ns2 -> ns1`, then `node3 -> node2 -> node1`, preserving the prior binpkg/kernel LKG snapshot for immediate rollback if `/healthz` or `/statusz` regresses.
+* **GLSA visibility:** If checked, run `glsa-check --test affected` read-only and filter strictly to `[exposed-surface]` (report only, never auto-emerge).
