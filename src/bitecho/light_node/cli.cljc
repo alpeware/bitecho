@@ -224,14 +224,15 @@
    "--subscribe-subnets" "--subnets" "--transport" "--proxy" "--timeout-ms" "--max-epoch-skew"
    "--cmd-file" "--events-out" "--session-id" "--session" "--min-seq" "--min-broadcast-seq"
    "--cursor" "--after-ts" "--min-balance" "--non-destructive"
-   "--ingress-tcp-port" "--trusted-dac-anchors" "--turn-server" "--turn-username"
+   "--ingress-tcp-port" "--trusted-dac-anchors" "--clear-trusted-dac-anchors" "--trusted-deploy-authorities"
+   "--turn-server" "--turn-username"
    "--turn-password" "--turn-realm" "--turn-force-relay" "--sync-interval-ms" "--price"
    "--price-max" "--burn" "--to" "--from" "--callee" "--peer" "--receiver" "--recipient"
    "--amount" "--text" "--message" "--payload-hex" "--peek" "--poll" "--sync" "--no-poll"
    "--autonomous" "--auto-sync" "--auto-register-home-set" "--no-auto-register-home-set"
    "--wait-open-ms" "--block" "--until-event" "--help" "--mcp"
    "--invariant-diff-edn" "--jurisdiction-map" "--human-anchor-sunset" "--bip-cid"
-   "--path" "--cid" "--file" "--hex" "--seq" "--authority" "--prefix" "--endpoint" "--candidates"
+   "--path" "--cid" "--file" "--out" "--local-only" "--hex" "--seq" "--authority" "--prefix" "--endpoint" "--candidates"
    "--nickname" "--name" "--domain"
    "--pin-version" "--auto-update-pointer" "--auto-update-interval-ms"
    "--node-role" "--retention-max-entries" "--retention-max-bytes" "--rotate-every"
@@ -1046,7 +1047,9 @@
             data-hex (extract-flag-value clean-tokens "--data-hex" nil)
             seq-num (extract-long-flag clean-tokens "--seq" nil)
             min-seq (extract-long-flag clean-tokens "--min-seq" nil)
-            out-file (extract-flag-value clean-tokens "--out-file" nil)
+            out-file (or (extract-flag-value clean-tokens "--out" nil)
+                         (extract-flag-value clean-tokens "--out-file" nil))
+            local-only? (has-flag? clean-tokens "--local-only")
             b (extract-long-flag clean-tokens "--burn" nil)
             m {"cmd" "storage-put" "subnet_id" sub "slot" slot "slot_id" slot}]
         (cond-> m
@@ -1055,6 +1058,7 @@
           seq-num (assoc "seq" seq-num)
           min-seq (assoc "min_seq" min-seq)
           out-file (assoc "out_file" out-file)
+          local-only? (assoc "local_only" true)
           (some? b) (assoc "burn" b)))
 
       "storage-get"
@@ -1344,7 +1348,8 @@
                     "global")
             cid (extract-flag-value clean-tokens "--cid" nil)
             path (extract-flag-value clean-tokens "--path" nil)
-            out-file (or (extract-flag-value clean-tokens "--out-file" nil)
+            out-file (or (extract-flag-value clean-tokens "--out" nil)
+                         (extract-flag-value clean-tokens "--out-file" nil)
                          (extract-flag-value clean-tokens "--file" nil))
             chunk-size (extract-long-flag clean-tokens "--chunk-size" nil)
             concurrency (extract-long-flag clean-tokens "--concurrency" nil)
@@ -1474,7 +1479,8 @@
             cid (extract-flag-value clean-tokens "--cid" nil)
             auth (or (extract-flag-value clean-tokens "--authority" nil)
                      (extract-flag-value clean-tokens "--pubkey" nil))
-            out-file (or (extract-flag-value clean-tokens "--out-file" nil)
+            out-file (or (extract-flag-value clean-tokens "--out" nil)
+                         (extract-flag-value clean-tokens "--out-file" nil)
                          (extract-flag-value clean-tokens "--file" nil))
             relay-url (extract-flag-value clean-tokens "--relay-url" nil)
             m {"cmd" "artifact-get" "subnet_id" sub}]

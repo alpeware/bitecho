@@ -7,6 +7,7 @@
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.bech32m :as bech32m]
             [bitecho.config :as config]
+            [bitecho.config.flags :as flags]
             [bitecho.core.data :as data]
             [bitecho.core.storage :as storage]
             [bitecho.core.subnet :as core-subnet]
@@ -17,6 +18,7 @@
             [bitecho.economy.burn :as burn]
             [bitecho.economy.escrow :as escrow]
             [bitecho.economy.puzzle :as puzzle]
+            [bitecho.errors.core :as errors]
             [bitecho.fido :as fido]
             [bitecho.fressian :as fressian]
             [bitecho.governance.core :as gov]
@@ -554,7 +556,9 @@
      (if (or (nil? trimmed-explicit) (= trimmed-explicit persisted-sub))
        {:ok? true
         :reconciled? false
-        :state (assoc state :subscribed-subnets merged-subs)
+        :state (assoc state
+                      :subscribed-subnets merged-subs
+                      :subnet-id-overridden? (boolean (:subnet-id-overridden? state false)))
         :effects []
         :stdout-events []}
        (let [evt {"event" "subnet-id-startup-override"
@@ -567,6 +571,7 @@
                    :to trimmed-explicit}
              st0 (-> state
                      (assoc :subnet-id trimmed-explicit
+                            :subnet-id-overridden? true
                             :subscribed-subnets (conj merged-subs trimmed-explicit))
                      (update-in [:diagnostics :subnet-id-startup-override] (fnil inc 0)))
              st1 (enqueue-actionable-events st0 [evt])]
@@ -3600,11 +3605,14 @@
       (let [burn-amt (max 0 (long (or (parse-long-safe (or (get cmd-map "burn") (:burn cmd-map)) 0) 0)))
             burn-chk (check-and-deduct-burn state burn-amt)]
         (if-not (:ok? burn-chk)
-          {:ok? false
-           :state state
-           :response {"ok" false "error" (:error burn-chk) "mesh_submitted" false "p2p" false "peers_targeted" 0}
-           :net-envelopes []
-           :stdout-events []}
+          (let [err (errors/canonical-error (:error burn-chk) {:burn burn-amt})
+                st-err (errors/record-error-diagnostic state err)]
+            {:ok? false
+             :state st-err
+             :response (errors/canonical-error->wire err {"mesh_submitted" false "p2p" false "peers_targeted" 0})
+             :effects [(errors/diagnose-effect err)]
+             :net-envelopes []
+             :stdout-events []})
           (let [st-after-burn (:state burn-chk)
                 sub-id (str (or (get cmd-map "subnet_id") (get cmd-map "subnet-id") (:subnet-id cmd-map) (:subnet-id state) "global"))
                 sender (normalize-pubkey-hex (:pubkey state))
@@ -3715,24 +3723,32 @@
        :stdout-events []}
 
       (nil? resolved-sid)
-      {:ok? false
-       :state (record-eviction state :session-not-open {:ts-ms (long (or (parse-long-safe (or (get cmd-map "now_ms") (:now-ms cmd-map)) nil) 0))})
-       :response {"ok" false "error" "session-not-open"
-                  "mesh_submitted" false "p2p" false "peers_targeted" 0}
-       :net-envelopes []
-       :stdout-events []}
+      (let [err (errors/canonical-error :session-not-open {:reason "no-open-session"})
+            st-err (-> state
+                       (record-eviction :session-not-open {:ts-ms (long (or (parse-long-safe (or (get cmd-map "now_ms") (:now-ms cmd-map)) nil) 0))})
+                       (errors/record-error-diagnostic err))]
+        {:ok? false
+         :state st-err
+         :response (errors/canonical-error->wire err {"mesh_submitted" false "p2p" false "peers_targeted" 0})
+         :effects [(errors/diagnose-effect err)]
+         :net-envelopes []
+         :stdout-events []})
 
       :else
       (let [session-id resolved-sid
             session (get-in state [:sessions session-id])]
         (if-not (and session (= "open" (:state session)))
-          {:ok? false
-           :state (record-eviction state :session-not-open {:session-id session-id
-                                                            :ts-ms (long (or (parse-long-safe (or (get cmd-map "now_ms") (:now-ms cmd-map)) nil) 0))})
-           :response {"ok" false "error" "session-not-open"
-                      "mesh_submitted" false "p2p" false "peers_targeted" 0}
-           :net-envelopes []
-           :stdout-events []}
+          (let [err (errors/canonical-error :session-not-open {:session-id session-id})
+                st-err (-> state
+                           (record-eviction :session-not-open {:session-id session-id
+                                                               :ts-ms (long (or (parse-long-safe (or (get cmd-map "now_ms") (:now-ms cmd-map)) nil) 0))})
+                           (errors/record-error-diagnostic err))]
+            {:ok? false
+             :state st-err
+             :response (errors/canonical-error->wire err {"mesh_submitted" false "p2p" false "peers_targeted" 0})
+             :effects [(errors/diagnose-effect err)]
+             :net-envelopes []
+             :stdout-events []})
           (let [pname (pubkey->petname state (:peer session))
                 text (or (get cmd-map "text") (get cmd-map "message")
                          (:text cmd-map) (:message cmd-map))
@@ -5048,6 +5064,16 @@
                        "directory_cache_count" (count (:directory-cache state {}))
                        "escrows_count" (count (:escrows state {}))
                        "delivery_telemetry" delivery-telemetry-resp
+                       "security_flags" (flags/security-flags->wire
+                                         (flags/build-security-flags-echo
+                                          {:subnet-id (or (:subnet-id state) "global")
+                                           :subnet-id-overridden? (boolean (:subnet-id-overridden? state false))
+                                           :trusted-dac-anchors (:trusted-dac-anchors state)
+                                           :trusted-dac-anchors-provenance (:trusted-dac-anchors-provenance state)
+                                           :trusted-deploy-authorities (:trusted-deploy-authorities state)
+                                           :pin-version (:pin-version state)
+                                           :auto-update-pointer (:auto-update-pointer state)
+                                           :keystore-security-tier (or (:keystore-security-tier state) :legacy-file-0600)}))
                        "accounting" {"scope" "local-non-consensus"
                                      "note" "Locally computed devnet totals; never consensus finalized"
                                      "burned_ech" (get-in state [:local-accounting :burned-ech] 0)
@@ -5836,12 +5862,27 @@
          :net-envelopes []
          :stdout-events []}))))
 
-(defn- exec-storage-put
+(defn prepare-storage-put
+  "Pure two-phase `storage-put` preparation (BIP-022 Stage A, Row 7; Rules 2 & 5).
+   - Packs encrypted `Blob` + signed monotonic `Pointer` via `bitecho.core.storage`.
+   - When `--local-only` (`local_only` / `:local-only`) is explicitly set, writes locally,
+     emits a counted `:storage-put-local-only` `:diagnose` effect, and returns
+     `{\"ok\" true \"replicated\" false \"local_only\" true ...}`.
+   - Otherwise, does NOT advance `:storage-pointers` or `:storage-min-seqs` yet; returns
+     `{:ok? true :pending-publish? true :publish-intent {...} :state state ...}` so the shell
+     must confirm network publication via `commit-storage-put-outcome`."
   [state effective-map privkey-bytes _sub-id]
   (let [burn-amt (max 0 (long (or (parse-long-safe (or (get effective-map "burn") (:burn effective-map)) 0) 0)))
         burn-chk (check-and-deduct-burn state burn-amt)]
     (if-not (:ok? burn-chk)
-      {:state state :response {"ok" false "error" (:error burn-chk)} :net-envelopes [] :stdout-events []}
+      (let [err (errors/canonical-error (:error burn-chk) {:burn burn-amt})
+            st-err (errors/record-error-diagnostic state err)]
+        {:ok? false
+         :state st-err
+         :response (errors/canonical-error->wire err)
+         :effects [(errors/diagnose-effect err)]
+         :net-envelopes []
+         :stdout-events []})
       (let [st-after-burn (:state burn-chk)
             raw-data (get effective-map "data" (get effective-map "payload" (get effective-map :data (:payload effective-map))))
             raw-hex (or (get effective-map "data_hex") (get effective-map "data-hex")
@@ -5860,6 +5901,10 @@
             seq-num (long (or (get effective-map "seq") (:seq effective-map) (inc min-seq)))
             context (or (get effective-map "context") (:context effective-map))
             nonce (or (get effective-map "nonce") (:nonce effective-map))
+            local-only? (boolean (or (get effective-map "local_only")
+                                     (get effective-map "local-only")
+                                     (:local-only effective-map)
+                                     (:local_only effective-map)))
             pack-res (storage/pack-encrypted-state {:privkey privkey-bytes
                                                     :pubkey (:pubkey state)
                                                     :subnet-id subnet
@@ -5891,25 +5936,148 @@
                                              burn-amt
                                              outer-sub)]
                              (merge rep-payload gossip-env {:p2p-broadcast? true})))]
-        {:state (-> st-after-burn
-                    (assoc-in [:blobs cid] blob)
-                    (assoc-in [:pointers [subnet path]] ptr)
-                    (assoc-in [:storage-blobs cid] blob)
-                    (assoc-in [:storage-pointers [subnet path]] ptr)
-                    (assoc-in [:storage-min-seqs [subnet path]] seq-num))
+        (if local-only?
+          (let [diag {:effect :diagnose
+                      :type :diagnose
+                      :reason :storage-put-local-only
+                      :cid cid
+                      :path path
+                      :seq seq-num}
+                st-local (-> st-after-burn
+                             (assoc-in [:blobs cid] blob)
+                             (assoc-in [:pointers [subnet path]] ptr)
+                             (assoc-in [:storage-blobs cid] blob)
+                             (assoc-in [:storage-pointers [subnet path]] ptr)
+                             (assoc-in [:storage-min-seqs [subnet path]] seq-num)
+                             (update-in [:diagnostics :storage-put-local-only] (fnil inc 0)))]
+            {:ok? true
+             :local-only? true
+             :pending-publish? false
+             :state st-local
+             :response {"ok" true
+                        "cid" cid
+                        "path" path
+                        "seq" seq-num
+                        "slot" slot
+                        "slot_id" slot
+                        "subnet_id" subnet
+                        "size_bytes" size-bytes
+                        "burn" burn-amt
+                        "replicated" false
+                        "local_only" true
+                        "blob" blob
+                        "pointer" ptr}
+             :effects [diag]
+             :net-envelopes (if rep-envelope [rep-envelope] [])
+             :stdout-events []})
+          {:ok? true
+           :local-only? false
+           :pending-publish? true
+           :state state
+           :publish-intent {:cid cid
+                            :path path
+                            :subnet subnet
+                            :slot slot
+                            :seq seq-num
+                            :size-bytes size-bytes
+                            :burn burn-amt
+                            :blob blob
+                            :pointer ptr
+                            :state-after-burn st-after-burn}
+           :response {"ok" false
+                      "pending" true
+                      "cid" cid
+                      "path" path
+                      "seq" seq-num
+                      "slot" slot
+                      "slot_id" slot
+                      "subnet_id" subnet
+                      "size_bytes" size-bytes
+                      "burn" burn-amt
+                      "replicated" false
+                      "blob" blob
+                      "pointer" ptr}
+           :effects []
+           :net-envelopes (if rep-envelope [rep-envelope] [])
+           :stdout-events []})))))
+
+(defn commit-storage-put-outcome
+  "Pure shell-confirmation reducer for `storage-put` (BIP-022 Stage A, Row 7; Rules 2 & 5).
+   - Commits local blob/pointer/min-seq and returns `{\"ok\" true \"replicated\" true \"endpoints\" [...]}`
+     ONLY when `(:ok? outcome)` is true AND `(seq (:endpoints outcome))` is non-empty.
+   - Otherwise fails closed with zero partial pointer advance, canonical `:storage-publish-failed`
+     error envelope, and counted Rule 5 `:diagnose`."
+  [state publish-intent outcome]
+  (let [endpoints (->> (or (:endpoints outcome) (get outcome "endpoints") [])
+                       (filter #(and (string? %) (not (str/blank? %))))
+                       vec)
+        confirmed? (and (true? (or (:ok? outcome) (get outcome "ok")))
+                        (seq endpoints))
+        {:keys [cid path subnet slot seq size-bytes burn blob pointer state-after-burn]} publish-intent]
+    (if confirmed?
+      (let [base-st (or state-after-burn state)
+            st-committed (-> base-st
+                             (assoc-in [:blobs cid] blob)
+                             (assoc-in [:pointers [subnet path]] pointer)
+                             (assoc-in [:storage-blobs cid] blob)
+                             (assoc-in [:storage-pointers [subnet path]] pointer)
+                             (assoc-in [:storage-min-seqs [subnet path]] seq))]
+        {:ok? true
+         :state st-committed
          :response {"ok" true
                     "cid" cid
                     "path" path
-                    "seq" seq-num
+                    "seq" seq
                     "slot" slot
                     "slot_id" slot
                     "subnet_id" subnet
                     "size_bytes" size-bytes
-                    "burn" burn-amt
+                    "burn" burn
+                    "replicated" true
+                    "endpoints" endpoints
                     "blob" blob
-                    "pointer" ptr}
-         :net-envelopes (if rep-envelope [rep-envelope] [])
+                    "pointer" pointer}
+         :effects []
+         :net-envelopes []
+         :stdout-events []})
+      (let [detail (cond-> {:cid cid
+                            :path path
+                            :subnet-id subnet
+                            :seq seq}
+                     (:status outcome) (assoc :status (:status outcome))
+                     (:error outcome) (assoc :cause (str (:error outcome)))
+                     (:detail outcome) (assoc :detail (:detail outcome))
+                     (empty? endpoints) (assoc :reason "network-replication-unconfirmed"))
+            err (errors/canonical-error :storage-publish-failed detail)
+            st-err (errors/record-error-diagnostic state err)]
+        {:ok? false
+         :state st-err
+         :response (errors/canonical-error->wire err {"cid" cid
+                                                      "path" path
+                                                      "seq" seq
+                                                      "replicated" false})
+         :effects [(errors/diagnose-effect err)]
+         :net-envelopes []
          :stdout-events []}))))
+
+(defn- exec-storage-put
+  [state effective-map privkey-bytes _sub-id]
+  (let [prep (prepare-storage-put state effective-map privkey-bytes _sub-id)]
+    (cond
+      (not (:ok? prep))
+      (dissoc prep :ok?)
+
+      (:local-only? prep)
+      (dissoc prep :ok? :local-only? :pending-publish?)
+
+      :else
+      (let [receipt (or (get effective-map "network_receipt")
+                        (:network-receipt effective-map)
+                        {:ok? false :detail "network-replication-unconfirmed"})
+            committed (commit-storage-put-outcome state (:publish-intent prep) receipt)]
+        (-> committed
+            (dissoc :ok?)
+            (assoc :net-envelopes (:net-envelopes prep)))))))
 
 (defn- exec-storage-get
   [state effective-map privkey-bytes _sub-id]

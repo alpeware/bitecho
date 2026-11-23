@@ -69,13 +69,13 @@ Every flag in `bitecho.light-node.cli/known-command-flags` is automatically veri
 | Category | Live Flags |
 | :--- | :--- |
 | **State, Daemon & Control** | `--state-dir`, `--control-port`, `--cmd-file`, `--events-out`, `--help`, `--mcp` |
-| **Network, Relay & Subnets** | `--bootstrap`, `--relay-url`, `--relay-urls`, `--quorum`, `--subnet-id`, `--subnet`, `--subscribe-subnets`, `--subnets`, `--transport`, `--proxy`, `--ingress-tcp-port`, `--trusted-dac-anchors`, `--max-epoch-skew` |
+| **Network, Relay & Subnets** | `--bootstrap`, `--relay-url`, `--relay-urls`, `--quorum`, `--subnet-id`, `--subnet`, `--subscribe-subnets`, `--subnets`, `--transport`, `--proxy`, `--ingress-tcp-port`, `--trusted-dac-anchors`, `--clear-trusted-dac-anchors`, `--trusted-deploy-authorities`, `--max-epoch-skew` |
 | **TURN & P2P Signaling** | `--turn-server`, `--turn-username`, `--turn-password`, `--turn-realm`, `--turn-force-relay`, `--endpoint`, `--candidates`, `--wait-open-ms` |
 | **Auto-Sync & `P-UPD-1` Auto-Update (`D40.2.1`)** | `--autonomous`, `--auto-sync`, `--sync-interval-ms`, `--auto-register-home-set`, `--no-auto-register-home-set`, `--sync`, `--poll`, `--no-poll`, `--auto-update-pointer`, `--auto-update-interval-ms`, `--pin-version` |
 | **Addressing, Sessions & Messaging** | `--to`, `--from`, `--callee`, `--peer`, `--receiver`, `--recipient`, `--session-id`, `--session`, `--text`, `--message`, `--payload-hex`, `--peek` |
 | **Cursors, Waiting & Ordering** | `--timeout-ms`, `--min-seq`, `--min-broadcast-seq`, `--cursor`, `--after-ts`, `--block`, `--until-event`, `--seq`, `--non-destructive` |
 | **Economy & Escrows** | `--amount`, `--burn`, `--min-balance`, `--price`, `--price-max` |
-| **Artifacts, Directory & Governance** | `--path`, `--cid`, `--file`, `--hex`, `--authority`, `--prefix`, `--nickname`, `--name`, `--domain`, `--bip-cid`, `--invariant-diff-edn`, `--jurisdiction-map`, `--human-anchor-sunset` |
+| **Artifacts, Directory & Governance** | `--path`, `--cid`, `--file`, `--out`, `--local-only`, `--hex`, `--authority`, `--prefix`, `--nickname`, `--name`, `--domain`, `--bip-cid`, `--invariant-diff-edn`, `--jurisdiction-map`, `--human-anchor-sunset` |
 | **BIP-016 Rolodex & Memento (`rolodex-*`, `memento-*`)** | `--node-role`, `--retention-max-entries`, `--retention-max-bytes`, `--rotate-every`, `--grace-epochs`, `--lkg-cid`, `--walk-depth-cap`, `--owner-pubkey`, `--cache-incentive` |
 | **BIP-017a Chunked Large-Artifact Storage (`artifact-put-chunked`, `artifact-get-chunked`, `artifact-manifest-verify`)** | `--chunk-size`, `--concurrency`, `--resume-dir`, `--grace-epochs`, `--max-bytes` |
 | **BIP-017b Atomic `web/app/release` Resolver (`web-release-publish`, `web-release-rollback`, `web-release-verify`)** | `--release-cid`, `--genesis-anchor-cid`, `--lkg-release-cid`, `--headers-config-cid` |

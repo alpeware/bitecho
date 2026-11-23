@@ -12,6 +12,7 @@
             [bitecho.d45-bip018-hardening-and-failover-test]
             [bitecho.d46-bip019-fepoch1-test]
             [bitecho.d47-bip020-delivery-telemetry-test]
+            [bitecho.d49-bip022-stage-a-operator-safety-test]
             [bitecho.economy.account-test]
             [bitecho.economy.burn-test]
             [bitecho.economy.treasury-test]
@@ -73,6 +74,7 @@
              'bitecho.d45-bip018-hardening-and-failover-test
              'bitecho.d46-bip019-fepoch1-test
              'bitecho.d47-bip020-delivery-telemetry-test
+             'bitecho.d49-bip022-stage-a-operator-safety-test
              'bitecho.v02322-hotfix-test))
 
 (set! *main-cli-fn* -main)

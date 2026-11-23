@@ -6,10 +6,12 @@
             [bitecho.bech32m :as bech32m]
             [bitecho.browser-cli :as browser-cli]
             [bitecho.config :as config]
+            [bitecho.config.flags :as flags]
             [bitecho.core.protocol.relay :as relay]
             [bitecho.crypto :as crypto]
             [bitecho.crypto.sealed :as sealed]
             [bitecho.deploy.core :as deploy]
+            [bitecho.errors.core :as errors]
             [bitecho.fressian :as fressian]
             [bitecho.light-node.cli :as cli]
             [bitecho.light-node.core :as light-core]
@@ -871,6 +873,30 @@
                                      :receivedButNotEmitted (:received-but-not-emitted dt)
                                      :fanout (:fanout dt)
                                      :ringBufferCount (count (or (:ring-buffer dt) []))}
+                 :security_flags (flags/security-flags->wire
+                                  (flags/build-security-flags-echo
+                                   {:subnet-id (or (:subnet-id light-st) (:subnet-id node) "global")
+                                    :subnet-id-overridden? (boolean (:subnet-id-overridden? light-st false))
+                                    :trusted-dac-anchors (:trusted-dac-anchors light-st)
+                                    :trusted-dac-anchors-provenance (:trusted-dac-anchors-provenance light-st)
+                                    :trusted-deploy-authorities (:trusted-deploy-authorities light-st)
+                                    :pin-version (:pin-version light-st)
+                                    :auto-update-pointer (:auto-update-pointer light-st)
+                                    :keystore-security-tier (if (nil? (get-in node [:keypair :private-key]))
+                                                              :webauthn-locked
+                                                              :legacy-file-0600)}))
+                 :securityFlags (flags/security-flags->wire
+                                 (flags/build-security-flags-echo
+                                  {:subnet-id (or (:subnet-id light-st) (:subnet-id node) "global")
+                                   :subnet-id-overridden? (boolean (:subnet-id-overridden? light-st false))
+                                   :trusted-dac-anchors (:trusted-dac-anchors light-st)
+                                   :trusted-dac-anchors-provenance (:trusted-dac-anchors-provenance light-st)
+                                   :trusted-deploy-authorities (:trusted-deploy-authorities light-st)
+                                   :pin-version (:pin-version light-st)
+                                   :auto-update-pointer (:auto-update-pointer light-st)
+                                   :keystore-security-tier (if (nil? (get-in node [:keypair :private-key]))
+                                                             :webauthn-locked
+                                                             :legacy-file-0600)}))
                  :sessions (redact-for-js (or (:sessions light-st) {}))
                  :pendingOffers (redact-for-js (or (:pending-offers light-st) {}))
                  :broadcastInbox (redact-for-js (or (:broadcast-inbox light-st) []))
@@ -1509,16 +1535,21 @@
      (open-channel arg1 arg2 arg3 500)
      (open-channel @active-node-atom arg1 arg2 arg3)))
   ([node-atom callee price burn]
-   (let [na (or node-atom @active-node-atom)]
+   (let [na (or node-atom @active-node-atom)
+         emit-err! (fn [code detail]
+                     (let [err (errors/canonical-error code detail)]
+                       (when na
+                         (swap! na update :light-state errors/record-error-diagnostic err))
+                       (clj->js (errors/canonical-error->wire err))))]
      (if-not na
-       (clj->js {:ok false :error "not-connected"})
+       (emit-err! :transport-disconnected {:reason "no-active-node"})
        (let [node @na
              channels (or (:active-channels node) {})
              phase (get-in node [:conn :phase])]
          (if (and (empty? channels) (not= phase :open))
-           (clj->js {:ok false :error "not-connected"})
+           (emit-err! :transport-disconnected {:phase (when phase (name phase))})
            (if-not (:private-key (:keypair node))
-             (clj->js {:ok false :error "hardware-unlock-required"})
+             (emit-err! :hardware-unlock-required {:action "open-channel"})
              (let [target-pub (resolve-peer-target node callee)
                    privkey (:private-key (:keypair node))
                    cmd-res (light-core/handle-command (:light-state node)

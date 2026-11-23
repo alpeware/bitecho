@@ -1108,7 +1108,7 @@
           (is (= pub (get-in res [:response "pubkey"])))))
 
       (testing "exec-browser-cli storage-put and storage-get"
-        (let [put-res (browser/exec-browser-cli initial-st "storage-put --subnet nexus --slot note --data 'secret-data' --seq 1" priv)]
+        (let [put-res (browser/exec-browser-cli initial-st "storage-put --subnet nexus --slot note --data 'secret-data' --seq 1 --local-only" priv)]
           (is (true? (:ok? put-res)))
           (is (= "storage-put" (:verb put-res)))
           (is (true? (get-in put-res [:response "ok"])))

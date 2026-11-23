@@ -3,9 +3,11 @@
    Handles CLI invocation, JSONL STDIN/STDOUT serve loop, state persistence
    with atomic rename (0600 permissions), and WebRTC DataChannel agent connections."
   (:require [bitecho.basalt.core :as basalt]
+            [bitecho.config.flags :as flags]
             [bitecho.core.protocol.relay :as relay]
             [bitecho.crypto :as crypto]
             [bitecho.deploy.core :as deploy]
+            [bitecho.errors.core :as errors]
             [bitecho.fressian :as fressian]
             [bitecho.light-node.cli :as cli]
             [bitecho.light-node.core :as light-core]
@@ -211,13 +213,13 @@
                                 "--cmd-file" "--events-out" "--session-id" "--session"
                                 "--min-seq" "--min-broadcast-seq" "--after-ts" "--min-balance"
                                 "--ingress-tcp-port"
-                                "--trusted-dac-anchors" "--turn-server" "--turn-username"
+                                "--trusted-dac-anchors" "--trusted-deploy-authorities" "--turn-server" "--turn-username"
                                 "--turn-password" "--turn-realm" "--sync-interval-ms"
                                 "--price" "--price-max" "--burn" "--to" "--from"
                                 "--callee" "--peer" "--receiver" "--recipient"
                                 "--amount" "--text" "--message" "--payload-hex"
                                 "--wait-open-ms" "--until-event"
-                                "--path" "--cid" "--file" "--hex" "--seq" "--authority" "--prefix"
+                                "--path" "--cid" "--file" "--out" "--out-file" "--hex" "--seq" "--authority" "--prefix"
                                 "--pin-version" "--auto-update-pointer" "--auto-update-interval-ms"}
         runner-valued-flags #{"--state-dir" "--control-port" "--bootstrap"}]
     (loop [rem (vec tokens)]
@@ -306,14 +308,14 @@
          relay-cli (extract-flag-value clean-args "--relay-url" nil)
          relay-url (resolve-relay-url relay-cli getenv-fn)
          subnet-id (extract-flag-value clean-args "--subnet-id" nil)
-         trusted-dac-anchors-raw (extract-flag-value clean-args "--trusted-dac-anchors" nil)
-         trusted-dac-anchors (when (and (string? trusted-dac-anchors-raw) (not (str/blank? trusted-dac-anchors-raw)))
-                               (let [raw-items (if (or (str/starts-with? (str/trim trusted-dac-anchors-raw) "[")
-                                                       (str/starts-with? (str/trim trusted-dac-anchors-raw) "#{"))
-                                                 (try (edn/read-string trusted-dac-anchors-raw)
-                                                      (catch Exception _ (str/split trusted-dac-anchors-raw #",")))
-                                                 (str/split trusted-dac-anchors-raw #","))]
-                                 (set (map #(or (light-core/normalize-pubkey-hex %) (str/trim (str %))) (remove str/blank? (map str raw-items))))))
+         trusted-dac-anchors-spec (flags/parse-trusted-dac-anchors-arg clean-args)
+         trusted-dac-anchors (when (= :set (:action trusted-dac-anchors-spec))
+                               (set (map #(or (light-core/normalize-pubkey-hex %) %)
+                                         (:anchors trusted-dac-anchors-spec))))
+         trusted-deploy-authorities-raw (extract-flag-value clean-args "--trusted-deploy-authorities" nil)
+         trusted-deploy-authorities (when (and (string? trusted-deploy-authorities-raw)
+                                               (not (str/blank? trusted-deploy-authorities-raw)))
+                                      (flags/parse-anchor-list trusted-deploy-authorities-raw))
          turn-server (extract-flag-value clean-args "--turn-server" nil)
          pin-version (extract-flag-value clean-args "--pin-version" nil)
          auto-update-pointer (extract-flag-value clean-args "--auto-update-pointer" nil)
@@ -381,6 +383,8 @@
        timeout-ms (assoc :timeout-ms timeout-ms)
        ingress-tcp-port (assoc :ingress-tcp-port (int ingress-tcp-port))
        (seq trusted-dac-anchors) (assoc :trusted-dac-anchors trusted-dac-anchors)
+       trusted-dac-anchors-spec (assoc :trusted-dac-anchors-spec trusted-dac-anchors-spec)
+       (seq trusted-deploy-authorities) (assoc :trusted-deploy-authorities trusted-deploy-authorities)
        (some? sync?) (assoc :sync? sync?)
        (some? connect?) (assoc :connect? connect?)
        proxy-url (assoc :proxy proxy-url)
@@ -2523,51 +2527,120 @@
        m1))))
 
 (defn- post-artifact-to-relay!
+  "Uploads blob + pointer to `raw-relay-url` and returns a structured receipt
+   `{:ok? true :endpoints [base-url]}` on HTTP 2xx or `{:ok? false :status ... :error ...}`
+   on failure (fail-closed, Rule 5)."
   [raw-relay-url verb resp]
-  (when-let [base-url (artifact-endpoint-base-url raw-relay-url)]
-    (when (and (map? resp) (true? (or (get resp "ok") (:ok resp))))
+  (let [base-url (artifact-endpoint-base-url raw-relay-url)]
+    (cond
+      (nil? base-url)
+      {:ok? false :error "missing-relay-url" :detail {:relay-url raw-relay-url}}
+
+      (not (map? resp))
+      {:ok? false :error "invalid-artifact-payload"}
+
+      :else
       (try
         (let [client (default-http-client)
-              post-json! (fn [subpath payload-str content-type timeout-ms]
-                           (let [req (-> (HttpRequest/newBuilder)
-                                         (.uri (URI/create (str base-url subpath)))
-                                         (.timeout (Duration/ofMillis (long timeout-ms)))
-                                         (.header "Content-Type" content-type)
-                                         (.POST (HttpRequest$BodyPublishers/ofString payload-str StandardCharsets/UTF_8))
-                                         (.build))
-                                 r (.send client req (HttpResponse$BodyHandlers/ofString StandardCharsets/UTF_8))]
-                             (try (json/read-str (.body r)) (catch Exception _ {"status" (.statusCode r)}))))]
-          (when (contains? #{"artifact-put" "put"} (str verb))
-            (when-let [blob (or (get resp "blob") (:blob resp))]
-              (post-json! "/artifact/v1/blob"
-                          (json/write-str {"bytes_hex" (basalt/bytes->hex (:blob/bytes blob))
-                                           "cid" (:blob/cid blob)
-                                           "media_type" (or (:blob/media-type blob) "application/octet-stream")})
-                          "application/json"
-                          30000)))
-          (when-let [ptr (or (get resp "pointer") (:pointer resp))]
-            (post-json! "/artifact/v1/pointer"
-                        (pr-str ptr)
-                        "application/edn"
-                        15000)))
-        (catch Exception _ nil)))))
+              post-req! (fn [subpath payload-str content-type timeout-ms]
+                          (let [req (-> (HttpRequest/newBuilder)
+                                        (.uri (URI/create (str base-url subpath)))
+                                        (.timeout (Duration/ofMillis (long timeout-ms)))
+                                        (.header "Content-Type" content-type)
+                                        (.POST (HttpRequest$BodyPublishers/ofString payload-str StandardCharsets/UTF_8))
+                                        (.build))
+                                r (.send client req (HttpResponse$BodyHandlers/ofString StandardCharsets/UTF_8))
+                                st (.statusCode r)]
+                            {:ok? (<= 200 st 299)
+                             :status st
+                             :body (.body r)}))
+              needs-blob? (contains? #{"artifact-put" "put" "storage-put"} (str verb))
+              blob (or (get resp "blob") (:blob resp))
+              ptr (or (get resp "pointer") (:pointer resp))
+              blob-res (if (and needs-blob? blob)
+                         (post-req! "/artifact/v1/blob"
+                                    (json/write-str {"bytes_hex" (basalt/bytes->hex (:blob/bytes blob))
+                                                     "cid" (:blob/cid blob)
+                                                     "media_type" (or (:blob/media-type blob) "application/octet-stream")})
+                                    "application/json"
+                                    30000)
+                         {:ok? true :status 200})]
+          (if-not (:ok? blob-res)
+            {:ok? false
+             :status (:status blob-res)
+             :error "artifact-blob-upload-failed"
+             :detail {:endpoint base-url :status (:status blob-res)}}
+            (let [ptr-res (if ptr
+                            (post-req! "/artifact/v1/pointer"
+                                       (pr-str ptr)
+                                       "application/edn"
+                                       15000)
+                            {:ok? true :status 200})]
+              (if (:ok? ptr-res)
+                {:ok? true :endpoints [base-url]}
+                {:ok? false
+                 :status (:status ptr-res)
+                 :error "artifact-pointer-upload-failed"
+                 :detail {:endpoint base-url :status (:status ptr-res)}}))))
+        (catch Exception e
+          {:ok? false
+           :error "relay-upload-exception"
+           :detail {:endpoint base-url :message (.getMessage e)}})))))
 
 (defn- maybe-write-artifact-out-file!
-  [verb cmd-map resp]
-  (let [eff-verb (effective-artifact-domain-verb verb cmd-map)]
-    (when (and (= eff-verb "artifact-get")
-               (map? resp)
-               (true? (or (get resp "ok") (:ok resp)))
-               (string? (get cmd-map "out_file"))
-               (not (str/blank? (get cmd-map "out_file")))
-               (string? (get resp "hex")))
+  "When `artifact-get` has `out_file` (`--out <file>`), writes verified raw bytes atomically
+   (`.tmp` + rename) and returns `{:applied? true :ok? true :response <compact-receipt>}`.
+   On any write or verification error, fails closed with canonical `:artifact-out-write-failed`
+   and counted Rule 5 `:diagnose` (zero silent catch)."
+  [verb cmd-map resp state-atom]
+  (let [eff-verb (effective-artifact-domain-verb verb cmd-map)
+        out-file (or (get cmd-map "out_file") (get cmd-map "out"))]
+    (if (and (= eff-verb "artifact-get")
+             (map? resp)
+             (true? (or (get resp "ok") (:ok resp)))
+             (string? out-file)
+             (not (str/blank? out-file))
+             (string? (get resp "hex")))
       (try
-        (let [f (io/file (get cmd-map "out_file"))]
-          (when-let [p (.getParentFile f)] (.mkdirs p))
-          (Files/write (.toPath f)
-                       ^bytes (basalt/hex->bytes (get resp "hex"))
-                       (into-array java.nio.file.OpenOption [])))
-        (catch Exception _ nil)))))
+        (let [raw-bytes ^bytes (basalt/hex->bytes (get resp "hex"))
+              expected-cid (or (get resp "cid") (:cid resp))
+              actual-cid (when (and (string? expected-cid) (not (str/blank? expected-cid)))
+                           (str/lower-case (basalt/bytes->hex (crypto/sha256 raw-bytes))))]
+          (if (and actual-cid (not= (str/lower-case expected-cid) actual-cid))
+            (let [err (errors/canonical-error :artifact-out-write-failed
+                                              {:out-file out-file :reason "cid-mismatch"})]
+              (when state-atom (swap! state-atom errors/record-error-diagnostic err))
+              {:applied? true :ok? false :response (errors/canonical-error->wire err)})
+            (let [f (io/file out-file)
+                  _ (when (.isDirectory f)
+                      (throw (ex-info "Target --out path is a directory" {:out-file out-file})))
+                  parent (.getParentFile f)
+                  _ (when parent (.mkdirs parent))
+                  tmp-f (io/file (or parent (io/file "."))
+                                 (str ".bitecho-art-" (System/nanoTime) ".tmp"))]
+              (Files/write (.toPath tmp-f)
+                           raw-bytes
+                           (into-array java.nio.file.OpenOption [StandardOpenOption/CREATE
+                                                                 StandardOpenOption/TRUNCATE_EXISTING
+                                                                 StandardOpenOption/WRITE]))
+              (try
+                (Files/move (.toPath tmp-f)
+                            (.toPath f)
+                            (into-array java.nio.file.CopyOption [StandardCopyOption/ATOMIC_MOVE
+                                                                  StandardCopyOption/REPLACE_EXISTING]))
+                (catch Exception _
+                  (Files/move (.toPath tmp-f)
+                              (.toPath f)
+                              (into-array java.nio.file.CopyOption [StandardCopyOption/REPLACE_EXISTING]))))
+              {:applied? true
+               :ok? true
+               :response (flags/format-artifact-get-out-receipt resp out-file (alength raw-bytes))})))
+        (catch Exception e
+          (let [err (errors/canonical-error :artifact-out-write-failed
+                                            {:out-file out-file :message (.getMessage e)})]
+            (when state-atom (swap! state-atom errors/record-error-diagnostic err))
+            {:applied? true :ok? false :response (errors/canonical-error->wire err)})))
+      {:applied? false :ok? true :response resp})))
 
 (defn handle-serve-line!
   "Processes a single STDIN, --cmd-file JSON line, or control-socket command map in serve mode,
@@ -2620,8 +2693,29 @@
                                                 (not (contains? effective-map "now_ms")))
                                          (assoc effective-map "now_ms" (System/currentTimeMillis))
                                          effective-map)
-                res (light-core/handle-command @state-atom effective-map-with-now (:privkey-bytes identity))
-                _ (maybe-write-artifact-out-file! eff-domain-verb effective-map (:response res))
+                res (if (and (= eff-domain-verb "storage-put")
+                             (not (boolean (or (get effective-map-with-now "local_only")
+                                               (get effective-map-with-now "local-only")
+                                               (:local-only effective-map-with-now)))))
+                      (let [sub-str (str (or (get effective-map-with-now "subnet_id") (:subnet-id @state-atom) "global"))
+                            prep (light-core/prepare-storage-put @state-atom effective-map-with-now (:privkey-bytes identity) sub-str)]
+                        (if-not (:ok? prep)
+                          (dissoc prep :ok?)
+                          (let [art-relay (or (get effective-map-with-now "relay_url")
+                                              (get effective-map-with-now "relay-url")
+                                              (:relay-url effective-map-with-now)
+                                              relay-url)
+                                net-receipt (post-artifact-to-relay! art-relay "storage-put" (:publish-intent prep))
+                                committed (light-core/commit-storage-put-outcome @state-atom (:publish-intent prep) net-receipt)]
+                            (assoc (dissoc committed :ok?)
+                                   :net-envelopes (if (:ok? committed) (:net-envelopes prep) [])))))
+                      (light-core/handle-command @state-atom effective-map-with-now (:privkey-bytes identity)))
+                _ (when (:state res)
+                    (reset! state-atom (:state res)))
+                out-write-res (maybe-write-artifact-out-file! eff-domain-verb effective-map (:response res) state-atom)
+                res (if (:applied? out-write-res)
+                      (assoc res :response (:response out-write-res) :state @state-atom)
+                      res)
                 _ (when (contains? #{"artifact-put" "artifact-revoke"} eff-domain-verb)
                     (when-let [art-relay (or (get effective-map "relay_url")
                                              (get effective-map "relay-url")
@@ -3396,11 +3490,32 @@
                                                                    (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
                                                                    (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
                                                                    (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap))))))
-            initial-state (cond-> (assoc base-state :max-epoch-skew (long (or (:max-epoch-skew opts) (:max-epoch-skew base-state) 15)))
-                            (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
-                            (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
-                            (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap))))
-            _ (when (and reconciled-res (:reconciled? reconciled-res))
+            initial-state-raw (cond-> (assoc base-state :max-epoch-skew (long (or (:max-epoch-skew opts) (:max-epoch-skew base-state) 15)))
+                                (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
+                                (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
+                                (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap)))
+                                (:pin-version opts) (assoc :pin-version (:pin-version opts))
+                                (:auto-update-pointer opts) (assoc :auto-update-pointer (:auto-update-pointer opts))
+                                (seq (:trusted-deploy-authorities opts)) (assoc :trusted-deploy-authorities (:trusted-deploy-authorities opts)))
+            dac-rec (flags/reconcile-trusted-dac-anchors initial-state-raw
+                                                         (:trusted-dac-anchors-spec opts)
+                                                         (:trusted-dac-anchors bootstrap))
+            initial-state (:state dac-rec)
+            _ (doseq [ev (:stdout-events dac-rec)]
+                (emit-json-line! out-writer ev (:events-out opts)))
+            _ (let [sec-echo (flags/security-flags->wire
+                              (flags/build-security-flags-echo
+                               {:subnet-id (:subnet-id initial-state)
+                                :subnet-id-overridden? (boolean (:subnet-id-overridden? initial-state false))
+                                :trusted-dac-anchors (:trusted-dac-anchors initial-state)
+                                :trusted-dac-anchors-provenance (:trusted-dac-anchors-provenance initial-state)
+                                :trusted-deploy-authorities (:trusted-deploy-authorities initial-state)
+                                :pin-version (:pin-version initial-state)
+                                :auto-update-pointer (:auto-update-pointer initial-state)}))]
+                (binding [*out* *err*]
+                  (println (json/write-str {"event" "startup-security-flags" "security_flags" sec-echo}))))
+            _ (when (or (and reconciled-res (:reconciled? reconciled-res))
+                        (seq (:effects dac-rec)))
                 (try (save-light-state! state-file initial-state) (catch Exception _ nil)))
             state-atom (atom initial-state)
             conn-atom (atom (init-conn-state))
@@ -3877,11 +3992,32 @@
                                                                    (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
                                                                    (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
                                                                    (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap))))))
-            initial-state (cond-> (assoc base-state :max-epoch-skew (long (or (:max-epoch-skew opts) (:max-epoch-skew base-state) 15)))
-                            (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
-                            (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
-                            (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap))))
-            _ (when (and reconciled-res (:reconciled? reconciled-res))
+            initial-state-raw (cond-> (assoc base-state :max-epoch-skew (long (or (:max-epoch-skew opts) (:max-epoch-skew base-state) 15)))
+                                (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
+                                (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
+                                (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap)))
+                                (:pin-version opts) (assoc :pin-version (:pin-version opts))
+                                (:auto-update-pointer opts) (assoc :auto-update-pointer (:auto-update-pointer opts))
+                                (seq (:trusted-deploy-authorities opts)) (assoc :trusted-deploy-authorities (:trusted-deploy-authorities opts)))
+            dac-rec (flags/reconcile-trusted-dac-anchors initial-state-raw
+                                                         (:trusted-dac-anchors-spec opts)
+                                                         (:trusted-dac-anchors bootstrap))
+            initial-state (:state dac-rec)
+            _ (doseq [ev (:stdout-events dac-rec)]
+                (emit-json-line! out-writer ev (:events-out opts)))
+            _ (let [sec-echo (flags/security-flags->wire
+                              (flags/build-security-flags-echo
+                               {:subnet-id (:subnet-id initial-state)
+                                :subnet-id-overridden? (boolean (:subnet-id-overridden? initial-state false))
+                                :trusted-dac-anchors (:trusted-dac-anchors initial-state)
+                                :trusted-dac-anchors-provenance (:trusted-dac-anchors-provenance initial-state)
+                                :trusted-deploy-authorities (:trusted-deploy-authorities initial-state)
+                                :pin-version (:pin-version initial-state)
+                                :auto-update-pointer (:auto-update-pointer initial-state)}))]
+                (binding [*out* *err*]
+                  (println (json/write-str {"event" "startup-security-flags" "security_flags" sec-echo}))))
+            _ (when (or (and reconciled-res (:reconciled? reconciled-res))
+                        (seq (:effects dac-rec)))
                 (try (save-light-state! state-file initial-state) (catch Exception _ nil)))
             state-atom (atom initial-state)
             verb (when (map? raw-cmd-map) (get raw-cmd-map "cmd"))
@@ -3933,8 +4069,28 @@
             err-resp)
           (binding [*out* *err*]
             (let [eff-domain-verb (effective-artifact-domain-verb verb cmd-map)
-                  res (light-core/handle-command @state-atom cmd-map (:privkey-bytes identity))
-                  _ (maybe-write-artifact-out-file! eff-domain-verb cmd-map (:response res))
+                  res (if (and (= eff-domain-verb "storage-put")
+                               (not (boolean (or (get cmd-map "local_only")
+                                                 (get cmd-map "local-only")
+                                                 (:local-only cmd-map)))))
+                        (let [sub-str (str (or (get cmd-map "subnet_id") (:subnet-id @state-atom) "global"))
+                              prep (light-core/prepare-storage-put @state-atom cmd-map (:privkey-bytes identity) sub-str)]
+                          (if-not (:ok? prep)
+                            (dissoc prep :ok?)
+                            (let [art-relay (or (get cmd-map "relay_url")
+                                                (get cmd-map "relay-url")
+                                                (:relay-url cmd-map)
+                                                effective-relay-url)
+                                  net-receipt (post-artifact-to-relay! art-relay "storage-put" (:publish-intent prep))
+                                  committed (light-core/commit-storage-put-outcome @state-atom (:publish-intent prep) net-receipt)]
+                              (assoc (dissoc committed :ok?)
+                                     :net-envelopes (if (:ok? committed) (:net-envelopes prep) [])))))
+                        (light-core/handle-command @state-atom cmd-map (:privkey-bytes identity)))
+                  _ (when (:state res) (reset! state-atom (:state res)))
+                  out-write-res (maybe-write-artifact-out-file! eff-domain-verb cmd-map (:response res) state-atom)
+                  res (if (:applied? out-write-res)
+                        (assoc res :response (:response out-write-res) :state @state-atom)
+                        res)
                   _ (when (contains? #{"artifact-put" "artifact-revoke"} eff-domain-verb)
                       (when-let [art-relay (or (get cmd-map "relay_url")
                                                (get cmd-map "relay-url")
