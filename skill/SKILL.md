@@ -57,7 +57,7 @@ All commands work identically in one-shot mode, `ctl` daemon mode, JSONL `serve`
 8. **`send`** — Send encrypted 1:1 sealed messages (`--session-id`, `--to`, `--text`, `--message`, `--payload-hex`) or subnet broadcasts (`--subnet-id`, `--subnet`, `--text`, `--burn`).
 9. **`inbox`** — Drain or peek decrypted messages and broadcasts (`--subnet-id`, `--peek`, `--cursor`).
 10. **`wait`** — Event-driven blocking watcher (`--timeout-ms`, `--min-seq`, `--min-broadcast-seq`, `--after-ts`, `--block`, `--until-event`, `--events-out`).
-11. **`serve`** — Persistent background daemon, JSONL stdio loop, MCP stdio server (`--mcp`), background BFT quorum sync, WebRTC/TURN/Ingress listeners, loopback `/ctl`, and opt-in `P-UPD-1` auto-update (`--auto-update-pointer`, `--auto-update-interval-ms`, `--pin-version`).
+11. **`serve`** — Persistent background daemon, JSONL stdio loop, MCP stdio server (`--mcp`), background BFT quorum sync, WebRTC/TURN/Ingress listeners, loopback `/ctl`, and opt-in `P-UPD-1` auto-update (`--auto-update-pointer`, `--auto-update-interval-ms`, `--trusted-deploy-authorities`, `--pin-version`).
 12. **`ctl`** — Loopback daemon control & command delegation (`ctl ensure`, `ctl status`, `ctl send`, `ctl wait`, DAC attach/revoke).
 
 ---
@@ -71,7 +71,7 @@ Every flag in `bitecho.light-node.cli/known-command-flags` is automatically veri
 | **State, Daemon & Control** | `--state-dir`, `--control-port`, `--cmd-file`, `--events-out`, `--help`, `--mcp` |
 | **Network, Relay & Subnets** | `--bootstrap`, `--relay-url`, `--relay-urls`, `--quorum`, `--subnet-id`, `--subnet`, `--reset-network-state`, `--subscribe-subnets`, `--subnets`, `--transport`, `--proxy`, `--ingress-tcp-port`, `--trusted-dac-anchors`, `--max-epoch-skew` |
 | **TURN & P2P Signaling** | `--turn-server`, `--turn-username`, `--turn-password`, `--turn-realm`, `--turn-force-relay`, `--endpoint`, `--candidates`, `--wait-open-ms` |
-| **Auto-Sync & `P-UPD-1` Auto-Update (`D40.2.1`)** | `--autonomous`, `--auto-sync`, `--sync-interval-ms`, `--auto-register-home-set`, `--no-auto-register-home-set`, `--sync`, `--poll`, `--no-poll`, `--auto-update-pointer`, `--auto-update-interval-ms`, `--pin-version` |
+| **Auto-Sync & `P-UPD-1` Auto-Update (`D40.2.1`)** | `--autonomous`, `--auto-sync`, `--sync-interval-ms`, `--auto-register-home-set`, `--no-auto-register-home-set`, `--sync`, `--poll`, `--no-poll`, `--auto-update-pointer`, `--auto-update-interval-ms`, `--trusted-deploy-authorities`, `--pin-version` |
 | **Addressing, Sessions & Messaging** | `--to`, `--from`, `--callee`, `--peer`, `--receiver`, `--recipient`, `--session-id`, `--session`, `--text`, `--message`, `--payload-hex`, `--peek` |
 | **Cursors, Waiting & Ordering** | `--timeout-ms`, `--min-seq`, `--min-broadcast-seq`, `--cursor`, `--after-ts`, `--block`, `--until-event`, `--seq`, `--non-destructive` |
 | **Economy & Escrows** | `--amount`, `--burn`, `--min-balance`, `--price`, `--price-max` |

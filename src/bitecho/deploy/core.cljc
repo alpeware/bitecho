@@ -2033,11 +2033,13 @@
                         :lkg-cid lkg-cid
                         :quarantined-cid failed-cid}
                   st1 (-> state
-                          (assoc :phase :rolled-back
+                          (assoc :phase :watching
                                  :current-version lkg-ver
                                  :current-cid lkg-cid
+                                 :last-rollback-cid failed-cid
                                  :pending-update nil
                                  :last-error :light-update-health-check-failed-rollback)
+                          (update :rollback-count (fnil inc 0))
                           (cond-> failed-cid (update :quarantined-cids (fnil conj #{}) failed-cid))
                           (update :generation inc)
                           (update-in [:diagnostics :light-update-health-check-failed-rollback] (fnil inc 0)))

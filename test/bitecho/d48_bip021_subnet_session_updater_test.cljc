@@ -646,7 +646,97 @@
       (is (false? (:ok? miss-step)))
       (is (true? (:done? bad-step)))
       (is (false? (:ok? bad-step)))
-      (is (= :mesh-cid-mismatch (:error bad-step))))))
+      (is (= :mesh-cid-mismatch (:error bad-step)))))
+
+  (testing "Gate 5(a) exact return-map shape of deploy/reduce-mesh-chunk-response (:done?/:ok?/:state/:next-req/:bytes/:error)"
+    (let [chunk-sz 64
+          payload (fressian/utf8->bytes (apply str (repeat 150 "Z")))
+          target-cid (deploy/sha256-hex payload)
+          asm0 (deploy/init-mesh-chunk-assembly target-cid chunk-sz)
+          req0 (deploy/build-mesh-chunk-request target-cid 0 chunk-sz "shape-0")
+          step0 (deploy/reduce-mesh-chunk-response asm0 (deploy/serve-mesh-blob-chunk payload req0))
+          step1 (deploy/reduce-mesh-chunk-response (:state step0) (deploy/serve-mesh-blob-chunk payload (:next-req step0)))
+          step2 (deploy/reduce-mesh-chunk-response (:state step1) (deploy/serve-mesh-blob-chunk payload (:next-req step1)))
+          err-step (deploy/reduce-mesh-chunk-response asm0 (deploy/serve-mesh-blob-chunk nil req0))]
+      (is (false? (:done? step0)))
+      (is (true? (:ok? step0)))
+      (is (nil? (:status step0)) "reduce-mesh-chunk-response uses :done?/:ok?, never :status")
+      (is (map? (:state step0)))
+      (is (= 64 (get-in step0 [:next-req :offset])))
+      (is (= 64 (get-in step0 [:next-req :length])))
+      (is (false? (:done? step1)))
+      (is (= 128 (get-in step1 [:next-req :offset])))
+      (is (true? (:done? step2)))
+      (is (true? (:ok? step2)))
+      (is (= target-cid (deploy/sha256-hex (:bytes step2))))
+      (is (true? (:done? err-step)))
+      (is (false? (:ok? err-step)))
+      (is (= :not-found (:error err-step)))))
+
+  (testing "Gate 5 rollback does NOT wedge :phase — quarantines bad CID A, rejects A, then cleanly applies fixed CID B"
+    (let [auth-kp (gen-kp 612)
+          old-cid (deploy/sha256-hex (fressian/utf8->bytes "v0.23.21"))
+          bad-bytes (fressian/utf8->bytes "broken-v0.23.22")
+          bad-cid (deploy/sha256-hex bad-bytes)
+          good-bytes (fressian/utf8->bytes "fixed-v0.23.23")
+          good-cid (deploy/sha256-hex good-bytes)
+          ptr-bad (deploy/sign-config-pointer (:priv auth-kp)
+                                              {:seq 2
+                                               :author-pubkey (:pub-hex auth-kp)
+                                               :target-version "0.23.22"
+                                               :light-node-cid bad-cid})
+          ptr-good (deploy/sign-config-pointer (:priv auth-kp)
+                                               {:seq 3
+                                                :author-pubkey (:pub-hex auth-kp)
+                                                :target-version "0.23.23"
+                                                :light-node-cid good-cid})
+          st0 (deploy/init-light-updater-state {:node-id "light-rollback-recovery"
+                                                :artifact-role :light-node
+                                                :current-version "0.23.21"
+                                                :current-cid old-cid
+                                                :trusted-deploy-authorities #{(:pub-hex auth-kp)}})
+          [st1 _] (deploy/reduce-light-update-tick st0 {:type :pointer-seen :pointer ptr-bad :generation (:generation st0)})
+          [st2 _] (deploy/reduce-light-update-tick st1 {:type :blob-fetched :cid bad-cid :bytes bad-bytes :generation (:generation st1)})
+          [st-rb effs-rb] (deploy/reduce-light-update-tick st2 {:type :health-check-result :healthy? false :generation (:generation st2)})
+          ;; Poll tick right after rollback must NOT be suppressed
+          [st-poll effs-poll] (deploy/reduce-light-update-tick st-rb {:type :poll-tick})
+          ;; Re-seeing quarantined bad CID A must emit :light-update-quarantined-cid
+          [st-q effs-q] (deploy/reduce-light-update-tick st-poll {:type :pointer-seen :pointer ptr-bad :generation (:generation st-poll)})
+          ;; Seeing fixed CID B must transition out of :watching and apply cleanly
+          [st-b1 effs-b1] (deploy/reduce-light-update-tick st-q {:type :pointer-seen :pointer ptr-good :generation (:generation st-q)})
+          [st-b2 effs-b2] (deploy/reduce-light-update-tick st-b1 {:type :blob-fetched :cid good-cid :bytes good-bytes :generation (:generation st-b1)})
+          [st-b3 _] (deploy/reduce-light-update-tick st-b2 {:type :health-check-result :healthy? true :generation (:generation st-b2)})]
+      (is (= :watching (:phase st-rb)) "Rollback must return :phase to :watching so future updates are never wedged")
+      (is (= bad-cid (:last-rollback-cid st-rb)))
+      (is (= 1 (:rollback-count st-rb)))
+      (is (contains? (:quarantined-cids st-rb) bad-cid))
+      (is (some #(= :restore-lkg-light-bundle (:effect %)) effs-rb))
+      (is (some #(= :fetch-pointer (:effect %)) effs-poll) "Post-rollback :poll-tick must emit :fetch-pointer, never :update-poll-suppressed")
+      (is (some #(and (= :diagnose (:effect %)) (= :light-update-quarantined-cid (:reason %))) effs-q))
+      (is (= :fetching-https (:phase st-b1)))
+      (is (some #(= :fetch-bundle-blob (:effect %)) effs-b1))
+      (is (= :health-checking (:phase st-b2)))
+      (is (some #(= :atomic-swap-and-restart-light-node (:effect %)) effs-b2))
+      (is (= :watching (:phase st-b3)))
+      (is (= good-cid (:current-cid st-b3)))
+      (is (= "0.23.23" (:current-version st-b3))))))
+
+(deftest bip021-browser-ctl-status-nested-mesh-conns-test
+  (testing "Gate 6: browser/exec-browser-command status counts open peers from nested {:mesh-conns {:peers {...}}}"
+    (let [kp (gen-kp 613)
+          ls (light/init-light-state (:pub-hex kp) {:subnet-id "global"})
+          st {:light-state ls
+              :mesh-conns {:peers {"node1" {:phase :open}
+                                   "node2" {:phase :open}
+                                   "node3" {:phase :connecting}}
+                           :generation 4}
+              :conn {:phase :open :generation 4}}
+          res (browser/exec-browser-cli st "status" (:priv kp))
+          resp (:response res)]
+      (is (true? (get resp "ok")))
+      (is (true? (get resp "connected")) "Nested :mesh-conns :peers with open peers must report connected: true")
+      (is (true? (get resp "transport_healthy")) "Nested :mesh-conns :peers with open peers must report transport_healthy: true")
+      (is (= 2 (get resp "mesh_open_peers"))))))
 
 ;; =============================================================================
 ;; §2.7 Node.js Buffer.poolSize Slab-Pinning Compact-Copy & Cold-Demotion
@@ -704,4 +794,19 @@
      (testing "/ctl HTTP server in node_main.cljs attaches socket error handlers emitting counted :ctl-socket-error (zero ECONNRESET crash)"
        (let [node-src (slurp "src/bitecho/node_main.cljs")]
          (is (str/includes? node-src ":ctl-socket-error")
-             "/ctl server socket error handler must emit counted :ctl-socket-error diagnostic")))))
+             "/ctl server socket error handler must emit counted :ctl-socket-error diagnostic")))
+     (testing "node_main.cljs mesh chunk handler uses :done?/:ok?/:state/:next-req (never :status) and emits counted :mesh-chunk-dispatch-error"
+       (let [node-src (slurp "src/bitecho/node_main.cljs")]
+         (is (not (str/includes? node-src "(case (:status step)"))
+             "on-chunk-res must never branch on nonexistent (:status step)")
+         (is (str/includes? node-src ":mesh-chunk-dispatch-error")
+             "try-dispatch-mesh-chunk-res! must emit counted Rule 5 diagnostic on handler exception")))
+     (testing "--trusted-deploy-authorities CLI flag is co-committed across cli.cljc, node_main.cljs, shell/light_node.clj, and skill/SKILL.md (Rule 6)"
+       (let [cli-src (slurp "src/bitecho/light_node/cli.cljc")
+             node-src (slurp "src/bitecho/node_main.cljs")
+             jvm-src (slurp "src/bitecho/shell/light_node.clj")
+             skill-src (slurp "skill/SKILL.md")]
+         (is (str/includes? cli-src "\"--trusted-deploy-authorities\""))
+         (is (str/includes? node-src "\"--trusted-deploy-authorities\""))
+         (is (str/includes? jvm-src "\"--trusted-deploy-authorities\""))
+         (is (str/includes? skill-src "--trusted-deploy-authorities"))))))

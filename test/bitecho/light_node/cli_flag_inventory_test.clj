@@ -610,4 +610,18 @@
           (is (= "bitecho.org/dev" (get w "subnet_id")))
           (is (= "sess-1" (get w "session_id")))
           (is (= 1795000000000 (get w "after_ts")))
-          (is (true? (get w "non_destructive"))))))))
+          (is (true? (get w "non_destructive")))))
+
+      (testing "BIP-021 --trusted-deploy-authorities flag parsing (CSV pubkeys, empty string, and 'none' -> #{})"
+        (let [flags (set cli/known-command-flags)
+              pk1 (apply str (repeat 64 "a"))
+              pk2 (apply str (repeat 64 "b"))
+              p-csv (shell/parse-light-node-args ["serve" "--trusted-deploy-authorities" (str pk1 "," pk2)])
+              p-empty (shell/parse-light-node-args ["serve" "--trusted-deploy-authorities" ""])
+              p-none (shell/parse-light-node-args ["serve" "--trusted-deploy-authorities" "none"])
+              p-omitted (shell/parse-light-node-args ["serve"])]
+          (is (contains? flags "--trusted-deploy-authorities"))
+          (is (= #{pk1 pk2} (:trusted-deploy-authorities p-csv)))
+          (is (= #{} (:trusted-deploy-authorities p-empty)))
+          (is (= #{} (:trusted-deploy-authorities p-none)))
+          (is (not (contains? p-omitted :trusted-deploy-authorities))))))))

@@ -101,7 +101,9 @@
       (is (some #(= :light-update-hash-mismatch (:reason %)) effs-bad))
       (is (= :health-checking (:phase st2)))
       (is (some #(= :atomic-swap-and-restart-light-node (:effect %)) effs2))
-      (is (= :rolled-back (:phase st3)))
+      (is (= :watching (:phase st3)))
+      (is (= 1 (:rollback-count st3)))
+      (is (contains? (:quarantined-cids st3) good-cid))
       (is (= "0.23.17" (:current-version st3)))
       (is (some #(= :restore-lkg-light-bundle (:effect %)) effs3))))
   (testing "S-D40-1: Node.js light node and full/infra node wire deploy/reduce-light-update-tick"

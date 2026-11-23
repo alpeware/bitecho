@@ -218,7 +218,7 @@
                                 "--amount" "--text" "--message" "--payload-hex"
                                 "--wait-open-ms" "--until-event"
                                 "--path" "--cid" "--file" "--hex" "--seq" "--authority" "--prefix"
-                                "--pin-version" "--auto-update-pointer" "--auto-update-interval-ms"}
+                                "--pin-version" "--auto-update-pointer" "--auto-update-interval-ms" "--trusted-deploy-authorities"}
         runner-valued-flags #{"--state-dir" "--control-port" "--bootstrap"}]
     (loop [rem (vec tokens)]
       (if (empty? rem)
@@ -319,6 +319,18 @@
          pin-version (extract-flag-value clean-args "--pin-version" nil)
          auto-update-pointer (extract-flag-value clean-args "--auto-update-pointer" nil)
          auto-update-interval-ms (extract-long-flag clean-args "--auto-update-interval-ms" nil)
+         trusted-deploy-auths-present? (boolean (some #(or (= % "--trusted-deploy-authorities")
+                                                           (str/starts-with? (str %) "--trusted-deploy-authorities="))
+                                                      clean-args))
+         trusted-deploy-auths-raw (extract-flag-value clean-args "--trusted-deploy-authorities" nil)
+         trusted-deploy-authorities (when trusted-deploy-auths-present?
+                                      (let [trimmed (str/trim (str (or trusted-deploy-auths-raw "")))]
+                                        (if (or (str/blank? trimmed) (= "none" (str/lower-case trimmed)))
+                                          #{}
+                                          (set (keep #(let [s (str/trim (str %))]
+                                                        (when-not (str/blank? s)
+                                                          (str/lower-case s)))
+                                                     (str/split trimmed #","))))))
          turn-username (extract-flag-value clean-args "--turn-username" nil)
          turn-password (extract-flag-value clean-args "--turn-password" nil)
          turn-realm (extract-flag-value clean-args "--turn-realm" nil)
@@ -390,7 +402,8 @@
        turn-config (assoc :turn-config turn-config)
        pin-version (assoc :pin-version pin-version)
        auto-update-pointer (assoc :auto-update-pointer auto-update-pointer)
-       auto-update-interval-ms (assoc :auto-update-interval-ms auto-update-interval-ms)))))
+       auto-update-interval-ms (assoc :auto-update-interval-ms auto-update-interval-ms)
+       trusted-deploy-auths-present? (assoc :trusted-deploy-authorities trusted-deploy-authorities)))))
 
 ;; -----------------------------------------------------------------------------
 ;; State Persistence & Identity Loading
@@ -3464,12 +3477,14 @@
             mdns-svc (try (mdns/start-mdns-service! {:initial-hosts {mdns-host lan-ip}}) (catch Exception _ nil))
             stop-updater! (when (:auto-update-pointer opts)
                             (updater/start-jvm-auto-updater!
-                             {:node-id (or (:peer-id identity) "jvm-light-node")
-                              :pointer-url (:auto-update-pointer opts)
-                              :poll-interval-ms (:auto-update-interval-ms opts)
-                              :pinned-version (:pin-version opts)
-                              :on-event (fn [ev] (event-out ev))
-                              :stop-node-fn! (fn [] (try (save-light-state! state-file @state-atom) (catch Exception _ nil)))}))
+                             (cond-> {:node-id (or (:peer-id identity) "jvm-light-node")
+                                      :pointer-url (:auto-update-pointer opts)
+                                      :poll-interval-ms (:auto-update-interval-ms opts)
+                                      :pinned-version (:pin-version opts)
+                                      :on-event (fn [ev] (event-out ev))
+                                      :stop-node-fn! (fn [] (try (save-light-state! state-file @state-atom) (catch Exception _ nil)))}
+                               (contains? opts :trusted-deploy-authorities)
+                               (assoc :trusted-deploy-authorities (:trusted-deploy-authorities opts)))))
             _ (when stop-updater!
                 (.addShutdownHook (Runtime/getRuntime) (Thread. ^Runnable stop-updater!)))
             mdns-atom (or mdns-svc (atom (mdns/init-mdns-table)))

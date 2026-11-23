@@ -1080,7 +1080,7 @@
                                 "--amount" "--text" "--message" "--payload-hex"
                                 "--wait-open-ms" "--until-event"
                                 "--path" "--cid" "--file" "--hex" "--seq" "--authority" "--prefix"
-                                "--pin-version" "--auto-update-pointer" "--auto-update-interval-ms"}
+                                "--pin-version" "--auto-update-pointer" "--auto-update-interval-ms" "--trusted-deploy-authorities"}
         runner-valued-flags #{"--state-dir" "--control-port" "--bootstrap"}]
     (loop [rem (vec tokens)]
       (if (empty? rem)
@@ -1167,6 +1167,18 @@
          pin-version (extract-flag-value clean-args "--pin-version" nil)
          auto-update-pointer (extract-flag-value clean-args "--auto-update-pointer" nil)
          auto-update-interval-ms (extract-long-flag clean-args "--auto-update-interval-ms" nil)
+         trusted-deploy-auths-present? (boolean (some #(or (= % "--trusted-deploy-authorities")
+                                                           (str/starts-with? (str %) "--trusted-deploy-authorities="))
+                                                      clean-args))
+         trusted-deploy-auths-raw (extract-flag-value clean-args "--trusted-deploy-authorities" nil)
+         trusted-deploy-authorities (when trusted-deploy-auths-present?
+                                      (let [trimmed (str/trim (str (or trusted-deploy-auths-raw "")))]
+                                        (if (or (str/blank? trimmed) (= "none" (str/lower-case trimmed)))
+                                          #{}
+                                          (set (keep #(let [s (str/trim (str %))]
+                                                        (when-not (str/blank? s)
+                                                          (str/lower-case s)))
+                                                     (str/split trimmed #","))))))
          relay-cli (extract-flag-value clean-args "--relay-url" nil)
          relay-url (resolve-relay-url relay-cli getenv-fn)
          subnet-id (extract-flag-value clean-args "--subnet-id" nil)
@@ -1249,6 +1261,7 @@
        pin-version (assoc :pin-version pin-version)
        auto-update-pointer (assoc :auto-update-pointer auto-update-pointer)
        auto-update-interval-ms (assoc :auto-update-interval-ms auto-update-interval-ms)
+       trusted-deploy-auths-present? (assoc :trusted-deploy-authorities trusted-deploy-authorities)
        relay-url (assoc :relay-url relay-url)
        turn-config (assoc :turn-config turn-config)))))
 
@@ -1777,18 +1790,31 @@
 
 (defn- try-dispatch-mesh-chunk-res!
   "Intercepts inbound `:artifact-blob-chunk-res` frames for active BIP-017a mesh chunk fetches.
-   Returns true if handled, false otherwise."
-  [payload]
-  (when (seq @mesh-chunk-handlers-atom)
-    (let [decoded (try (light-core/thaw-payload payload) (catch :default _ nil))]
-      (when (and (map? decoded) (= :artifact-blob-chunk-res (:type decoded)))
-        (let [req-id (:req-id decoded)
-              cid (str (:cid decoded))
-              handler (or (when req-id (get @mesh-chunk-handlers-atom req-id))
-                          (get @mesh-chunk-handlers-atom cid))]
-          (when (fn? handler)
-            (try (handler decoded) (catch :default _ nil))
-            true))))))
+   Returns true if handled, false otherwise. Emits counted Rule 5 `:mesh-chunk-dispatch-error`
+   diagnostic if a chunk handler throws (zero silent catches)."
+  ([payload]
+   (try-dispatch-mesh-chunk-res! payload nil nil))
+  ([payload state-atom event-out]
+   (when (seq @mesh-chunk-handlers-atom)
+     (let [decoded (try (light-core/thaw-payload payload) (catch :default _ nil))]
+       (when (and (map? decoded) (= :artifact-blob-chunk-res (:type decoded)))
+         (let [req-id (:req-id decoded)
+               cid (str (:cid decoded))
+               handler (or (when req-id (get @mesh-chunk-handlers-atom req-id))
+                           (get @mesh-chunk-handlers-atom cid))]
+           (when (fn? handler)
+             (try
+               (handler decoded)
+               (catch :default e
+                 (let [msg (or (ex-message e) (str e))]
+                   (when state-atom
+                     (swap! state-atom update-in [:diagnostics :mesh-chunk-dispatch-error] (fnil inc 0)))
+                   (when event-out
+                     (event-out {"event" "auto-update-diagnose"
+                                 "reason" "mesh-chunk-dispatch-error"
+                                 "cid" cid
+                                 "detail" msg})))))
+             true)))))))
 
 (defn- sync-conn-diagnostics!
   "Synchronizes derived runtime liveness and diagnostics from `conn-atom` into `state-atom`."
@@ -1933,7 +1959,7 @@
                        (when-let [cid (:channel-id evt)]
                          (reset! channel-id cid))
                        (when-let [payload (:payload evt)]
-                         (when-not (try-dispatch-mesh-chunk-res! payload)
+                         (when-not (try-dispatch-mesh-chunk-res! payload state-atom event-out)
                            (when state-atom
                              (let [st @state-atom
                                    res (light-core/handle-wire-payload st payload (:privkey-bytes identity))]
@@ -4061,8 +4087,9 @@
                          (catch :default _ nil))
            proxy-url (resolve-proxy-url (:proxy opts))
            poll-ms (max 5000 (long (or (:auto-update-interval-ms opts) 60000)))
-           trusted-auths (or (not-empty (:trusted-deploy-authorities opts))
-                             #{config/infra-cold-root-pubkey})
+           trusted-auths (if (contains? opts :trusted-deploy-authorities)
+                           (:trusted-deploy-authorities opts)
+                           #{config/infra-cold-root-pubkey})
            updater-atom (atom (deploy/init-light-updater-state
                                {:node-id (or (:peer-id identity) "light-node")
                                 :artifact-role :light-node
@@ -4156,13 +4183,11 @@
                                        on-chunk-res (fn [res]
                                                       (when-not @settled?
                                                         (let [step (deploy/reduce-mesh-chunk-response @asm-atom res)]
-                                                          (case (:status step)
-                                                            :more
-                                                            (do
-                                                              (reset! asm-atom (:assembly step))
-                                                              (send-chunk! (:next-offset step) (:next-length step) chunk-ms))
+                                                          (cond
+                                                            (not (:ok? step))
+                                                            (fail! (or (:error step) :mesh-chunk-error))
 
-                                                            :done
+                                                            (:done? step)
                                                             (when (compare-and-set! settled? false true)
                                                               (cleanup!)
                                                               (reset! staged-bytes-atom (:bytes step))
@@ -4172,8 +4197,12 @@
                                                                           :source :mesh
                                                                           :generation gen}))
 
-                                                            :error
-                                                            (fail! (or (:reason step) :mesh-chunk-error))))))]
+                                                            :else
+                                                            (do
+                                                              (reset! asm-atom (:state step))
+                                                              (send-chunk! (get-in step [:next-req :offset])
+                                                                           (get-in step [:next-req :length])
+                                                                           chunk-ms))))))]
                                    (swap! mesh-chunk-handlers-atom assoc req-id on-chunk-res cid on-chunk-res)
                                    (reset! total-timer (js/setTimeout #(fail! :mesh-total-timeout) total-ms))
                                    (send-chunk! 0 chunk-bytes probe-ms))))

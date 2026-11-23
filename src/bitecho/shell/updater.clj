@@ -77,8 +77,9 @@
           client (-> (HttpClient/newBuilder)
                      (.connectTimeout (Duration/ofSeconds 10))
                      (.build))
-          eff-trusted (or (not-empty trusted-deploy-authorities)
-                          #{config/infra-cold-root-pubkey})
+          eff-trusted (if (some? trusted-deploy-authorities)
+                        (set trusted-deploy-authorities)
+                        #{config/infra-cold-root-pubkey})
           updater-atom (atom (deploy/init-light-updater-state
                               {:node-id (or node-id "jvm-node")
                                :artifact-role :jvm-jar
