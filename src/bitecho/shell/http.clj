@@ -1483,7 +1483,8 @@
                    (when-let [forwarder (:on-relay-forward config)]
                      (doseq [eff (:effects r)]
                        (when (= :forward-to-validators (:effect eff))
-                         (try (forwarder eff) (catch Exception _ nil)))))
+                         (try (forwarder eff) (catch Exception _ nil))))))
+                 (when (relay/should-replicate-to-peers? r {:replicated? replicated?})
                    (replicate-relay-request! config "/relay/v1/send" body-bytes))
                  (let [recip (or (get-in r [:response "recipient"])
                                  (when-let [eff (first (filter #(= :forward-to-validators (:effect %)) (:effects r)))]
@@ -2748,7 +2749,7 @@
                                        (let [recip (or (get-in res [:response "recipient"])
                                                        (get-in res [:response "pubkey"]))
                                              broadcast? (boolean (get-in res [:response "broadcast"]))]
-                                         (when (and recip (not broadcast?))
+                                         (when (relay/should-replicate-to-peers? res {:replicated? false :from-validator? true})
                                            (try
                                              (let [payload-bytes (if (bytes? payload) payload (fressian/encode-wire payload))
                                                    wire-hex (basalt/bytes->hex payload-bytes)

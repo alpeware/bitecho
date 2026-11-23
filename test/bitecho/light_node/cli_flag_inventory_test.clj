@@ -137,8 +137,9 @@
             (is (= 2 (count all-evs)))
             (is (= 2 (count (distinct all-evs))))))
 
-        ;; 6. D18: POST /ctl with {"argv": [...]} and run-one-shot! auto-delegation
-        (swap! state-atom assoc :account {:balance 5000 :spendable 5000 :seq 0})
+        ;; 6. D18 + BIP-020-STAGE4-F2: POST /ctl with {"argv": [...]} on live http-relay commits delivery_telemetry
+        (swap! state-atom assoc :account {:balance 5000 :spendable 5000 :seq 0} :connected? true)
+        (reset! conn-atom {:ok? true :phase :open :transport :http-relay :send-fn (fn [_] true)})
         (let [ctl-info (json/read-str (slurp (io/file state-dir "control.json")))
               port (get ctl-info "port")
               token (get ctl-info "token")
@@ -149,9 +150,12 @@
                                  "--text" "hello from argv" "--burn" "100"]}
                         5000)]
           (is (true? (or (get argv-res "ok") (:ok argv-res))))
+          (is (true? (get argv-res "mesh_submitted")))
           (is (= "homebrew-cafe" (get argv-res "subnet_id")))
           (is (= 100 (get argv-res "burn")))
-          (is (= 4900 (get-in @state-atom [:account :spendable]))))
+          (is (= 4900 (get-in @state-atom [:account :spendable])))
+          (is (= 1 (get-in @state-atom [:delivery-telemetry :sent])))
+          (is (= 1 (get-in @state-atom [:delivery-telemetry :fanout :mesh-submitted]))))
 
         ;; 7. D18: run-light-node-cli! one-shot command auto-delegates when control.json is reachable
         (let [oneshot-res (shell/run-light-node-cli! ["petname-set" "--state-dir" (str state-dir)

@@ -569,3 +569,87 @@
           res (light-core/handle-wire-payload alice-state foreign-msg nil)]
       (is (= 1 (get-in (:state res) [:delivery-telemetry :received-but-not-emitted :foreign-unicast])))
       (is (= 1 (get-in (:state res) [:diagnostics :foreign-unicast-dropped]))))))
+
+;; =============================================================================
+;; STAGE 4 REMEDIATION: BIP-020-STAGE4-F1 & BIP-020-STAGE4-F2 (Strict TDD)
+;; =============================================================================
+
+(deftest test-f1-cross-relay-broadcast-replication-no-loop
+  (testing "BIP-020-STAGE4-F1: subnet broadcasts replicate ns1 -> ns3 without loops and carol receives 100%"
+    (let [{:keys [alice-state alice-id bob-id]} (make-open-session-state "bip020-f1-xrelay")
+          carol (make-test-identity "bip020-f1-carol")
+          prep (light-core/prepare-broadcast
+                alice-state
+                {"subnet_id" "bip020.test/soak" "text" "soak-broadcast-1" "burn" 0 "now_ms" 1795000000000}
+                (:privkey-bytes alice-id))
+          wire-bytes (fressian/encode-wire (first (:net-envelopes prep)))
+          ns1-0 (relay/init-relay-state {:relay-id "ns1"})
+          ns3-0 (relay/init-relay-state {:relay-id "ns3"})
+          ;; 1. Client submits zero-burn subnet broadcast to ns1 /relay/v1/send
+          ns1-sub (relay/reduce-relay ns1-0 {:type :relay-submit :wire-bytes wire-bytes :now-ms 1795000001000})
+          ;; Must replicate to peer relays (both direct HTTP and validator-bridge origin)
+          _ (is (true? (relay/should-replicate-to-peers? ns1-sub {:replicated? false :from-validator? false})))
+          _ (is (true? (relay/should-replicate-to-peers? ns1-sub {:replicated? false :from-validator? true})))
+          ;; 2. ns3 receives replicated broadcast (X-Bitecho-Relay-Replicated: true)
+          ns3-sub (relay/reduce-relay ns3-0 {:type :relay-submit :wire-bytes wire-bytes :now-ms 1795000001050})
+          ;; Receiving peer MUST NOT re-replicate (prevents infinite broadcast storm)
+          _ (is (false? (relay/should-replicate-to-peers? ns3-sub {:replicated? true :from-validator? false})))
+          ;; Duplicate arrival on ns3 MUST NOT re-replicate even if not marked replicated
+          ns3-dup (relay/reduce-relay (:state ns3-sub) {:type :relay-submit :wire-bytes wire-bytes :now-ms 1795000001100})
+          _ (is (true? (:duplicate? ns3-dup)))
+          _ (is (false? (relay/should-replicate-to-peers? ns3-dup {:replicated? false :from-validator? true})))
+          ;; 3. Mesh-only subscriber carol polling ns3 receives the subnet broadcast
+          poll-carol (relay/reduce-relay (:state ns3-sub)
+                                         (make-relay-poll-event carol {:subnets ["bip020.test/soak"]
+                                                                       :now-ms 1795000002000}))
+          bcasts (get-in poll-carol [:response "broadcasts"])]
+      (is (:ok? poll-carol))
+      (is (= 1 (count bcasts)))
+      (is (= "bip020.test/soak" (:subnet-id (first bcasts))))
+      (is (some? bob-id)))))
+
+(deftest test-f2-http-relay-send-and-broadcast-commit-delivery-telemetry
+  (testing "BIP-020-STAGE4-F2: http-relay direct send and broadcast commit delivery_telemetry.sent and fanout counters"
+    (let [{:keys [alice-state alice-id session-id]} (make-open-session-state "bip020-f2-telemetry")
+          ;; 1. Broadcast via handle-command -> has :fanout-intent -> shell commits http-relay + P2P outcome
+          b-res (light-core/handle-command alice-state
+                                           {"cmd" "broadcast"
+                                            "subnet_id" "bip020.test/soak"
+                                            "text" "hello-soak"
+                                            "now_ms" 1795000000000}
+                                           (:privkey-bytes alice-id))
+          _ (is (map? (:fanout-intent b-res)))
+          b-committed (light-core/commit-delivery-outcome
+                       (:state b-res)
+                       (:fanout-intent b-res)
+                       {:mesh-submitted? true
+                        :p2p-direct? true
+                        :mesh-peers-targeted 1
+                        :p2p-peers-targeted 1
+                        :now-ms 1795000000050})
+          ;; 2. Direct DM via handle-command -> has :fanout-intent -> shell commits http-relay mesh outcome
+          s-res (light-core/handle-command (:state b-committed)
+                                           {"cmd" "send"
+                                            "session_id" session-id
+                                            "text" "hello-carol"
+                                            "now_ms" 1795000001000}
+                                           (:privkey-bytes alice-id))
+          _ (is (map? (:fanout-intent s-res)))
+          s-committed (light-core/commit-delivery-outcome
+                       (:state s-res)
+                       (:fanout-intent s-res)
+                       {:mesh-submitted? true
+                        :p2p-direct? false
+                        :mesh-peers-targeted 1
+                        :p2p-peers-targeted 0
+                        :now-ms 1795000001050})
+          status (light-core/exec-status (:state s-committed) 1795000002000)
+          dt (get-in status [:response "delivery_telemetry"])]
+      (is (true? (get-in b-committed [:response "ok"])))
+      (is (true? (get-in b-committed [:response "mesh_submitted"])))
+      (is (true? (get-in b-committed [:response "p2p_direct"])))
+      (is (nil? (get-in b-committed [:response "pending_delivery"])))
+      (is (= 2 (get dt "sent")))
+      (is (= 2 (get-in dt ["fanout" "mesh_submitted"])))
+      (is (= 1 (get-in dt ["fanout" "p2p_direct"])))
+      (is (= 3 (get-in dt ["fanout" "peers_targeted"]))))))

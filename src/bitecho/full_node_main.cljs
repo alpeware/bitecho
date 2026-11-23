@@ -846,13 +846,17 @@
 
 (defn- replicate-relay-to-peers!
   [rt endpoint body-buf]
-  (when (and (get-in (:config rt) [:cluster :enabled?] false) body-buf (pos? (.-length body-buf)))
-    (let [hmac (compute-relay-auth-hmac (:tls-secret rt) endpoint body-buf)
-          hdrs (cond-> {"Content-Type" "application/json"
-                        "X-Bitecho-Relay-Replicated" "true"}
-                 hmac (assoc "X-Bitecho-Relay-Auth" hmac))]
-      (doseq [peer (eligible-http-peers (:config rt))]
-        (post-to-peer! peer endpoint hdrs body-buf (:shell-atom rt) :peer-relay-replicate-failed)))))
+  (let [peers (eligible-http-peers (:config rt))]
+    (when (and (or (get-in (:config rt) [:cluster :enabled?] false)
+                   (seq peers))
+               body-buf
+               (pos? (.-length body-buf)))
+      (let [hmac (compute-relay-auth-hmac (:tls-secret rt) endpoint body-buf)
+            hdrs (cond-> {"Content-Type" "application/json"
+                          "X-Bitecho-Relay-Replicated" "true"}
+                   hmac (assoc "X-Bitecho-Relay-Auth" hmac))]
+        (doseq [peer peers]
+          (post-to-peer! peer endpoint hdrs body-buf (:shell-atom rt) :peer-relay-replicate-failed))))))
 
 (defn- submit-subnet-event!
   [rt event]
@@ -1693,7 +1697,8 @@
                    (when-not (:replicated? rep-auth)
                      (doseq [eff (:effects r)]
                        (when (= :forward-to-validators (:effect eff))
-                         (forward-relay-to-validator-mesh! rt eff)))
+                         (forward-relay-to-validator-mesh! rt eff))))
+                   (when (relay/should-replicate-to-peers? r {:replicated? (:replicated? rep-auth)})
                      (replicate-relay-to-peers! rt "/relay/v1/send" body-buf))
                    (wake-relay-waiters! waiters-atom
                                         (or (get-in r [:response "recipient"])
@@ -4312,7 +4317,7 @@
                                     (let [recip (or (get-in res [:response "recipient"])
                                                     (get-in res [:response "pubkey"]))
                                           broadcast? (boolean (get-in res [:response "broadcast"]))]
-                                      (when (and recip (not broadcast?))
+                                      (when (relay/should-replicate-to-peers? res {:replicated? false :from-validator? true})
                                         (try
                                           (let [payload-bytes (if (fressian/bytes? payload) payload (fressian/encode-wire payload))
                                                 wire-hex (basalt/bytes->hex payload-bytes)

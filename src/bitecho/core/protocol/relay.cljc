@@ -398,6 +398,21 @@
 ;; 4. Pure Sans-IO Relay Reducer (`reduce-relay`)
 ;; =============================================================================
 
+(defn should-replicate-to-peers?
+  "Pure predicate (BIP-020-STAGE4-F1) deciding whether a `:relay-submit` result should be
+   replicated to peer HTTP relays.
+   - Replicates BOTH direct messages (with `:recipient`/`pubkey`) AND subnet broadcasts (`broadcast: true`).
+   - NEVER replicates if the request already arrived via peer replication (`:replicated? true`)
+     or was already seen (`:duplicate? true`), preventing broadcast storms and infinite loops."
+  [submit-res {:keys [replicated?]}]
+  (let [resp (:response submit-res)
+        recip (or (get resp "recipient") (get resp "pubkey"))
+        broadcast? (boolean (get resp "broadcast"))]
+    (boolean (and (:ok? submit-res)
+                  (not (:duplicate? submit-res))
+                  (not replicated?)
+                  (or (some? recip) broadcast?)))))
+
 (defn reduce-relay
   "Pure Sans-IO HTTP Gateway Relay Reducer (`state + event -> {:state :ok? :response :effects}`)."
   [state event]

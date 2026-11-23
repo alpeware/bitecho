@@ -2659,22 +2659,42 @@
                 (crypto/verify pub-bytes (fressian/utf8->bytes sig-str) sig-bytes))))))))
 
 (defn route-net-envelope!
-  "Routes an outgoing network envelope directly to P2P peer(s) or falls back to validator gossip."
+  "Routes an outgoing network envelope directly to P2P peer(s) or falls back to validator/relay mesh.
+   Returns `{:mesh-submitted? :p2p-direct? :mesh-peers-targeted :p2p-peers-targeted :error}` (BIP-020-STAGE4-F2)."
   [env send-fn-atom p2p-peers-atom ingress-peers-atom state-atom privkey-bytes]
   (let [send-default! (fn []
-                        (when-let [sfn (cond
-                                         (instance? cljs.core/Atom send-fn-atom) @send-fn-atom
-                                         (fn? send-fn-atom) send-fn-atom
-                                         :else nil)]
-                          (sfn env)))]
+                        (if-let [sfn (cond
+                                       (instance? cljs.core/Atom send-fn-atom) @send-fn-atom
+                                       (fn? send-fn-atom) send-fn-atom
+                                       :else nil)]
+                          (try
+                            (let [r (sfn env)]
+                              (not (false? r)))
+                            (catch :default _
+                              false))
+                          false))]
     (cond
       (:p2p-broadcast? env)
       (let [p2p-sends (keep :send-fn (vals (or (when p2p-peers-atom @p2p-peers-atom) {})))
             ingress-sends (vals (or (when ingress-peers-atom @ingress-peers-atom) {}))
-            all-sends (concat p2p-sends ingress-sends)]
-        (doseq [sfn all-sends]
-          (try (sfn env) (catch :default _ nil)))
-        (send-default!))
+            all-sends (concat p2p-sends ingress-sends)
+            p2p-sent (reduce
+                      (fn [acc sfn]
+                        (try
+                          (let [r (sfn env)]
+                            (if (false? r) acc (inc acc)))
+                          (catch :default _
+                            (when state-atom
+                              (swap! state-atom update-in [:diagnostics :p2p-send-failed] (fnil inc 0)))
+                            acc)))
+                      0
+                      all-sends)
+            mesh-ok? (boolean (send-default!))]
+        {:mesh-submitted? mesh-ok?
+         :p2p-direct? (pos? p2p-sent)
+         :mesh-peers-targeted (if mesh-ok? 1 0)
+         :p2p-peers-targeted p2p-sent
+         :error (when-not (or mesh-ok? (pos? p2p-sent)) "broadcast-route-failed")})
 
       (:p2p-direct? env)
       (let [norm-target (light-core/normalize-pubkey-hex (:p2p-peer env))
@@ -2682,18 +2702,27 @@
             ingress-send (when ingress-peers-atom (get @ingress-peers-atom norm-target))
             direct-send (or (:send-fn p2p-entry) ingress-send)]
         (if direct-send
-          (try
-            (direct-send env)
-            (catch :default ex
-              (when (and state-atom (:p2p-session-id env))
-                (let [cmd-res (light-core/handle-command @state-atom
-                                                         {"cmd" "p2p-channel-state"
-                                                          "session_id" (:p2p-session-id env)
-                                                          "connected" false
-                                                          "error" (str "direct-send-failed: " (or (ex-message ex) (str ex)))}
-                                                         privkey-bytes)]
-                  (reset! state-atom (:state cmd-res))))
-              (send-default!)))
+          (let [direct-ok? (try
+                             (let [r (direct-send env)]
+                               (not (false? r)))
+                             (catch :default ex
+                               (when (and state-atom (:p2p-session-id env))
+                                 (let [cmd-res (light-core/handle-command @state-atom
+                                                                          {"cmd" "p2p-channel-state"
+                                                                           "session_id" (:p2p-session-id env)
+                                                                           "connected" false
+                                                                           "error" (str "direct-send-failed: " (or (ex-message ex) (str ex)))}
+                                                                          privkey-bytes)]
+                                   (reset! state-atom (:state cmd-res))))
+                               false))]
+            (if direct-ok?
+              {:mesh-submitted? false :p2p-direct? true :mesh-peers-targeted 0 :p2p-peers-targeted 1 :error nil}
+              (let [mesh-ok? (boolean (send-default!))]
+                {:mesh-submitted? mesh-ok?
+                 :p2p-direct? false
+                 :mesh-peers-targeted (if mesh-ok? 1 0)
+                 :p2p-peers-targeted 0
+                 :error (when-not mesh-ok? "direct-and-mesh-send-failed")})))
           (do
             (when (and state-atom (:p2p-session-id env))
               (let [cmd-res (light-core/handle-command @state-atom
@@ -2703,17 +2732,38 @@
                                                         "error" "no-direct-route"}
                                                        privkey-bytes)]
                 (reset! state-atom (:state cmd-res))))
-            (send-default!))))
+            (let [mesh-ok? (boolean (send-default!))]
+              {:mesh-submitted? mesh-ok?
+               :p2p-direct? false
+               :mesh-peers-targeted (if mesh-ok? 1 0)
+               :p2p-peers-targeted 0
+               :error (when-not mesh-ok? "no-direct-or-mesh-route")}))))
 
       :else
-      (send-default!))))
+      (let [mesh-ok? (boolean (send-default!))]
+        {:mesh-submitted? mesh-ok?
+         :p2p-direct? false
+         :mesh-peers-targeted (if mesh-ok? 1 0)
+         :p2p-peers-targeted 0
+         :error (when-not mesh-ok? "mesh-send-failed")}))))
 
 (defn send-routed-envelopes!
-  "Routes a sequence of outgoing network envelopes via route-net-envelope!."
+  "Routes a sequence of outgoing network envelopes via route-net-envelope! and returns
+   an aggregated delivery outcome map `{:ok? :mesh-submitted? :p2p-direct? :mesh-peers-targeted :p2p-peers-targeted :error}`."
   [envs send-fn-atom p2p-peers-atom ingress-peers-atom state-atom privkey-bytes]
-  (doseq [env envs]
-    (route-net-envelope! env send-fn-atom p2p-peers-atom ingress-peers-atom state-atom privkey-bytes))
-  true)
+  (let [outcomes (mapv #(route-net-envelope! % send-fn-atom p2p-peers-atom ingress-peers-atom state-atom privkey-bytes)
+                       envs)
+        mesh-ok? (boolean (some :mesh-submitted? outcomes))
+        p2p-ok? (boolean (some :p2p-direct? outcomes))
+        mesh-peers (reduce + 0 (map #(long (or (:mesh-peers-targeted %) 0)) outcomes))
+        p2p-peers (reduce + 0 (map #(long (or (:p2p-peers-targeted %) 0)) outcomes))]
+    {:ok? (or mesh-ok? p2p-ok? (empty? envs))
+     :mesh-submitted? mesh-ok?
+     :p2p-direct? p2p-ok?
+     :mesh-peers-targeted mesh-peers
+     :p2p-peers-targeted p2p-peers
+     :error (when-not (or mesh-ok? p2p-ok? (empty? envs))
+              (or (some :error outcomes) "send-routed-failed"))}))
 
 (defn dial-p2p-peer!
   "Dials a remote P2P candidate peer via WebRTC DataChannel (TCP/UDP/mDNS)."
@@ -3461,19 +3511,30 @@
                                                           (swap! state-atom update-in [:diagnostics :relay-mirror-failed] (fnil inc 0))))
                                                       {:timeout-ms 5000})
                                                      (catch :default _
-                                                       (swap! state-atom update-in [:diagnostics :relay-mirror-failed] (fnil inc 0)))))))]
+                                                       (swap! state-atom update-in [:diagnostics :relay-mirror-failed] (fnil inc 0)))))))
+                            commit-intent! (fn [res-map outcome]
+                                             (if-let [intent (:fanout-intent res-map)]
+                                               (let [committed (light-core/commit-delivery-outcome
+                                                                @state-atom
+                                                                intent
+                                                                (assoc outcome :now-ms (.now js/Date)))]
+                                                 (reset! state-atom (:state committed))
+                                                 (assoc res-map
+                                                        :state (:state committed)
+                                                        :response (:response committed)))
+                                               res-map))]
                         (if (some #(or (:p2p-direct? %) (:p2p-broadcast? %)) live-envs)
-                          (do
-                            (send-routed-envelopes! live-envs
-                                                    (when currently-live? (:send-fn @conn-atom))
-                                                    p2p-peers-atom
-                                                    ingress-peers-atom
-                                                    state-atom
-                                                    (:privkey-bytes identity))
-                            (mirror-to-relay! live-envs)
+                          (let [route-res (send-routed-envelopes! live-envs
+                                                                  (when currently-live? (:send-fn @conn-atom))
+                                                                  p2p-peers-atom
+                                                                  ingress-peers-atom
+                                                                  state-atom
+                                                                  (:privkey-bytes identity))
+                                _ (mirror-to-relay! live-envs)
+                                committed-res (commit-intent! res route-res)]
                             (sync-conn-diagnostics! state-atom conn-atom)
                             (save-light-state! state-file @state-atom)
-                            (finish-resp! res))
+                            (finish-resp! committed-res))
                           (let [sent-ingress? (boolean
                                                (when (and ingress-peers-atom (seq @ingress-peers-atom))
                                                  (some true? (mapv #(send-all-envelopes! % live-envs) (vals @ingress-peers-atom)))))
@@ -3482,11 +3543,16 @@
                                 _ (mirror-to-relay! live-envs)
                                 sent? (or sent-val? sent-ingress?)]
                             (if sent?
-                              (do
+                              (let [committed-res (commit-intent!
+                                                   res
+                                                   {:mesh-submitted? (boolean sent-val?)
+                                                    :p2p-direct? sent-ingress?
+                                                    :mesh-peers-targeted (if sent-val? 1 0)
+                                                    :p2p-peers-targeted (if sent-ingress? 1 0)})]
                                 (swap! state-atom assoc :connected? true :connection-error nil)
                                 (sync-conn-diagnostics! state-atom conn-atom)
                                 (save-light-state! state-file @state-atom)
-                                (finish-resp! res))
+                                (finish-resp! committed-res))
                               (do
                                 (swap! state-atom assoc :connected? false :connection-error "send-failed")
                                 (when conn-atom
@@ -3508,11 +3574,16 @@
                                          (let [r-envs (light-core/build-unacked-replay-envelopes @state-atom (:privkey-bytes identity))
                                                all-envs (into (vec r-envs) (:net-envelopes res))]
                                            (if (send-all-envelopes! (:send-fn reconn) all-envs)
-                                             (do
+                                             (let [committed-res (commit-intent!
+                                                                  res
+                                                                  {:mesh-submitted? true
+                                                                   :p2p-direct? false
+                                                                   :mesh-peers-targeted 1
+                                                                   :p2p-peers-targeted 0})]
                                                (swap! state-atom assoc :connected? true :connection-error nil)
                                                (sync-conn-diagnostics! state-atom conn-atom)
                                                (save-light-state! state-file @state-atom)
-                                               (finish-resp! res))
+                                               (finish-resp! committed-res))
                                              (let [err "send-failed"]
                                                (when conn-atom
                                                  (apply-conn-event! conn-atom {:type :send-failed :error err :generation target-gen} conn-opts))
