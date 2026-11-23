@@ -809,4 +809,14 @@
          (is (str/includes? cli-src "\"--trusted-deploy-authorities\""))
          (is (str/includes? node-src "\"--trusted-deploy-authorities\""))
          (is (str/includes? jvm-src "\"--trusted-deploy-authorities\""))
-         (is (str/includes? skill-src "--trusted-deploy-authorities"))))))
+         (is (str/includes? skill-src "--trusted-deploy-authorities"))))
+     (testing ":443 passthrough splice-sockets! and handle-passthrough-socket! use ^js hints (no Closure :advanced mangling of .unpipe/.removeAllListeners/.writableFinished) and zero silent catches"
+       (let [full-src (slurp "src/bitecho/full_node_main.cljs")]
+         (is (str/includes? full-src "[^js client-sock ^js backend-sock shell-atom]")
+             "splice-sockets! must type-hint ^js on client-sock and backend-sock")
+         (is (str/includes? full-src "[^js client-sock {:keys [domain")
+             "handle-passthrough-socket! must type-hint ^js on client-sock")
+         (is (str/includes? full-src ":passthrough-cleanup-error")
+             "splice-sockets! must emit counted Rule 5 :passthrough-cleanup-error instead of silent catches")
+         (is (str/includes? full-src "on-bsock-dial-error")
+             "handle-passthrough-socket! must detach pre-connect dial error listener on connect")))))

@@ -2322,12 +2322,19 @@
   "Bidirectionally splices `client-sock` and `backend-sock` under a single-authority
    generation-tagged `core-infra/transition-passthrough-pair` lifecycle reducer so that
    paused sockets with unread TLS `close_notify` buffers are always destroyed cleanly
-   (fixing the live `TCPSocketWrap`/`ArrayBuffer` leak, BIP-018-SOAK-F1)."
-  [client-sock backend-sock shell-atom]
+   (fixing the live `TCPSocketWrap`/`ArrayBuffer` leak, BIP-018-SOAK-F1).
+   All socket/stream/timer bindings are explicitly `^js`-hinted so Closure `:advanced`
+   never mangles `.unpipe`, `.removeAllListeners`, `.writableFinished`, `.destroy`, or `.end`."
+  [^js client-sock ^js backend-sock shell-atom]
   (let [pair-id (str "pt-" (:next-id (swap! passthrough-registry-atom update :next-id inc)))
         pair-atom (atom (core-infra/init-passthrough-pair {:generation 1 :pair-id pair-id}))
         drain-started-at-atom (atom nil)
         drain-timer-atom (atom nil)
+        diag-cleanup-err! (fn [op ^js e]
+                            (apply-shell-event! shell-atom
+                                                {:type :drop
+                                                 :reason :passthrough-cleanup-error
+                                                 :detail (str op ":" (or (when e (.-message e)) (str e)))}))
         clear-timer! (fn []
                        (when-let [t @drain-timer-atom]
                          (reset! drain-timer-atom nil)
@@ -2335,20 +2342,30 @@
                          (js/clearTimeout t)))
         cleanup-pair! (fn []
                         (clear-timer!)
-                        (try (.unpipe client-sock backend-sock) (catch :default _ nil))
-                        (try (.unpipe backend-sock client-sock) (catch :default _ nil))
+                        (when client-sock
+                          (try (.unpipe client-sock backend-sock)
+                               (catch :default e (diag-cleanup-err! "unpipe-client" e)))
+                          (try (.removeAllListeners client-sock "drain")
+                               (catch :default e (diag-cleanup-err! "rm-drain-client" e))))
+                        (when backend-sock
+                          (try (.unpipe backend-sock client-sock)
+                               (catch :default e (diag-cleanup-err! "unpipe-backend" e)))
+                          (try (.removeAllListeners backend-sock "drain")
+                               (catch :default e (diag-cleanup-err! "rm-drain-backend" e))))
                         (swap! passthrough-registry-atom
                                (fn [reg]
                                  (-> reg
                                      (update :active-pairs dissoc pair-id)
                                      (update :draining-order #(vec (remove (fn [id] (= id pair-id)) %)))))))
-        sock-for (fn [side] (if (= side :client) client-sock backend-sock))
+        sock-for (fn ^js [side] (if (= side :client) client-sock backend-sock))
         force-destroy-both! (fn []
                               (cleanup-pair!)
                               (when (and client-sock (not (.-destroyed client-sock)))
-                                (try (.destroy client-sock) (catch :default _ nil)))
+                                (try (.destroy client-sock)
+                                     (catch :default e (diag-cleanup-err! "destroy-client" e))))
                               (when (and backend-sock (not (.-destroyed backend-sock)))
-                                (try (.destroy backend-sock) (catch :default _ nil))))
+                                (try (.destroy backend-sock)
+                                     (catch :default e (diag-cleanup-err! "destroy-backend" e)))))
         _ (swap! passthrough-registry-atom assoc-in [:active-pairs pair-id] force-destroy-both!)
         step! (fn step! [ev]
                 (let [effs-box (atom [])
@@ -2387,28 +2404,31 @@
                       (clear-timer!)
 
                       :end-socket
-                      (let [s (sock-for (:side eff))]
+                      (let [^js s (sock-for (:side eff))]
                         (when (and s (not (.-destroyed s)) (not (.-writableEnded s)))
-                          (try (.end s) (catch :default _ nil))))
+                          (try (.end s)
+                               (catch :default e (diag-cleanup-err! "end-socket" e)))))
 
                       :destroy-socket
-                      (let [s (sock-for (:side eff))]
+                      (let [^js s (sock-for (:side eff))]
                         (when (and s (not (.-destroyed s)))
-                          (try (.removeAllListeners s "drain") (catch :default _ nil))
-                          (try (.destroy s) (catch :default _ nil))))
+                          (try (.removeAllListeners s "drain")
+                               (catch :default e (diag-cleanup-err! "rm-drain-destroy" e)))
+                          (try (.destroy s)
+                               (catch :default e (diag-cleanup-err! "destroy-socket" e)))))
 
                       :schedule-drain-timeout
                       (do
                         (clear-timer!)
                         (let [side (:side eff)
                               ms (long (or (:timeout-ms eff) core-infra/default-passthrough-drain-timeout-ms))
-                              t (js/setTimeout
-                                 (fn []
-                                   (when @drain-timer-atom
-                                     (reset! drain-timer-atom nil)
-                                     (swap! passthrough-registry-atom update :active-timers #(max 0 (dec (long (or % 0))))))
-                                   (step! {:type :drain-timeout :side side :generation 1}))
-                                 ms)]
+                              ^js t (js/setTimeout
+                                     (fn []
+                                       (when @drain-timer-atom
+                                         (reset! drain-timer-atom nil)
+                                         (swap! passthrough-registry-atom update :active-timers #(max 0 (dec (long (or % 0))))))
+                                       (step! {:type :drain-timeout :side side :generation 1}))
+                                     ms)]
                           (when (.-unref t) (.unref t))
                           (swap! passthrough-registry-atom update :active-timers (fnil inc 0))
                           (reset! drain-timer-atom t)))
@@ -2435,9 +2455,9 @@
                      :elapsed-ms (- (.now js/Date) (long (or @drain-started-at-atom (.now js/Date))))
                      :generation 1}))))
     (.on client-sock "error"
-         (fn [e] (step! {:type :socket-error :side :client :detail (.-message e) :generation 1})))
+         (fn [^js e] (step! {:type :socket-error :side :client :detail (.-message e) :generation 1})))
     (.on backend-sock "error"
-         (fn [e] (step! {:type :socket-error :side :backend :detail (.-message e) :generation 1})))
+         (fn [^js e] (step! {:type :socket-error :side :backend :detail (.-message e) :generation 1})))
     (.once client-sock "finish"
            (fn [] (step! {:type :socket-finish :side :client :generation 1})))
     (.once backend-sock "finish"
@@ -2462,13 +2482,14 @@
     (.pipe backend-sock client-sock)))
 
 (defn- handle-passthrough-socket!
-  [client-sock {:keys [domain internal-https-port ingress-target connect-targets connect-routes peek-timeout-ms shell-atom]}]
-  (let [chunks #js []
+  [^js client-sock {:keys [domain internal-https-port ingress-target connect-targets connect-routes peek-timeout-ms shell-atom]}]
+  (let [^js chunks #js []
         handled? (atom false)
+        on-pre-error (fn [_] (reset! handled? true))
         dispatch! (fn []
                     (when (compare-and-set! handled? false true)
                       (.setTimeout client-sock 0)
-                      (let [buf (.concat js/Buffer chunks)
+                      (let [^js buf (.concat js/Buffer chunks)
                             _ (set! (.-length chunks) 0)
                             n (.-length buf)]
                         (if (or (not (pos? n)) (.-destroyed client-sock))
@@ -2483,59 +2504,64 @@
                                   (do
                                     (apply-shell-event! shell-atom {:type :drop :reason :http-connect-denied :detail target-key})
                                     (.end client-sock "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n"))
-                                  (let [bsock (.createConnection node-net #js {:host (:host backend) :port (long (:port backend))})
+                                  (let [^js bsock (.createConnection node-net #js {:host (:host backend) :port (long (:port backend)) :allowHalfOpen true})
                                         hdr-end (or (find-header-end-idx buf) n)
                                         on-client-early-close (fn []
                                                                 (when-not (.-destroyed bsock)
-                                                                  (.destroy bsock)))]
+                                                                  (.destroy bsock)))
+                                        on-bsock-dial-error (fn [^js e]
+                                                              (.removeListener client-sock "close" on-client-early-close)
+                                                              (apply-shell-event! shell-atom {:type :drop :reason :http-connect-dial-failed :detail (.-message e)})
+                                                              (when-not (.-destroyed client-sock)
+                                                                (.end client-sock "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")))]
                                     (.setNoDelay client-sock true)
                                     (.setNoDelay bsock true)
                                     (.once client-sock "close" on-client-early-close)
+                                    (.once bsock "error" on-bsock-dial-error)
                                     (.once bsock "connect"
                                            (fn []
                                              (.removeListener client-sock "close" on-client-early-close)
+                                             (.removeListener client-sock "error" on-pre-error)
+                                             (.removeListener bsock "error" on-bsock-dial-error)
                                              (if (.-destroyed client-sock)
                                                (.destroy bsock)
                                                (do
                                                  (.write client-sock "HTTP/1.1 200 Connection Established\r\n\r\n")
                                                  (when (< hdr-end n)
                                                    (.write bsock (.subarray buf hdr-end n)))
-                                                 (splice-sockets! client-sock bsock shell-atom)))))
-                                    (.on bsock "error"
-                                         (fn [e]
-                                           (.removeListener client-sock "close" on-client-early-close)
-                                           (apply-shell-event! shell-atom {:type :drop :reason :http-connect-dial-failed :detail (.-message e)})
-                                           (when-not (.-destroyed client-sock)
-                                             (.end client-sock "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")))))))
+                                                 (splice-sockets! client-sock bsock shell-atom))))))))
                               ;; 2. Ingress stream (DTLS/STUN/SNI *.ingress.<domain>) vs internal HTTPS server
                               (let [ingress? (and (some? ingress-target) (dns-proto/ingress-stream? u8 n domain))
                                     target (if ingress? ingress-target {:host "127.0.0.1" :port internal-https-port})
-                                    bsock (.createConnection node-net #js {:host (:host target) :port (long (:port target))})
+                                    ^js bsock (.createConnection node-net #js {:host (:host target) :port (long (:port target)) :allowHalfOpen true})
                                     on-client-early-close (fn []
                                                             (when-not (.-destroyed bsock)
-                                                              (.destroy bsock)))]
+                                                              (.destroy bsock)))
+                                    on-bsock-dial-error (fn [^js e]
+                                                          (.removeListener client-sock "close" on-client-early-close)
+                                                          (apply-shell-event! shell-atom {:type :drop :reason :passthrough-dial-failed :detail (.-message e)})
+                                                          (when-not (.-destroyed client-sock)
+                                                            (.destroy client-sock)))]
                                 (.setNoDelay client-sock true)
                                 (.setNoDelay bsock true)
                                 (.once client-sock "close" on-client-early-close)
+                                (.once bsock "error" on-bsock-dial-error)
                                 (.once bsock "connect"
                                        (fn []
                                          (.removeListener client-sock "close" on-client-early-close)
+                                         (.removeListener client-sock "error" on-pre-error)
+                                         (.removeListener bsock "error" on-bsock-dial-error)
                                          (if (.-destroyed client-sock)
                                            (.destroy bsock)
                                            (do
                                              (.write bsock buf)
-                                             (splice-sockets! client-sock bsock shell-atom)))))
-                                (.on bsock "error"
-                                     (fn [e]
-                                       (.removeListener client-sock "close" on-client-early-close)
-                                       (apply-shell-event! shell-atom {:type :drop :reason :passthrough-dial-failed :detail (.-message e)})
-                                       (.destroy client-sock))))))))))]
+                                             (splice-sockets! client-sock bsock shell-atom))))))))))))]
     (.setTimeout client-sock (long (or peek-timeout-ms 2000)))
     (.once client-sock "timeout" (fn [] (when-not @handled? (.destroy client-sock))))
     (.once client-sock "end" (fn [] (when-not @handled? (.destroy client-sock))))
-    (.on client-sock "error" (fn [_] (reset! handled? true)))
+    (.on client-sock "error" on-pre-error)
     (.once client-sock "data"
-           (fn [chunk]
+           (fn [^js chunk]
              (.pause client-sock)
              (.push chunks chunk)
              (dispatch!)))))
@@ -4525,7 +4551,8 @@
                      (let [internal-port (.-port (.address https-srv))
                            front-srv (.createServer
                                       node-net
-                                      (fn [sock]
+                                      #js {:allowHalfOpen true}
+                                      (fn [^js sock]
                                         (handle-passthrough-socket!
                                          sock
                                          {:domain (or (:domain config) "bitecho.org")
