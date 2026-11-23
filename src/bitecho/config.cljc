@@ -47,6 +47,14 @@
   "Pinned Cold Offline Infra Root Ed25519 public key (HEX) for on-network artifact attestation."
   "302a300506032b6570032100d88b92f094f65be1d32c8c1fb6c85f7913458a99ebdc142009ab2f18fd1bf641")
 
+(def devnet-deploy-authority-pubkey
+  "Pinned Devnet Online Deploy Authority Ed25519 public key (HEX) for signed release pointers."
+  "302a300506032b65700321009b33a9ebd1866d6db419edabe2de9ee74c884dc86b4214f60e3a26f04cbd9cfc")
+
+(def default-trusted-deploy-authorities
+  "Fail-closed default set of pinned Ed25519 deploy authority public keys (HEX)."
+  #{infra-cold-root-pubkey devnet-deploy-authority-pubkey})
+
 (def legacy-unbound-offer-hash-sunset
   "Sunset ISO timestamp after which unbound offer hashes (|net:<uri> missing) are strictly rejected."
   "2026-12-31")

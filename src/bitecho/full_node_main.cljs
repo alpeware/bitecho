@@ -12,6 +12,7 @@
    - Single-authority generation-tagged lifecycle state (`bitecho.core.infra/transition-shell`, Rules 4 & 5)."
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.config :as config]
+            [bitecho.config.flags :as flags]
             [bitecho.core.data :as data]
             [bitecho.core.infra :as core-infra]
             [bitecho.core.mesh :as core-mesh]
@@ -1104,6 +1105,16 @@
                    :active_drain_timers (long (:active-timers pt-reg 0))
                    :tcp_socket_wraps (count-tcp-socket-wraps)
                    :open_fds (count-proc-self-fds)}
+     :security_flags (flags/security-flags->wire
+                      (flags/build-security-flags-echo
+                       {:subnet-id (or (:subnet-id rt) (:subnet-id sub) "devnet.bitecho.org")
+                        :subnet-id-overridden? false
+                        :trusted-dac-anchors (:trusted-dac-anchors rt)
+                        :trusted-dac-anchors-provenance (if (seq (:trusted-dac-anchors rt)) :config :default)
+                        :trusted-deploy-authorities (:trusted-deploy-authorities rt)
+                        :pin-version (:pin-version rt)
+                        :auto-update-pointer (:auto-update-pointer rt)
+                        :keystore-security-tier :legacy-file-0600}))
      :diagnostics {:runtime (core-infra/shell-status-summary @(:shell-atom rt))
                    :http (when http-shell-atom (core-infra/shell-status-summary @http-shell-atom))
                    :dns (when dns-shell-atom (core-infra/shell-status-summary @dns-shell-atom))
@@ -3711,7 +3722,7 @@
           bundle-path (when (exists? js/__filename) js/__filename)
           poll-ms (max 5000 (long (or (:auto-update-interval-ms config) 60000)))
           trusted-auths (or (not-empty (:trusted-deploy-authorities config))
-                            #{config/infra-cold-root-pubkey})
+                            config/default-trusted-deploy-authorities)
           updater-atom (atom (deploy/init-light-updater-state
                               {:node-id nid
                                :artifact-role :full-node

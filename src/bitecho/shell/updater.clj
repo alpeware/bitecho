@@ -79,7 +79,7 @@
                      (.build))
           eff-trusted (if (some? trusted-deploy-authorities)
                         (set trusted-deploy-authorities)
-                        #{config/infra-cold-root-pubkey})
+                        config/default-trusted-deploy-authorities)
           updater-atom (atom (deploy/init-light-updater-state
                               (cond-> {:node-id (or node-id "jvm-node")
                                        :artifact-role :jvm-jar

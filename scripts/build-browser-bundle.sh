@@ -1331,9 +1331,17 @@ async function test() {
   if (!ctlRes || (!ctlRes.ok && !ctlRes.pubkey)) throw new Error('ctl status failed: ' + JSON.stringify(ctlRes));
   console.log('ctl status verified, pubkey:', ctlRes.pubkey ? ctlRes.pubkey.slice(0, 24) + '...' : ctlRes);
 
-  const putRes = await B.execCommand('storage-put --subnet nexus --slot note --data minified-payload --seq 1');
-  if (!putRes || !putRes.ok) throw new Error('execCommand storage-put failed: ' + JSON.stringify(putRes));
-  console.log('execCommand storage-put verified (pure browser Ed25519 sign + verify)');
+  const failClosedPut = await B.execCommand('storage-put --subnet nexus --slot note --data minified-payload --seq 1');
+  if (!failClosedPut || failClosedPut.ok !== false || failClosedPut.error !== 'storage-publish-failed' || failClosedPut.category !== 'storage') {
+    throw new Error('BIP-022 Row 7 fail-closed storage-put check failed: ' + JSON.stringify(failClosedPut));
+  }
+  console.log('execCommand storage-put fail-closed verified (storage-publish-failed)');
+
+  const putRes = await B.execCommand('storage-put --subnet nexus --slot note --data minified-payload --seq 1 --local-only');
+  if (!putRes || !putRes.ok || putRes.local_only !== true || putRes.replicated !== false) {
+    throw new Error('execCommand storage-put --local-only failed: ' + JSON.stringify(putRes));
+  }
+  console.log('execCommand storage-put --local-only verified (pure browser Ed25519 sign + verify)');
 
   const getRes = await B.ctl('storage-get --subnet nexus --slot note --min-seq 1');
   if (!getRes || !getRes.ok || getRes.data !== 'minified-payload') {

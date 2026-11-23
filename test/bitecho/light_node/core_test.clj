@@ -3671,7 +3671,7 @@
           priv (:privkey-bytes alice)
           data {:theme "dark" :petnames {"bob" "1234"}}
           ;; 1. storage-put
-          put-res (light-core/handle-command st0 {"cmd" "storage-put" "slot" "prefs" "data" data} priv)
+          put-res (light-core/handle-command st0 {"cmd" "storage-put" "slot" "prefs" "data" data "local_only" true} priv)
           st1 (:state put-res)
           resp-put (:response put-res)]
       (is (true? (get resp-put "ok")))
@@ -3687,7 +3687,7 @@
         (is (= 1 (get resp-get "seq"))))
 
       ;; 3. update storage-put with seq 2
-      (let [put-res2 (light-core/handle-command st1 {"cmd" "storage-put" "slot" "prefs" "data" (assoc data :theme "light")} priv)
+      (let [put-res2 (light-core/handle-command st1 {"cmd" "storage-put" "slot" "prefs" "data" (assoc data :theme "light") "local_only" true} priv)
             st2 (:state put-res2)
             get-res2 (light-core/handle-command st2 {"cmd" "storage-get" "slot" "prefs"} priv)]
         (is (true? (get (:response put-res2) "ok")))
@@ -3800,7 +3800,7 @@
         st0 (light-core/init-light-state (:identity alice) {})
         priv-a (:privkey-bytes alice)
         priv-b (:privkey-bytes bob)
-        put-res (light-core/handle-command st0 {"cmd" "storage-put" "slot" "cfg" "data" "val1"} priv-a)
+        put-res (light-core/handle-command st0 {"cmd" "storage-put" "slot" "cfg" "data" "val1" "local_only" true} priv-a)
         rep-env (first (:net-envelopes put-res))
         st1 (:state put-res)]
     (is (true? (get-in put-res [:response "ok"])))
@@ -3893,7 +3893,7 @@
   (let [alice (test-identity)
         st0 (light-core/init-light-state (:identity alice) {})
         priv (:privkey-bytes alice)
-        st1 (:state (light-core/handle-command st0 {"cmd" "storage-put" "slot" "s1" "data" {:a 1}} priv))
+        st1 (:state (light-core/handle-command st0 {"cmd" "storage-put" "slot" "s1" "data" {:a 1} "local_only" true} priv))
         st2 (:state (light-core/handle-command st1 {"cmd" "capability-publish"
                                                     "capability_id" "c1"
                                                     "capability_type" "storage/blob-pinning"
@@ -3968,7 +3968,8 @@
       ;; storage-put with slot-id
       (let [put-res (light-core/handle-command st0 {"cmd" "storage-put"
                                                     "slot_id" "config"
-                                                    "data" {:v 42}}
+                                                    "data" {:v 42}
+                                                    "local_only" true}
                                                priv-a)
             put-resp (:response put-res)
             st1 (:state put-res)]
@@ -4066,7 +4067,7 @@
                                                          "burn" 5000}
                                                   priv-a)]
           (is (false? (get-in fail-res [:response "ok"])))
-          (is (= "insufficient-funds" (get-in fail-res [:response "error"]))))
+          (is (= "insufficient-balance" (get-in fail-res [:response "error"]))))
 
         ;; Bob (subscribed to "homebrew-cafe") receives Alice's homebrew-cafe broadcast and drains via inbox with --subnet-id filtering
         (let [rx-res (light-core/handle-wire-payload (assoc st-b0 :subscribed-subnets #{"homebrew-cafe"}) env priv-b)
@@ -4095,7 +4096,8 @@
                                                       "slot_id" "notes"
                                                       "subnet_id" "homebrew-cafe"
                                                       "data" "my secret notes"
-                                                      "burn" 100}
+                                                      "burn" 100
+                                                      "local_only" true}
                                                priv-a)
             st-a1 (:state put-res)
             put-env (first (:net-envelopes put-res))]
