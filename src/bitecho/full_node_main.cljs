@@ -1785,9 +1785,13 @@
                                                 fresh-m (filterv #(and (> (long (:relay-seq %)) eff-since-seq)
                                                                        (>= (long (:received-at % 0)) cutoff))
                                                                  (get-in st [:inboxes norm-pk] []))
-                                                all-b (filterv #(and (> (long (:broadcast-seq %)) eff-since-bseq)
-                                                                     (>= (long (:received-at % 0)) cutoff))
-                                                               (get st :broadcasts []))
+                                                retained-b (filterv #(>= (long (:received-at % 0)) cutoff)
+                                                                    (get st :broadcasts []))
+                                                min-avail-bseq (if (seq retained-b)
+                                                                 (long (apply min (map :broadcast-seq retained-b)))
+                                                                 (if (pos? max-bcast-seq) (inc max-bcast-seq) 0))
+                                                all-b (filterv #(> (long (:broadcast-seq %)) eff-since-bseq)
+                                                               retained-b)
                                                 max-bseq (if (seq all-b)
                                                            (apply max (map :broadcast-seq all-b))
                                                            eff-since-bseq)
@@ -1801,9 +1805,11 @@
                                             (when-not (.-writableEnded res)
                                               (send-json! res 200 {"ok" true
                                                                    "pubkey" norm-pk
+                                                                   "relay_id" (str (or (:relay-id st) "relay-default"))
                                                                    "messages" fresh-m
                                                                    "broadcasts" fresh-b
-                                                                   "last_broadcast_seq" max-bseq})))))
+                                                                   "last_broadcast_seq" max-bseq
+                                                                   "min_available_broadcast_seq" min-avail-bseq})))))
                               wake-fn (let [self-ref (atom nil)]
                                         (letfn [(do-wake []
                                                   (let [f @self-ref]

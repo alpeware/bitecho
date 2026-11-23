@@ -1663,13 +1663,35 @@
                                 fresh-msgs (filterv (fn [e] (and (> (long (:relay-seq e)) eff-since-seq)
                                                                  (>= (long (:received-at e 0)) cutoff-ms)))
                                                     (get-in st [:inboxes norm-pk] []))
-                                fresh-bcasts (filterv (fn [e] (and (> (long (:broadcast-seq e)) eff-since-bseq)
-                                                                   (>= (long (:received-at e 0)) cutoff-ms)))
-                                                      (get st :broadcasts []))
+                                sub-filter-set (when (and subnets (seq (cond (coll? subnets) subnets
+                                                                             (string? subnets) (str/split subnets #",")
+                                                                             :else [])))
+                                                 (set (map (comp str/trim str)
+                                                           (if (coll? subnets) subnets (str/split subnets #",")))))
+                                retained-bcasts (filterv (fn [e] (>= (long (:received-at e 0)) cutoff-ms))
+                                                         (get st :broadcasts []))
+                                min-avail-bseq (if (seq retained-bcasts)
+                                                 (long (apply min (map :broadcast-seq retained-bcasts)))
+                                                 (if (pos? max-bcast-seq) (inc max-bcast-seq) 0))
+                                all-fresh-bcasts (filterv (fn [e] (> (long (:broadcast-seq e)) eff-since-bseq))
+                                                          retained-bcasts)
+                                last-bseq (if (seq all-fresh-bcasts)
+                                            (apply max (map :broadcast-seq all-fresh-bcasts))
+                                            eff-since-bseq)
+                                fresh-bcasts (if sub-filter-set
+                                               (filterv (fn [e]
+                                                          (let [esub (str (or (:subnet-id e) (:subnet_id e) (get e "subnet_id") "global"))]
+                                                            (or (contains? sub-filter-set esub)
+                                                                (contains? sub-filter-set "*"))))
+                                                        all-fresh-bcasts)
+                                               all-fresh-bcasts)
                                 resp {"ok" true
                                       "pubkey" norm-pk
+                                      "relay_id" (str (or (:relay-id st) "relay-default"))
                                       "messages" fresh-msgs
-                                      "broadcasts" fresh-bcasts}]
+                                      "broadcasts" fresh-bcasts
+                                      "last_broadcast_seq" last-bseq
+                                      "min_available_broadcast_seq" min-avail-bseq}]
                             (send-response exchange
                                            {:response/status 200
                                             :response/headers {"Content-Type" "application/json; charset=utf-8"}

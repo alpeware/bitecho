@@ -503,7 +503,22 @@
             "network-uri" "network-replay-rejected"
             "subscribed-subnets" "offer-nonce"
             "raw-public-hex" "stale-browser-bundle"
-            "petname-meta" "voice-id" "color" "event-listener-errors"}
+            "petname-meta" "voice-id" "color" "event-listener-errors"
+            ;; BIP-020 Pillar 1-3 bounded delivery telemetry
+            "delivery-telemetry" "ring-buffer" "ring-buffer-count" "ring-buffer-max"
+            "sent" "acked" "unacked-aged" "unacked-age-threshold-ms"
+            "evicted-by-reason" "retries-exhausted" "epoch-skew" "session-not-open"
+            "mesh-disconnected" "capacity-overflow" "expired"
+            "received-but-not-emitted" "cursor-skip" "subnet-mismatch" "session-mismatch"
+            "event-type-mismatch" "min-seq-filter" "min-broadcast-seq-filter" "after-ts-filter"
+            "duplicate-replay" "queue-overflow" "foreign-unicast" "watcher-closed" "admission-drop"
+            "fanout" "mesh-submitted" "p2p-direct" "peers-targeted" "mesh-peers-targeted"
+            "p2p-peers-targeted" "mesh-submit-failed" "route"
+            "broadcast-seen-order" "relay-cursors" "event-history"
+            "broadcast-gap-detected" "foreign-unicast-dropped" "events-out-mismatch"
+            ;; BIP-018 blob-store persistence keys
+            "blob-hot-evicted" "max-pinned-app-bytes" "max-hot-blob-bytes"
+            "pinned-app-bytes" "pinned-app-cap-exceeded" "blob-stored-cold"}
           test-map (into {}
                          (concat (map (fn [k] [k "SENSITIVE"]) all-forbidden-keys)
                                  (map (fn [k] [k "UNLISTED"]) unlisted-keys)
@@ -671,8 +686,8 @@
                                     (collect-keys populated-light)
                                     (collect-keys base-anchor)
                                     (collect-keys base-conn)))))
-        ;; All 46 top-level init-light-state keys and all non-secret init-anchor-state / initial-conn-state keys survive intact
-        (is (= 46 (count (keys base-light))))
+        ;; All 50 top-level init-light-state keys and all non-secret init-anchor-state / initial-conn-state keys survive intact
+        (is (= 50 (count (keys base-light))))
         (is (= (set (keys base-light)) (set (keys sanitized-light))))
         (is (= (set (keys base-light)) (set (keys @loaded-light))))
         (is (= (disj (set (keys base-anchor)) :privkey-bytes)
@@ -840,16 +855,21 @@
          (is (empty? (:sessions @node-atom)))
          (is (empty? (:outbox @node-atom)))
          (let [r-acc (js->clj (browser-main/accept-offer nil valid-offer) :keywordize-keys true)
+               ;; BIP-020 dead-mesh honesty: sending with 0 open channels fails loudly
+               r-send-dead (js->clj (browser-main/send-sealed-message nil caller-pub-hex "dead-mesh") :keywordize-keys true)
+               _ (swap! node-atom assoc-in [:active-channels "node1"] #js {:readyState "open" :send (fn [_] nil)})
                r-send-ok-1 (js->clj (browser-main/send-sealed-message nil caller-pub-hex "hello-r5") :keywordize-keys true)
                r-send-ok-2 (js->clj (browser-main/send-sealed-message caller-pub-hex "") :keywordize-keys true)]
            (is (true? (:ok r-acc)))
            (is (true? (:accepted r-acc)))
+           (is (false? (:ok r-send-dead)))
+           (is (false? (:sent r-send-dead)))
            (is (true? (:ok r-send-ok-1)))
            (is (true? (:sent r-send-ok-1)))
-           (is (= 1 (:seq r-send-ok-1)))
+           (is (= 2 (:seq r-send-ok-1)))
            (is (true? (:ok r-send-ok-2)))
            (is (true? (:sent r-send-ok-2)))
-           (is (= 2 (:seq r-send-ok-2))))))))
+           (is (= 3 (:seq r-send-ok-2))))))))
 
 #?(:cljs
    (deftest browser-refresh-identity-continuity-and-no-private-key-persistence-test

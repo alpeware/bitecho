@@ -2429,36 +2429,13 @@
 
 (def waitable-event-types
   "Set of incoming asynchronous event types eligible to wake `wait-event`."
-  #{"message-received" "offer-received" "channel-opened" "session-established"
-    "rendezvous-header-received" "rendezvous-reveal-received"
-    "p2p-offer-received" "p2p-connected" "broadcast-received"})
+  light-core/waitable-event-types)
 
 (defn event-matches-wait-filter?
-  "Pure predicate checking whether an emitted JSON event map satisfies a `wait-event` filter."
+  "Delegates to unified pure `.cljc` core `light-core/event-matches-wait-filter?`
+   (supporting `broadcast_seq` and `config/equivalent-subnet-id?`)."
   [evt opts]
-  (if-not (map? evt)
-    false
-    (let [ev-type (or (get evt "event") (some-> (:event evt) name))
-          waitable? (contains? waitable-event-types ev-type)
-          target-sid (:session-id opts)
-          ev-sid (or (get evt "session_id") (get evt "session-id") (:session-id evt) (:session_id evt))
-          target-subnet (or (:subnet-id opts) (:subnet opts))
-          ev-subnet (or (get evt "subnet_id") (get evt "subnet-id") (:subnet-id evt) (:subnet_id evt))
-          min-seq (:min-seq opts)
-          raw-seq (or (get evt "seq") (:seq evt))
-          ev-seq (when (some? raw-seq) (parse-long-safe raw-seq nil))
-          min-bseq (:min-broadcast-seq opts)
-          raw-bseq (or (get evt "broadcast_seq") (get evt "broadcast-seq") (:broadcast-seq evt) (:broadcast_seq evt))
-          ev-bseq (when (some? raw-bseq) (parse-long-safe raw-bseq nil))
-          after-ts (:after-ts opts)
-          raw-ts (or (get evt "timestamp_ms") (:timestamp-ms evt) (:timestamp_ms evt))
-          ev-ts (if (some? raw-ts) (parse-long-safe raw-ts 0) 0)
-          sid-ok? (or (nil? target-sid) (= (str ev-sid) (str target-sid)))
-          subnet-ok? (or (nil? target-subnet) (= (str ev-subnet) (str target-subnet)))
-          seq-ok? (or (nil? min-seq) (and (some? ev-seq) (>= (or ev-seq 0) (or min-seq 0))))
-          bseq-ok? (or (nil? min-bseq) (and (some? ev-bseq) (>= (or ev-bseq 0) (or min-bseq 0))))
-          ts-ok? (or (nil? after-ts) (> (or ev-ts 0) (or after-ts 0)))]
-      (boolean (and waitable? sid-ok? subnet-ok? seq-ok? bseq-ok? ts-ok?)))))
+  (light-core/event-matches-wait-filter? evt opts))
 
 (defn- raw-byte-array?
   [v]
@@ -2523,15 +2500,31 @@
                      (assoc safe-data "timestamp_ms" (js/Date.now)))]
       (.appendFileSync node-fs p (str (write-json-str enriched) "\n") "utf8"))))
 
+(defonce ^:private events-out-error-count-atom (atom 0))
+
 (defn emit-json-line!
   "Writes `data` as a JSON line to `process.stdout` and optionally mirrors to `events-out-path`.
-   Sanitizes raw byte arrays so `artifact-replicated` / `put` logs never dump raw Uint8Arrays."
-  ([data] (emit-json-line! data nil))
-  ([data events-out-path]
+   Sanitizes raw byte arrays so `artifact-replicated` / `put` logs never dump raw Uint8Arrays.
+   Never swallows `append-event-jsonl!` I/O errors silently (Rule 5 / BIP-020 Catch 4)."
+  ([data] (emit-json-line! data nil nil))
+  ([data events-out-path] (emit-json-line! data events-out-path nil))
+  ([data events-out-path state-atom]
    (let [safe-data (sanitize-stdout-log-data data)]
      (.write (.-stdout js/process) (str (write-json-str safe-data) "\n"))
      (when events-out-path
-       (try (append-event-jsonl! events-out-path safe-data) (catch :default _ nil))))))
+       (try
+         (append-event-jsonl! events-out-path safe-data)
+         (catch :default err
+           (swap! events-out-error-count-atom inc)
+           (when state-atom
+             (swap! state-atom (fn [st]
+                                 (-> st
+                                     (update-in [:diagnostics :events-out-write-failed] (fnil inc 0))
+                                     (update-in [:diagnostics :dropped] (fnil inc 0))))))
+           (try
+             (.write (.-stderr js/process)
+                     (str "WARN: append-event-jsonl! failed for " events-out-path ": " err "\n"))
+             (catch :default _ nil))))))))
 
 (defn read-new-cmd-file-lines!
   "Reads newly appended complete UTF-8 lines or balanced JSON objects from `cmd-file-path` starting at byte `offset`."
@@ -2585,10 +2578,25 @@
                 (try (.closeSync node-fs fd) (catch :default _ nil))))))))))
 
 (defn run-wait-event!
-  "Polls `--events-out` (or `<state-dir>/events.jsonl`) until a matching incoming event arrives."
+  "Polls `--events-out` (or `<state-dir>/events.jsonl`) until a matching incoming event arrives.
+   Checks `<state-dir>/control.json` for `events_out` mismatch and emits a loud warning + diagnostic (BIP-020 Catch 4)."
   [opts]
   (let [state-dir (or (:state-dir opts) (.join node-path (.homedir node-os) ".bitecho" "light-node"))
         events-path (or (:events-out opts) (.join node-path state-dir "events.jsonl"))
+        ctrl-file (.join node-path state-dir "control.json")
+        _ (when (.existsSync node-fs ctrl-file)
+            (when-let [ctrl (try (parse-json-safe (.readFileSync node-fs ctrl-file "utf8")) (catch :default _ nil))]
+              (when (contains? ctrl "events_out")
+                (let [daemon-ev (get ctrl "events_out")
+                      canon-target (.resolve node-path (str events-path))
+                      canon-daemon (when (and (string? daemon-ev) (not (str/blank? daemon-ev)))
+                                     (.resolve node-path daemon-ev))]
+                  (when (not= canon-target canon-daemon)
+                    (try
+                      (.write (.-stderr js/process)
+                              (str "WARN: events-out-mismatch: wait-event targeting " canon-target
+                                   " but daemon control.json has events_out=" (pr-str canon-daemon) "\n"))
+                      (catch :default _ nil)))))))
         timeout-ms (max 1 (or (:timeout-ms opts) 300000))
         poll-ms (or (:poll-ms opts) 50)
         scan-from-start? (or (some? (:min-seq opts)) (some? (:min-broadcast-seq opts)) (some? (:after-ts opts)))
@@ -3398,7 +3406,13 @@
         execute-cmd!
         (fn [effective-line]
           (let [eff-domain-verb (effective-artifact-domain-verb verb cmd-map)
-                res (light-core/process-jsonl-line @state-atom effective-line (:privkey-bytes identity))
+                line-with-now (if (contains? #{"send" "broadcast"} verb)
+                                (let [m (parse-json-safe effective-line)]
+                                  (if (and (map? m) (not (contains? m "now_ms")))
+                                    (write-json-str (assoc m "now_ms" (.now js/Date)))
+                                    effective-line))
+                                effective-line)
+                res (light-core/process-jsonl-line @state-atom line-with-now (:privkey-bytes identity))
                 _ (maybe-write-artifact-out-file! eff-domain-verb cmd-map (:response res))
                 art-relay (when (contains? #{"artifact-put" "artifact-revoke"} eff-domain-verb)
                             (or (get cmd-map "relay_url")
@@ -3440,8 +3454,14 @@
                                                           (not= :http-relay (:transport @conn-atom)))
                                                  (doseq [env (remove :p2p-direct? envs)]
                                                    (try
-                                                     (submit-relay-envelope! relay-url env (fn [_] nil) {:timeout-ms 5000})
-                                                     (catch :default _ nil)))))]
+                                                     (submit-relay-envelope!
+                                                      relay-url env
+                                                      (fn [r]
+                                                        (when-not (and (map? r) (or (true? (get r "ok")) (true? (:ok r))))
+                                                          (swap! state-atom update-in [:diagnostics :relay-mirror-failed] (fnil inc 0))))
+                                                      {:timeout-ms 5000})
+                                                     (catch :default _
+                                                       (swap! state-atom update-in [:diagnostics :relay-mirror-failed] (fnil inc 0)))))))]
                         (if (some #(or (:p2p-direct? %) (:p2p-broadcast? %)) live-envs)
                           (do
                             (send-routed-envelopes! live-envs
@@ -3499,14 +3519,16 @@
                                                (swap! state-atom assoc :connected? false :connection-error err)
                                                (if (= verb "send")
                                                  (do
+                                                   (when-let [intent (:fanout-intent res)]
+                                                     (swap! state-atom #(:state (light-core/commit-delivery-outcome % intent {:mesh-submitted? false :p2p-direct? false :error err :now-ms (.now js/Date)}))))
                                                    (sync-conn-diagnostics! state-atom conn-atom)
                                                    (save-light-state! state-file @state-atom)
-                                                   (let [err-map (assoc (or (:response res) {"ok" true}) "ok" true "queued" true "transport_error" err)]
+                                                   (let [err-map (assoc (or (:response res) {"ok" false}) "ok" false "queued" true "mesh_submitted" false "transport_error" err "error" err)]
                                                      (emit! err-map)
                                                      (done-cb err-map)))
                                                  (do
                                                    (sync-conn-diagnostics! state-atom conn-atom)
-                                                   (let [resp {"ok" false "error" err}]
+                                                   (let [resp {"ok" false "mesh_submitted" false "error" err}]
                                                      (emit! resp)
                                                      (done-cb resp))))))))
                                        (let [err (or (:error reconn) "listener-disabled")]
@@ -3515,14 +3537,16 @@
                                          (swap! state-atom assoc :connected? false :connection-error err)
                                          (if (= verb "send")
                                            (do
+                                             (when-let [intent (:fanout-intent res)]
+                                               (swap! state-atom #(:state (light-core/commit-delivery-outcome % intent {:mesh-submitted? false :p2p-direct? false :error err :now-ms (.now js/Date)}))))
                                              (sync-conn-diagnostics! state-atom conn-atom)
                                              (save-light-state! state-file @state-atom)
-                                             (let [err-map (assoc (or (:response res) {"ok" true}) "ok" true "queued" true "transport_error" err)]
+                                             (let [err-map (assoc (or (:response res) {"ok" false}) "ok" false "queued" true "mesh_submitted" false "transport_error" err "error" err)]
                                                (emit! err-map)
                                                (done-cb err-map)))
                                            (do
                                              (sync-conn-diagnostics! state-atom conn-atom)
-                                             (let [resp {"ok" false "error" err}]
+                                             (let [resp {"ok" false "mesh_submitted" false "error" err}]
                                                (emit! resp)
                                                (done-cb resp))))))))))))))
                       (let [deferred-forward? (and import-shuttle-verb? (seq (:net-envelopes res)))
@@ -3589,16 +3613,29 @@
                       (long ms))
             cursor (when-let [c (or (get cmd-map "cursor") (:cursor cmd-map))]
                      (long c))
+            sub-filter (or (get cmd-map "subnet_id") (get cmd-map "subnet-id") (:subnet-id cmd-map) (:subnet cmd-map))
+            sid-filter (or (get cmd-map "session_id") (get cmd-map "session-id") (:session-id cmd-map))
+            min-bseq (when-let [mb (or (get cmd-map "min_broadcast_seq") (get cmd-map "min-broadcast-seq") (:min-broadcast-seq cmd-map))]
+                       (long mb))
+            after-ts (when-let [at (or (get cmd-map "after_ts") (get cmd-map "after-ts") (:after-ts cmd-map))]
+                       (long at))
             deadline (+ (.now js/Date) timeout-ms)
             check! (fn check! []
-                     (let [q (:event-queue @state-atom)
-                           has-event? (if (or min-seq cursor)
-                                        (boolean (some (fn [ev]
-                                                         (let [eid (long (or (get ev "event_id") (:event-id ev) (get ev "event_seq") (:event-seq ev) (get ev "eid") (:eid ev) 0))
-                                                               s   (long (or (get ev "seq") (:seq ev) 0))]
-                                                           (and (or (nil? min-seq) (>= eid min-seq) (>= s min-seq))
-                                                                (or (nil? cursor) (> eid cursor)))))
-                                                       q))
+                     (let [st @state-atom
+                           q (if (some? cursor)
+                               (let [h (:event-history st)] (if (seq h) h (:event-queue st)))
+                               (:event-queue st))
+                           has-filter? (or min-seq cursor sub-filter sid-filter min-bseq after-ts)
+                           filter-opts {:enforce-waitable-type? false
+                                        :cursor cursor
+                                        :session-id sid-filter
+                                        :subnet-id sub-filter
+                                        :min-seq min-seq
+                                        :min-broadcast-seq min-bseq
+                                        :after-ts after-ts
+                                        :allow-eid-fallback-for-min-seq? (nil? cursor)}
+                           has-event? (if has-filter?
+                                        (boolean (some #(light-core/event-matches-wait-filter? % filter-opts) q))
                                         (boolean (seq q)))]
                        (if (or has-event?
                                (>= (.now js/Date) deadline))
@@ -3608,9 +3645,14 @@
 
 (defn start-control-server!
   "Starts loopback-only (127.0.0.1) control HTTP server on control-port (default 5020 or ephemeral).
-   Writes <state-dir>/control.json with 0600 permissions."
+   Writes <state-dir>/control.json with 0600 permissions including canonical `events_out` (BIP-020 Catch 4)."
   [state-dir ctx conn-opts]
   (let [req-port (int (or (:control-port conn-opts) 5020))
+        raw-events-out (or (:events-out conn-opts) (:events-out ctx))
+        canon-events-out (when (and (string? raw-events-out) (not (str/blank? raw-events-out)))
+                           (.resolve node-path raw-events-out))
+        _ (when-let [st-atom (:state-atom ctx)]
+            (swap! st-atom assoc :events-out canon-events-out))
         token (.toString (.randomBytes node-crypto 32) "hex")
         pid (.-pid js/process)
         ctrl-file (.join node-path state-dir "control.json")
@@ -3663,7 +3705,8 @@
             (let [actual-port (.-port (.address server))
                   ctrl-info {"port" actual-port
                              "token" token
-                             "pid" (or pid 0)}
+                             "pid" (or pid 0)
+                             "events_out" canon-events-out}
                   json-str (write-json-str ctrl-info)]
               (try
                 (write-bytes-atomic! ctrl-file (js/Buffer.from json-str "utf8"))

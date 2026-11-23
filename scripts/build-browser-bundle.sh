@@ -1373,8 +1373,9 @@ async function test() {
     throw new Error('BitechoLightNode.listSubnets failed: ' + JSON.stringify(subList));
   }
   const bcastRes = await LN.sendBroadcast({ subnetId: 'global', text: 'Line 1\nLine 2 🌍' });
-  if (!bcastRes || !bcastRes.ok || bcastRes.subnetId !== 'global') {
-    throw new Error('BitechoLightNode.sendBroadcast failed: ' + JSON.stringify(bcastRes));
+  // BIP-020 dead-mesh honesty: with 0 open channels/relay, sendBroadcast must fail loudly (never ok:true)
+  if (!bcastRes || bcastRes.ok !== false || bcastRes.meshSubmitted !== false || bcastRes.subnetId !== 'global' || bcastRes.error !== 'no-open-mesh-channels') {
+    throw new Error('BitechoLightNode.sendBroadcast dead-mesh honesty check failed: ' + JSON.stringify(bcastRes));
   }
   const badArt = await LN.getArtifact({ cid: 'not-a-valid-cid' });
   if (!badArt || badArt.ok !== false || badArt.error !== 'invalid-cid') {

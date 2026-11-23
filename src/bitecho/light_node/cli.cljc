@@ -223,7 +223,7 @@
   ["--state-dir" "--control-port" "--bootstrap" "--relay-url" "--relay-urls" "--quorum" "--subnet-id" "--subnet"
    "--subscribe-subnets" "--subnets" "--transport" "--proxy" "--timeout-ms" "--max-epoch-skew"
    "--cmd-file" "--events-out" "--session-id" "--session" "--min-seq" "--min-broadcast-seq"
-   "--cursor" "--after-ts" "--min-balance"
+   "--cursor" "--after-ts" "--min-balance" "--non-destructive"
    "--ingress-tcp-port" "--trusted-dac-anchors" "--turn-server" "--turn-username"
    "--turn-password" "--turn-realm" "--turn-force-relay" "--sync-interval-ms" "--price"
    "--price-max" "--burn" "--to" "--from" "--callee" "--peer" "--receiver" "--recipient"
@@ -873,17 +873,24 @@
             cursor (extract-long-flag clean-tokens "--cursor" nil)
             sub (or (extract-flag-value clean-tokens "--subnet-id" nil)
                     (extract-flag-value clean-tokens "--subnet" nil))
+            sid (or (extract-flag-value clean-tokens "--session-id" nil)
+                    (extract-flag-value clean-tokens "--session" nil))
+            after-ts (extract-long-flag clean-tokens "--after-ts" nil)
             block? (or (has-flag? clean-tokens "--block")
                        (has-flag? clean-tokens "--until-event"))
             peek? (has-flag? clean-tokens "--peek")
+            non-destructive? (has-flag? clean-tokens "--non-destructive")
             m {"cmd" "wait" "timeout_ms" (or t 30000)}]
         (cond-> m
           ms (assoc "min_seq" ms)
           bcast-seq (assoc "min_broadcast_seq" bcast-seq)
           cursor (assoc "cursor" cursor)
           sub (assoc "subnet_id" sub)
+          sid (assoc "session_id" sid)
+          after-ts (assoc "after_ts" after-ts)
           block? (assoc "block" true)
-          peek? (assoc "peek" true)))
+          peek? (assoc "peek" true)
+          non-destructive? (assoc "non_destructive" true)))
 
       "retransmit-outbox"
       (let [sid (or (extract-flag-value clean-tokens "--session-id" nil)

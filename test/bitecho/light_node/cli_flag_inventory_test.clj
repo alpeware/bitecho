@@ -589,4 +589,21 @@
           (is (= 3 (get rb1 "seq")))
           (is (= "put" (get (cli/desugar-cli-cmd-map rb1) "canonical_cmd")))
           (is (= "web-release-verify" (get ver1 "cmd")))
-          (is (= "get" (get (cli/desugar-cli-cmd-map ver1) "canonical_cmd"))))))))
+          (is (= "get" (get (cli/desugar-cli-cmd-map ver1) "canonical_cmd")))))
+
+      (testing "BIP-020 wait cursor, subnet, min-broadcast-seq, and --non-destructive flags"
+        (let [flags (set cli/known-command-flags)
+              w (cli/build-cmd-map "wait"
+                                   ["--cursor" "12" "--min-broadcast-seq" "5"
+                                    "--subnet-id" "bitecho.org/dev"
+                                    "--session-id" "sess-1"
+                                    "--after-ts" "1795000000000"
+                                    "--non-destructive"])]
+          (is (contains? flags "--non-destructive"))
+          (is (= "wait" (get w "cmd")))
+          (is (= 12 (get w "cursor")))
+          (is (= 5 (get w "min_broadcast_seq")))
+          (is (= "bitecho.org/dev" (get w "subnet_id")))
+          (is (= "sess-1" (get w "session_id")))
+          (is (= 1795000000000 (get w "after_ts")))
+          (is (true? (get w "non_destructive"))))))))

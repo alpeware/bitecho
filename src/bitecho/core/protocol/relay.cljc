@@ -118,7 +118,8 @@
   "Initializes pure relay state with configurable limits and default empty collections."
   ([] (init-relay-state {}))
   ([opts]
-   {:max-inbox-size (long (or (:max-inbox-size opts) 256))
+   {:relay-id (str (or (:relay-id opts) "relay-default"))
+    :max-inbox-size (long (or (:max-inbox-size opts) 256))
     :max-broadcast-size (long (or (:max-broadcast-size opts) 256))
     :max-payload-bytes (long (or (:max-payload-bytes opts) 65536))
     :max-total-queued-bytes (long (or (:max-total-queued-bytes opts) (:max-queued-bytes opts) 16777216))
@@ -620,13 +621,19 @@
                                               (filterv (fn [e] (>= (long (:received-at e 0)) cutoff-ms))
                                                        (or (:broadcasts capped-st) []))
                                               (or (:broadcasts capped-st) []))
-                            sub-id (str (or (:subnet-id decoded)
-                                            (get decoded "subnet_id")
-                                            (get decoded "subnet-id")
-                                            (get-in decoded [:event :subnet-id])
-                                            (get-in decoded [:event "subnet_id"])
-                                            (get-in decoded [:event :message :subnet-id])
-                                            (get-in decoded [:event "message" "subnet_id"])
+                            inner-sub (when (map? inner-msg)
+                                        (or (:subnet-id inner-msg)
+                                            (get inner-msg "subnet_id")
+                                            (get inner-msg "subnet-id")))
+                            outer-sub (or (:subnet-id decoded)
+                                          (get decoded "subnet_id")
+                                          (get decoded "subnet-id")
+                                          (get-in decoded [:event :subnet-id])
+                                          (get-in decoded [:event "subnet_id"])
+                                          (get-in decoded [:event :message :subnet-id])
+                                          (get-in decoded [:event "message" "subnet_id"]))
+                            sub-id (str (or (when (and inner-sub (not= (str inner-sub) "*")) inner-sub)
+                                            outer-sub
                                             "global"))
                             b-entry {:broadcast-seq next-bseq
                                      :broadcast_seq next-bseq
@@ -770,9 +777,13 @@
                                                               :else [])))
                                  (set (map (comp str/trim str)
                                            (if (coll? raw-subs) raw-subs (str/split raw-subs #",")))))
-                all-bcasts (filterv (fn [e] (and (> (long (:broadcast-seq e)) since-bseq)
-                                                 (or (<= now-ms 0) (>= (long (:received-at e 0)) cutoff-ms))))
-                                    (get state :broadcasts []))
+                retained-bcasts (filterv (fn [e] (or (<= now-ms 0) (>= (long (:received-at e 0)) cutoff-ms)))
+                                         (get state :broadcasts []))
+                min-avail-bseq (if (seq retained-bcasts)
+                                 (long (apply min (map :broadcast-seq retained-bcasts)))
+                                 (if (pos? max-bcast-seq) (inc max-bcast-seq) 0))
+                all-bcasts (filterv (fn [e] (> (long (:broadcast-seq e)) since-bseq))
+                                    retained-bcasts)
                 max-bseq (if (seq all-bcasts)
                            (apply max (map :broadcast-seq all-bcasts))
                            since-bseq)
@@ -800,9 +811,11 @@
              :ok? true
              :response {"ok" true
                         "pubkey" norm-pk
+                        "relay_id" (str (or (:relay-id state) "relay-default"))
                         "messages" inbox
                         "broadcasts" filtered-bcasts
-                        "last_broadcast_seq" max-bseq}
+                        "last_broadcast_seq" max-bseq
+                        "min_available_broadcast_seq" min-avail-bseq}
              :effects effs})))
 
       :relay-ack

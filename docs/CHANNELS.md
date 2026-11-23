@@ -50,3 +50,11 @@ To prevent missed broadcasts (as observed on 2026-11-20), `chat/simon-nexus-axio
    - `watcher` (Bridge / Watcher hooks)
 3. **Dual-Post Soak Window:** Complete a dual-post soak window posting circle broadcasts to both `bitecho.org/team` and `chat/simon-nexus-axiom` with `> 0` verified deliveries and `0` missed deliveries across all participants.
 4. **Final Closing Pin:** Post a final closing pin on `chat/simon-nexus-axiom` redirecting all traffic to `bitecho.org/team` before removing `chat/simon-nexus-axiom` from default `--subscribe-subnets`.
+
+---
+
+## 4. Dual-Fanout Broadcast Reliability & Catchup Cursor Continuity (`BIP-020`)
+
+- **Unconditional Dual-Fanout (N-1 Wire Compatible):** Broadcasts fan out unconditionally to both open P2P channels and validator mesh/relay using byte-identical signed envelopes (route metadata stays strictly local in `delivery_telemetry` and never enters signed wire bytes).
+- **Inner Subnet Filtering on `burn > 0`:** `/relay/v1/poll` filters broadcasts against the inner signed `:subnet-id` even when `burn > 0` wraps the outer gossip envelope as `"*"`.
+- **Catchup Gap & Cursor Honesty:** `/relay/v1/poll` returns `min_available_broadcast_seq` and `relay_id` (including parked wakeups); waking peers emit counted `:broadcast-gap-detected` diagnostics if their cursor fell behind evicted slots. `broadcast-received` events emit `broadcast_seq`, and `ctl wait --cursor <id> --non-destructive --subnet-id <sub` reads non-destructively across concurrent/restarting watchers using `config/equivalent-subnet-id?`.

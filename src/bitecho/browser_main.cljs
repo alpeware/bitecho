@@ -781,12 +781,23 @@
            light-st (:light-state node)
            channels (:active-channels node)
            open-channels (into [] (keep (fn [[k dc]]
-                                          (when (and dc (= (.-readyState dc) "open"))
-                                            (if (or (keyword? k) (symbol? k)) (name k) (str k))))
+                                          (let [pid (if (or (keyword? k) (symbol? k)) (name k) (str k))
+                                                peer-phase (get-in mesh-conns [:peers pid :phase])]
+                                            (when (and dc
+                                                       (= (.-readyState dc) "open")
+                                                       (or (nil? peer-phase) (= :open peer-phase)))
+                                              pid)))
                                         channels))
-           connected-nodes (if (seq open-channels)
-                             open-channels
-                             (or (:open-peers mesh-summary) []))
+           connected-nodes (if has-mesh-peers?
+                             (if (seq open-channels)
+                               (filterv (set (or (:open-peers mesh-summary) [])) open-channels)
+                               (or (:open-peers mesh-summary) []))
+                             open-channels)
+           relay-fallback-active? (and (empty? connected-nodes)
+                                       (boolean (or (:relay-url node) (:relay-fallback-active? node))))
+           core-diags (or (:diagnostics light-st) {})
+           dt (merge light-core/initial-delivery-telemetry (or (:delivery-telemetry light-st) {}))
+           unacked-aged (light-core/compute-unacked-aged-count light-st (.now js/Date))
            closed-nodes (or (:closed-peers mesh-summary) [])
            dialing-nodes (or (:dialing-peers mesh-summary) [])
            degraded? (boolean (:degraded? mesh-summary))
@@ -834,37 +845,47 @@
                  :visibilityState (or (:visibility-state mesh-summary) (:visibility-state conn) "visible")
                  :burnedEch (or (:burned-ech node) 0)
                  :meshConnected (boolean (seq connected-nodes))
+                 :relayFallbackActive relay-fallback-active?
                  :connectedNodes connected-nodes
                  :closedNodes closed-nodes
                  :dialingNodes dialing-nodes
                  :degraded degraded?
+                 :deliveryTelemetry {:sent (long (or (:sent dt) 0))
+                                     :acked (long (or (:acked dt) 0))
+                                     :unackedAged unacked-aged
+                                     :evictedByReason (:evicted-by-reason dt)
+                                     :receivedButNotEmitted (:received-but-not-emitted dt)
+                                     :fanout (:fanout dt)
+                                     :ringBufferCount (count (or (:ring-buffer dt) []))}
                  :sessions (redact-for-js (or (:sessions light-st) {}))
                  :pendingOffers (redact-for-js (or (:pending-offers light-st) {}))
                  :broadcastInbox (redact-for-js (or (:broadcast-inbox light-st) []))
                  :chatHistory (or (:chat-history node) [])
                  :petnames (or (:petnames node) default-petnames)
-                 :diagnostics {:phase diag-phase-str
-                               :generation eff-gen
-                               :lastError eff-last-err
-                               :dropped eff-dropped
-                               :ignoredStale eff-stale
-                               :unsupportedFormatDropped eff-unsup
-                               :backgroundThrottledEvents eff-bg
-                               :iceDisconnects eff-ice-disc
-                               :iceReconnects eff-ice-reconn
-                               :closeCount eff-close-cnt
-                               :dialFailures eff-dial-fail
-                               :eventListenerErrors (long (or (:event-listener-errors diag) 0))
-                               :cidMismatch (long (or (:cid-mismatch diag) 0))
-                               :lastIceState eff-last-ice
-                               :lastConnectionState eff-last-cs
-                               :totalPeers (long (or (:total-peers mesh-summary) 0))
-                               :openPeers connected-nodes
-                               :dialingPeers dialing-nodes
-                               :closedPeers closed-nodes
-                               :degraded degraded?
-                               :peers eff-peers
-                               :recentEvents eff-recent}})))))
+                 :diagnostics (merge
+                               core-diags
+                               {:phase diag-phase-str
+                                :generation eff-gen
+                                :lastError eff-last-err
+                                :dropped (+ (long (or eff-dropped 0)) (long (or (:dropped core-diags) 0)))
+                                :ignoredStale eff-stale
+                                :unsupportedFormatDropped eff-unsup
+                                :backgroundThrottledEvents eff-bg
+                                :iceDisconnects eff-ice-disc
+                                :iceReconnects eff-ice-reconn
+                                :closeCount eff-close-cnt
+                                :dialFailures eff-dial-fail
+                                :eventListenerErrors (long (or (:event-listener-errors diag) 0))
+                                :cidMismatch (long (or (:cid-mismatch diag) 0))
+                                :lastIceState eff-last-ice
+                                :lastConnectionState eff-last-cs
+                                :totalPeers (long (or (:total-peers mesh-summary) 0))
+                                :openPeers connected-nodes
+                                :dialingPeers dialing-nodes
+                                :closedPeers closed-nodes
+                                :degraded degraded?
+                                :peers eff-peers
+                                :recentEvents eff-recent})})))))
 
 (defn build-p2p-link-bind-envelope
   "Builds and signs a :p2p-link-bind envelope proving peer pubkey and session identity."
@@ -938,26 +959,46 @@
         effs))))
 
 (defn- send-to-all-channels!
+  "Sends wire envelope to all healthy open validator DataChannels or falls back to HTTPS relay.
+   Returns `{:mesh-submitted? bool :mesh-peers-targeted int :error str-or-nil}` (BIP-020 Catch 1/2)."
   [node-atom env]
-  (let [channels (:active-channels @node-atom)
+  (let [node @node-atom
+        channels (:active-channels node)
+        mesh-peers (get-in node [:mesh-conns :peers] {})
         wire-bytes (fressian/encode-wire env)
-        open-dcs (filter (fn [[_id dc]] (and dc (= (.-readyState dc) "open"))) channels)]
+        open-dcs (filter (fn [[nid dc]]
+                           (let [pid (if (or (keyword? nid) (symbol? nid)) (name nid) (str nid))
+                                 p-phase (get-in mesh-peers [pid :phase])]
+                             (and dc
+                                  (= (.-readyState dc) "open")
+                                  (or (nil? p-phase) (= :open p-phase)))))
+                         channels)]
     (if (seq open-dcs)
-      (doseq [[nid dc] open-dcs]
-        (try
-          (.send dc wire-bytes)
-          (catch :default err
-            (let [cur-gen (long (or (get-in @node-atom [:mesh-conns :peers nid :generation]) 0))]
-              (dispatch-mesh-peer-event!
-               node-atom
-               nid
-               {:type :dial-failed
-                :generation cur-gen
-                :error (str "send-failed:" err)
-                :timestamp-ms (.now js/Date)}
-               nil)))))
-      (if-let [relay-url (:relay-url @node-atom)]
-        (submit-relay-envelope! relay-url env nil)
+      (let [sent-cnt (reduce
+                      (fn [acc [nid dc]]
+                        (try
+                          (.send dc wire-bytes)
+                          (inc acc)
+                          (catch :default err
+                            (let [cur-gen (long (or (get-in @node-atom [:mesh-conns :peers nid :generation]) 0))]
+                              (dispatch-mesh-peer-event!
+                               node-atom
+                               nid
+                               {:type :dial-failed
+                                :generation cur-gen
+                                :error (str "send-failed:" err)
+                                :timestamp-ms (.now js/Date)}
+                               nil))
+                            acc)))
+                      0
+                      open-dcs)]
+        (if (pos? sent-cnt)
+          {:mesh-submitted? true :mesh-peers-targeted sent-cnt :error nil}
+          {:mesh-submitted? false :mesh-peers-targeted 0 :error "all-mesh-channel-sends-failed"}))
+      (if-let [relay-url (:relay-url node)]
+        (do
+          (submit-relay-envelope! relay-url env nil)
+          {:mesh-submitted? true :mesh-peers-targeted 1 :error nil})
         ;; Rule 5: Never drop outbound envelopes silently when no channels or relay are open
         (let [target-pid (if (contains? (get-in @node-atom [:mesh-conns :peers]) "node1") "node1" "mesh")
               cur-gen (long (or (get-in @node-atom [:mesh-conns :peers target-pid :generation]) 0))]
@@ -968,10 +1009,13 @@
             :generation cur-gen
             :envelope env
             :timestamp-ms (.now js/Date)}
-           nil))))))
+           nil)
+          {:mesh-submitted? false :mesh-peers-targeted 0 :error "no-open-mesh-channels"})))))
 
 (defn route-browser-envelope!
-  "Routes an outgoing envelope directly to open P2P channel(s) or falls back to validator mesh."
+  "Routes an outgoing envelope with unconditional dual-fanout for broadcasts (BIP-020 Catch 2)
+   and zero silent `.send` catch blocks (Rule 5).
+   Returns `{:mesh-submitted? :p2p-direct? :mesh-peers-targeted :p2p-peers-targeted :error}`."
   [node-atom env]
   (cond
     (:p2p-broadcast? env)
@@ -979,27 +1023,61 @@
           open-chans (into [] (keep (fn [entry]
                                       (let [dc (:channel entry)]
                                         (when (and dc (= (.-readyState dc) "open")) dc)))
-                                    p2p-chans))]
-      (if (seq open-chans)
-        (let [wire-bytes (fressian/encode-wire env)]
-          (doseq [dc open-chans]
-            (try (.send dc wire-bytes) (catch :default _ nil))))
-        (send-to-all-channels! node-atom env)))
+                                    p2p-chans))
+          wire-bytes (fressian/encode-wire env)
+          p2p-sent (reduce
+                    (fn [acc dc]
+                      (try
+                        (.send dc wire-bytes)
+                        (inc acc)
+                        (catch :default err
+                          (swap! node-atom update-in [:light-state :diagnostics :p2p-send-failed] (fnil inc 0))
+                          (emit-browser-event! node-atom {:type "diagnose"
+                                                          :kind :p2p-send-failed
+                                                          :reason (str "p2p-broadcast-send-failed:" err)
+                                                          :timestamp-ms (.now js/Date)})
+                          acc)))
+                    0
+                    open-chans)
+          ;; BIP-020 Catch 2: ALWAYS fan out unconditionally to validator mesh/relay as well
+          mesh-res (send-to-all-channels! node-atom env)]
+      {:mesh-submitted? (boolean (:mesh-submitted? mesh-res))
+       :p2p-direct? (pos? p2p-sent)
+       :mesh-peers-targeted (long (or (:mesh-peers-targeted mesh-res) 0))
+       :p2p-peers-targeted p2p-sent
+       :error (when-not (or (:mesh-submitted? mesh-res) (pos? p2p-sent))
+                (or (:error mesh-res) "broadcast-fanout-failed"))})
 
     (:p2p-direct? env)
     (let [peer-pk (light-core/normalize-pubkey-hex (:p2p-peer env))
           entry (get-in @node-atom [:p2p-channels peer-pk])
           dc (:channel entry)]
       (if (and dc (= (.-readyState dc) "open"))
-        (let [wire-bytes (fressian/encode-wire env)]
-          (try (.send dc wire-bytes) (catch :default _ nil)))
+        (let [wire-bytes (fressian/encode-wire env)
+              p2p-ok? (try
+                        (.send dc wire-bytes)
+                        true
+                        (catch :default err
+                          (swap! node-atom update-in [:light-state :diagnostics :p2p-send-failed] (fnil inc 0))
+                          (emit-browser-event! node-atom {:type "diagnose"
+                                                          :kind :p2p-send-failed
+                                                          :peer-id peer-pk
+                                                          :reason (str "p2p-direct-send-failed:" err)
+                                                          :timestamp-ms (.now js/Date)})
+                          false))]
+          (if p2p-ok?
+            {:mesh-submitted? false :p2p-direct? true :mesh-peers-targeted 0 :p2p-peers-targeted 1 :error nil}
+            (let [mesh-res (send-to-all-channels! node-atom env)]
+              (assoc mesh-res :p2p-direct? false :p2p-peers-targeted 0))))
         (do
           (when (:p2p-session-id env)
             (set-p2p-channel-state node-atom (:p2p-session-id env) false {:error "no-direct-route"}))
-          (send-to-all-channels! node-atom env))))
+          (let [mesh-res (send-to-all-channels! node-atom env)]
+            (assoc mesh-res :p2p-direct? false :p2p-peers-targeted 0)))))
 
     :else
-    (send-to-all-channels! node-atom env)))
+    (let [mesh-res (send-to-all-channels! node-atom env)]
+      (assoc mesh-res :p2p-direct? false :p2p-peers-targeted 0))))
 
 (defn dial-browser-p2p-peer!
   "Dials a remote P2P candidate peer via WebRTC DataChannel in the browser per Rule 4."
@@ -1199,6 +1277,29 @@
           (try (.send dc (fressian/encode-wire q-env)) (catch :default _ nil)))))))
 
 (defonce ^:private keepalive-timers-atom (atom {}))
+(defonce ^:private redial-timer-atom (atom nil))
+
+(defn- dispatch-redial-event!
+  [node-atom ev dial-validator-fn]
+  (let [effs-box (atom [])]
+    (swap! node-atom
+           (fn [st]
+             (let [r0 (or (:redial-state st)
+                          (browser/initial-redial-state {:peers ["node1" "node2" "node3" "ns1" "ns2" "ns3"]}))
+                   [r1 effs] (browser/transition-redial r0 ev)]
+               (reset! effs-box effs)
+               (assoc st :redial-state r1))))
+    (doseq [eff @effs-box]
+      (case (:type eff)
+        :start-dial
+        (when-let [ncfg (get default-bootstrap-nodes (keyword (:peer-id eff)))]
+          (when dial-validator-fn
+            (dial-validator-fn (:peer-id eff) ncfg)))
+
+        :diagnose
+        (emit-browser-event! node-atom (assoc eff :type "diagnose" :timestamp-ms (.now js/Date)))
+
+        nil))))
 
 (defn- on-validator-channel-open!
   "Handles validator DataChannel open: records channel, registers home set, queries chain state, and starts keepalive."
@@ -1272,10 +1373,15 @@
            _ (doseq [[_nid old-dc] (:active-channels @node-atom)]
                (when old-dc
                  (try (.close old-dc) (catch :default _ nil))))
-           _ (swap! node-atom assoc :active-channels {})
+           _ (when-let [old-rt @redial-timer-atom]
+               (try (js/clearInterval old-rt) (catch :default _ nil))
+               (reset! redial-timer-atom nil))
+           _ (swap! node-atom assoc
+                    :active-channels {}
+                    :redial-state (browser/initial-redial-state {:peers ["node1" "node2" "node3" "ns1" "ns2" "ns3"]}))
            node1 (get default-bootstrap-nodes :node1)
            dial-validator!
-           (fn [nid-str ncfg]
+           (fn dial-validator! [nid-str ncfg]
              (let [sdp (browser/format-validator-sdp-answer ncfg)
                    target-url (str "rtc://" (:ip ncfg) ":" (:agent-port ncfg))]
                (browser/connect-webrtc!
@@ -1287,20 +1393,60 @@
                  :dispatch! (fn [ev eff-handler]
                               (dispatch-mesh-peer-event! node-atom nid-str ev eff-handler))
                  :on-open (fn [open-info]
+                            (dispatch-redial-event!
+                             node-atom
+                             {:type :peer-open :peer-id nid-str :generation (:generation open-info) :now-ms (.now js/Date)}
+                             dial-validator!)
                             (on-validator-channel-open! node-atom nid-str (:channel open-info) (:generation open-info)))
                  :on-close (fn [_close-info]
                              (when-let [tid (get @keepalive-timers-atom nid-str)]
                                (try (js/clearInterval tid) (catch :default _ nil))
                                (swap! keepalive-timers-atom dissoc nid-str))
+                             (dispatch-redial-event!
+                              node-atom
+                              {:type :peer-down :peer-id nid-str :now-ms (.now js/Date)}
+                              dial-validator!)
                              (notify-ui-listeners!))
-                 :on-diagnose (fn [_diag-eff]
+                 :on-diagnose (fn [diag-eff]
+                                (when (contains? #{:ice-disconnected :ice-failed :ice-closed :dial-failed} (:kind diag-eff))
+                                  (dispatch-redial-event!
+                                   node-atom
+                                   {:type (if (= :dial-failed (:kind diag-eff)) :dial-failed :peer-down)
+                                    :peer-id nid-str
+                                    :generation (:generation diag-eff)
+                                    :now-ms (.now js/Date)}
+                                   dial-validator!))
                                 (notify-ui-listeners!))
                  :on-deliver-message (fn [env]
-                                       (handle-inbound-wire-envelope! node-atom env))})))]
+                                       (handle-inbound-wire-envelope! node-atom env))})))
+           relay-origin (or (when (and (exists? js/window) (.-location js/window) (.-origin (.-location js/window)))
+                              (let [o (str (.-origin (.-location js/window)))]
+                                (if (str/starts-with? o "http") o "https://ns1.bitecho.org")))
+                            "https://ns1.bitecho.org")]
        ;; Dial all 6 validators (node1..ns3) through single-authority mesh-conns for 4-of-6 BFT quorum
        (doseq [nid [:node1 :node2 :node3 :ns1 :ns2 :ns3]]
          (when-let [ncfg (get default-bootstrap-nodes nid)]
            (dial-validator! (name nid) ncfg)))
+       ;; Bounded auto-redial tick + HTTPS relay fallback when 0/6 mesh peers are open (BIP-020 Catch 2 & 3)
+       (reset! redial-timer-atom
+               (js/setInterval
+                (fn []
+                  (when-let [st @node-atom]
+                    (let [now-ms (.now js/Date)
+                          mesh-summary (browser/summarize-mesh-diagnostics (:mesh-conns st))
+                          zero-open? (empty? (:open-peers mesh-summary))]
+                      (dispatch-redial-event! node-atom {:type :tick :now-ms now-ms} dial-validator!)
+                      (swap! node-atom assoc :relay-fallback-active? zero-open?)
+                      (when zero-open?
+                        (try
+                          (fetch-relay-chain-state! relay-origin {:node-atom node-atom})
+                          (catch :default err
+                            (swap! node-atom update-in [:light-state :diagnostics :relay-fallback-error] (fnil inc 0))
+                            (emit-browser-event! node-atom {:type "diagnose"
+                                                            :kind :relay-fallback-error
+                                                            :reason (str err)
+                                                            :timestamp-ms now-ms})))))))
+                2000))
        (notify-ui-listeners!)
        (clj->js {:ok true
                  :connected false
@@ -1313,20 +1459,25 @@
 
 (defn- resolve-peer-target
   "Resolves peer identifier or petname against :petnames, default-petnames,
-   and anchor-state-atom :supervised-agents, returning hex public key string."
+   and anchor-state-atom :supervised-agents, returning hex public key string.
+   Uses safe-map-get so populated string-keyed sorted-maps never throw CLJS CompareError."
   [node peer-or-petname]
   (let [target (if (keyword? peer-or-petname) (name peer-or-petname) (str peer-or-petname))
-        agents (when-let [st @anchor-state-atom] (:supervised-agents st))]
-    (or (get (:petnames node) target)
-        (get (:petnames node) (keyword target))
-        (get default-petnames target)
-        (get default-petnames (keyword target))
-        (when (map? agents)
-          (or (get-in agents [target :agent-pubkey])
-              (get-in agents [(keyword target) :agent-pubkey])
-              (get-in agents [target "agent-pubkey"])
-              (get-in agents [target :pubkey])
-              (get-in agents [target "pubkey"])))
+        kw-target (keyword target)
+        pnames (:petnames node)
+        agents (when-let [st @anchor-state-atom] (:supervised-agents st))
+        agent-entry (when (map? agents)
+                      (or (light-core/safe-map-get agents target)
+                          (light-core/safe-map-get agents kw-target)))]
+    (or (light-core/safe-map-get pnames target)
+        (light-core/safe-map-get pnames kw-target)
+        (light-core/safe-map-get default-petnames target)
+        (light-core/safe-map-get default-petnames kw-target)
+        (when (map? agent-entry)
+          (or (light-core/safe-map-get agent-entry :agent-pubkey)
+              (light-core/safe-map-get agent-entry "agent-pubkey")
+              (light-core/safe-map-get agent-entry :pubkey)
+              (light-core/safe-map-get agent-entry "pubkey")))
         target)))
 
 (defn open-channel
@@ -1834,17 +1985,18 @@
                         :sender (fressian/bytes->hex (:public-key (:keypair node)))
                         :recipient eff-peer
                         :sealed-frame sealed-frame}
-                   [new-conn effects] (browser/transition-conn (:conn node)
-                                                               {:type :send :envelope env})]
+                   route-res (route-browser-envelope! na env)
+                   delivered? (boolean (or (:mesh-submitted? route-res) (:p2p-direct? route-res)))]
                (swap! na (fn [st]
                            (-> st
-                               (assoc :conn new-conn)
                                (assoc-in [:sessions eff-peer :seq] seq-num)
                                (update :outbox conj env))))
-               (clj->js {:ok (some? sealed-frame)
-                         :sent (some? sealed-frame)
-                         :seq seq-num
-                         :effects effects})))))))))
+               (clj->js {:ok (and (some? sealed-frame) delivered?)
+                         :sent (and (some? sealed-frame) delivered?)
+                         :meshSubmitted (boolean (:mesh-submitted? route-res))
+                         :p2pDirect (boolean (:p2p-direct? route-res))
+                         :error (when-not delivered? (:error route-res))
+                         :seq seq-num})))))))))
 
 (defn run-subnet-demo
   "Runs the browser-only subnet demo and returns a JavaScript summary object."
@@ -2969,46 +3121,78 @@
                  resolved-sid (resolve-best-open-session-id sessions target-pub (when direct-sess sid))
                  resolved-sess (when resolved-sid (get sessions resolved-sid))
                  actual-peer-pub (or (:peer resolved-sess) target-pub)
+                 now-ms (.now js/Date)
                  cmd-map (cond-> {"cmd" "send"
                                   "peer" actual-peer-pub
                                   "text" text
-                                  "message" text}
+                                  "message" text
+                                  "now_ms" now-ms}
                            resolved-sid (assoc "session_id" resolved-sid))
-                 cmd-res (light-core/handle-command (:light-state node) cmd-map privkey)
-                 new-st (:state cmd-res)
-                 out-envs (:net-envelopes cmd-res)
-                 resp (:response cmd-res)
-                 cmd-ok? (and (boolean (get resp "ok" true))
-                              (pos? (count out-envs)))
-                 out-sid (or (get resp "session_id") resolved-sid sid)
-                 out-seq (get resp "seq")
-                 out-burn (long (or (get resp "burn") 0))]
-             (swap! na (fn [curr]
-                         (cond-> (-> curr
-                                     (assoc :light-state new-st)
-                                     (assoc :sessions (:sessions new-st)))
-                           cmd-ok?
-                           (update :chat-history
-                                   (fn [h]
-                                     (conj (vec (or h []))
-                                           {:timestamp (.toISOString (js/Date.))
-                                            :direction :outgoing
-                                            :peer (or (:petname (browser-cli/resolve-petname-entry curr actual-peer-pub))
-                                                      actual-peer-pub)
-                                            :sessionId out-sid
-                                            :seq out-seq
-                                            :text text
-                                            :status :sent}))))))
-             (doseq [env out-envs]
-               (route-browser-envelope! na env))
-             (browser/persist-state! (browser/sanitize-state-for-persistence @na))
-             (notify-ui-listeners!)
-             (js/Promise.resolve #js {"ok" cmd-ok?
-                                      "sessionId" out-sid
-                                      "seq" out-seq
-                                      "burn" out-burn
-                                      "error" (when-not cmd-ok?
-                                                (or (get resp "error") "no-open-session-for-peer"))}))))))))
+                 prep-res (light-core/prepare-send (:light-state node) cmd-map privkey)
+                 out-envs (:net-envelopes prep-res)
+                 intent (:fanout-intent prep-res)]
+             (if-not (and (:ok? prep-res) (seq out-envs))
+               (do
+                 (swap! na assoc :light-state (:state prep-res))
+                 (notify-ui-listeners!)
+                 (js/Promise.resolve #js {"ok" false
+                                          "sessionId" (or resolved-sid sid)
+                                          "seq" nil
+                                          "burn" 0
+                                          "meshSubmitted" false
+                                          "p2pDirect" false
+                                          "peersTargeted" 0
+                                          "error" (or (get-in prep-res [:response "error"]) "no-open-session-for-peer")}))
+               (let [route-outcomes (mapv #(route-browser-envelope! na %) out-envs)
+                     mesh-ok? (boolean (some :mesh-submitted? route-outcomes))
+                     p2p-ok? (boolean (some :p2p-direct? route-outcomes))
+                     mesh-peers (reduce + 0 (map #(long (or (:mesh-peers-targeted %) 0)) route-outcomes))
+                     p2p-peers (reduce + 0 (map #(long (or (:p2p-peers-targeted %) 0)) route-outcomes))
+                     first-err (some :error route-outcomes)
+                     committed (light-core/commit-delivery-outcome
+                                (:state prep-res)
+                                intent
+                                {:mesh-submitted? mesh-ok?
+                                 :p2p-direct? p2p-ok?
+                                 :mesh-peers-targeted mesh-peers
+                                 :p2p-peers-targeted p2p-peers
+                                 :error first-err
+                                 :now-ms (.now js/Date)})
+                     new-st (:state committed)
+                     resp (:response committed)
+                     cmd-ok? (boolean (:ok? committed))
+                     out-sid (or (get resp "session_id") resolved-sid sid)
+                     out-seq (get resp "seq")
+                     out-burn (long (or (get resp "burn") 0))]
+                 (swap! na (fn [curr]
+                             (-> curr
+                                 (assoc :light-state new-st)
+                                 (assoc :sessions (:sessions new-st))
+                                 (update :chat-history
+                                         (fn [h]
+                                           (conj (vec (or h []))
+                                                 {:timestamp (.toISOString (js/Date.))
+                                                  :direction :outgoing
+                                                  :peer (or (:petname (browser-cli/resolve-petname-entry curr actual-peer-pub))
+                                                            actual-peer-pub)
+                                                  :sessionId out-sid
+                                                  :seq out-seq
+                                                  :text text
+                                                  :status (if cmd-ok? :sent :failed)
+                                                  :error (when-not cmd-ok? (get resp "error"))}))))))
+                 (doseq [diag-ev (:stdout-events committed)]
+                   (emit-browser-event! na (assoc diag-ev :type "diagnose" :timestamp-ms (.now js/Date))))
+                 (browser/persist-state! (browser/sanitize-state-for-persistence @na))
+                 (notify-ui-listeners!)
+                 (js/Promise.resolve #js {"ok" cmd-ok?
+                                          "sessionId" out-sid
+                                          "seq" out-seq
+                                          "burn" out-burn
+                                          "meshSubmitted" mesh-ok?
+                                          "p2pDirect" p2p-ok?
+                                          "peersTargeted" (+ mesh-peers p2p-peers)
+                                          "error" (when-not cmd-ok?
+                                                    (or (get resp "error") "mesh-submit-failed"))}))))))))))
 
 (defn send-broadcast-v1
   "D40.4 v1.0.0: Multi-line UTF-8 safe subnet broadcast sender accepting either
@@ -3050,45 +3234,75 @@
                                     "seq" nil
                                     "burn" 0
                                     "error" "hardware-unlock-required"})
-           (let [cmd-res (light-core/handle-command (:light-state node)
-                                                    {"cmd" "broadcast"
-                                                     "subnet_id" sub-id
-                                                     "text" text
-                                                     "message" text}
-                                                    privkey)
-                 new-st (:state cmd-res)
-                 out-envs (:net-envelopes cmd-res)
-                 resp (:response cmd-res)
-                 cmd-ok? (boolean (get resp "ok" true))
-                 out-sub (or (get resp "subnet_id") sub-id)
-                 out-seq (get resp "seq")
-                 out-burn (long (or (get resp "burn") 0))]
-             (swap! na (fn [curr]
-                         (cond-> (-> curr
-                                     (assoc :light-state new-st)
-                                     (assoc :sessions (:sessions new-st)))
-                           cmd-ok?
-                           (update :chat-history
-                                   (fn [h]
-                                     (conj (vec (or h []))
-                                           {:timestamp (.toISOString (js/Date.))
-                                            :direction :outgoing
-                                            :peer out-sub
-                                            :sessionId out-sub
-                                            :seq out-seq
-                                            :text text
-                                            :status :sent}))))))
-             (doseq [env out-envs]
-               (route-browser-envelope! na env))
-             (when-let [dial-info (:p2p-dial cmd-res)]
-               (dial-browser-p2p-peer! na dial-info))
-             (browser/persist-state! (browser/sanitize-state-for-persistence @na))
-             (notify-ui-listeners!)
-             (js/Promise.resolve #js {"ok" cmd-ok?
-                                      "subnetId" out-sub
-                                      "seq" out-seq
-                                      "burn" out-burn
-                                      "error" (when-not cmd-ok? (get resp "error"))}))))))))
+           (let [now-ms (.now js/Date)
+                 prep-res (light-core/prepare-broadcast (:light-state node)
+                                                        {"subnet_id" sub-id
+                                                         "text" text
+                                                         "message" text
+                                                         "now_ms" now-ms}
+                                                        privkey)
+                 out-envs (:net-envelopes prep-res)
+                 intent (:fanout-intent prep-res)]
+             (if-not (and (:ok? prep-res) (seq out-envs))
+               (do
+                 (swap! na assoc :light-state (:state prep-res))
+                 (notify-ui-listeners!)
+                 (js/Promise.resolve #js {"ok" false
+                                          "subnetId" sub-id
+                                          "seq" nil
+                                          "burn" 0
+                                          "meshSubmitted" false
+                                          "p2pDirect" false
+                                          "peersTargeted" 0
+                                          "error" (or (get-in prep-res [:response "error"]) "broadcast-prepare-failed")}))
+               (let [route-outcomes (mapv #(route-browser-envelope! na %) out-envs)
+                     mesh-ok? (boolean (some :mesh-submitted? route-outcomes))
+                     p2p-ok? (boolean (some :p2p-direct? route-outcomes))
+                     mesh-peers (reduce + 0 (map #(long (or (:mesh-peers-targeted %) 0)) route-outcomes))
+                     p2p-peers (reduce + 0 (map #(long (or (:p2p-peers-targeted %) 0)) route-outcomes))
+                     first-err (some :error route-outcomes)
+                     committed (light-core/commit-delivery-outcome
+                                (:state prep-res)
+                                intent
+                                {:mesh-submitted? mesh-ok?
+                                 :p2p-direct? p2p-ok?
+                                 :mesh-peers-targeted mesh-peers
+                                 :p2p-peers-targeted p2p-peers
+                                 :error first-err
+                                 :now-ms (.now js/Date)})
+                     new-st (:state committed)
+                     resp (:response committed)
+                     cmd-ok? (boolean (:ok? committed))
+                     out-sub (or (get resp "subnet_id") sub-id)
+                     out-seq (get resp "seq")
+                     out-burn (long (or (get resp "burn") 0))]
+                 (swap! na (fn [curr]
+                             (-> curr
+                                 (assoc :light-state new-st)
+                                 (assoc :sessions (:sessions new-st))
+                                 (update :chat-history
+                                         (fn [h]
+                                           (conj (vec (or h []))
+                                                 {:timestamp (.toISOString (js/Date.))
+                                                  :direction :outgoing
+                                                  :peer out-sub
+                                                  :sessionId out-sub
+                                                  :seq out-seq
+                                                  :text text
+                                                  :status (if cmd-ok? :sent :failed)
+                                                  :error (when-not cmd-ok? (get resp "error"))}))))))
+                 (doseq [diag-ev (:stdout-events committed)]
+                   (emit-browser-event! na (assoc diag-ev :type "diagnose" :timestamp-ms (.now js/Date))))
+                 (browser/persist-state! (browser/sanitize-state-for-persistence @na))
+                 (notify-ui-listeners!)
+                 (js/Promise.resolve #js {"ok" cmd-ok?
+                                          "subnetId" out-sub
+                                          "seq" out-seq
+                                          "burn" out-burn
+                                          "meshSubmitted" mesh-ok?
+                                          "p2pDirect" p2p-ok?
+                                          "peersTargeted" (+ mesh-peers p2p-peers)
+                                          "error" (when-not cmd-ok? (get resp "error"))}))))))))))
 
 (defn get-artifact-v1
   "D40.4 v1.0.0: Fetches an artifact by `{ cid }` or `{ subnet, path }` (plus optional `{ baseUrl }`),

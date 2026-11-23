@@ -1667,42 +1667,13 @@
 
 (def waitable-event-types
   "Set of incoming asynchronous event types eligible to wake `wait-event`."
-  #{"message-received" "offer-received" "channel-opened" "session-established"
-    "rendezvous-header-received" "rendezvous-reveal-received"
-    "p2p-offer-received" "p2p-connected" "broadcast-received"})
+  light-core/waitable-event-types)
 
 (defn event-matches-wait-filter?
-  "Pure predicate checking whether an emitted JSON event map satisfies a `wait-event` filter."
+  "Delegates to unified pure `.cljc` core `light-core/event-matches-wait-filter?`
+   (supporting `broadcast_seq` and `config/equivalent-subnet-id?`)."
   [evt opts]
-  (if-not (map? evt)
-    false
-    (let [ev-type (or (get evt "event") (some-> (:event evt) name))
-          waitable? (contains? waitable-event-types ev-type)
-          target-sid (:session-id opts)
-          ev-sid (or (get evt "session_id") (get evt "session-id") (:session-id evt) (:session_id evt))
-          target-subnet (or (:subnet-id opts) (:subnet opts))
-          ev-subnet (or (get evt "subnet_id") (get evt "subnet-id") (:subnet-id evt) (:subnet_id evt))
-          min-seq (:min-seq opts)
-          raw-seq (or (get evt "seq") (:seq evt))
-          ev-seq (when (some? raw-seq)
-                   (try (Long/parseLong (str raw-seq)) (catch Exception _ nil)))
-          min-bseq (:min-broadcast-seq opts)
-          raw-bseq (or (get evt "broadcast_seq") (get evt "broadcast-seq") (:broadcast-seq evt) (:broadcast_seq evt))
-          ev-bseq (when (some? raw-bseq)
-                    (try (Long/parseLong (str raw-bseq)) (catch Exception _ nil)))
-          after-ts (:after-ts opts)
-          raw-ts (or (get evt "timestamp_ms") (:timestamp-ms evt) (:timestamp_ms evt))
-          ev-ts (if (some? raw-ts)
-                  (try (Long/parseLong (str raw-ts)) (catch Exception _ 0))
-                  0)
-          sid-ok? (or (nil? target-sid) (= (str ev-sid) (str target-sid)))
-          subnet-ok? (or (nil? target-subnet) (= (str ev-subnet) (str target-subnet)))
-          seq-ok? (or (nil? min-seq)
-                      (and (some? ev-seq) (>= (long ev-seq) (long min-seq))))
-          bseq-ok? (or (nil? min-bseq)
-                       (and (some? ev-bseq) (>= (long ev-bseq) (long min-bseq))))
-          ts-ok? (or (nil? after-ts) (> (long ev-ts) (long after-ts)))]
-      (boolean (and waitable? sid-ok? subnet-ok? seq-ok? bseq-ok? ts-ok?)))))
+  (light-core/event-matches-wait-filter? evt opts))
 
 (defn append-event-jsonl!
   "Appends a single JSON object line to events-out-path with a monotonic timestamp_ms field."
@@ -1717,16 +1688,31 @@
                        (assoc data "timestamp_ms" (System/currentTimeMillis)))]
         (spit f (str (json/write-str enriched) "\n") :append true)))))
 
+(defonce ^:private events-out-error-count-atom (atom 0))
+
 (defn- emit-json-line!
-  "Writes a data object as a JSON line to the dedicated print writer, and optionally mirrors to events-out-path."
+  "Writes a data object as a JSON line to the dedicated print writer, and optionally mirrors to events-out-path.
+   Never swallows `append-event-jsonl!` I/O errors silently (Rule 5 / BIP-020 Catch 4)."
   ([^PrintWriter writer data]
-   (emit-json-line! writer data nil))
+   (emit-json-line! writer data nil nil))
   ([^PrintWriter writer data events-out-path]
+   (emit-json-line! writer data events-out-path nil))
+  ([^PrintWriter writer data events-out-path state-atom]
    (when writer
      (.println writer ^String (json/write-str data))
      (.flush writer))
    (when events-out-path
-     (try (append-event-jsonl! events-out-path data) (catch Exception _ nil)))))
+     (try
+       (append-event-jsonl! events-out-path data)
+       (catch Exception e
+         (swap! events-out-error-count-atom inc)
+         (when state-atom
+           (swap! state-atom (fn [st]
+                               (-> st
+                                   (update-in [:diagnostics :events-out-write-failed] (fnil inc 0))
+                                   (update-in [:diagnostics :dropped] (fnil inc 0))))))
+         (binding [*out* *err*]
+           (println (str "WARN: append-event-jsonl! failed for " events-out-path ": " (.getMessage e)))))))))
 
 (defn read-new-cmd-file-lines!
   "Reads newly appended complete UTF-8 lines or balanced JSON objects from cmd-file-path
@@ -1785,6 +1771,18 @@
   [opts]
   (let [state-dir (or (:state-dir opts) (str (System/getProperty "user.home") "/.bitecho/light-node"))
         events-path (or (:events-out opts) (str (io/file state-dir "events.jsonl")))
+        ctrl-file (io/file state-dir "control.json")
+        _ (when (.exists ctrl-file)
+            (when-let [ctrl (try (json/read-str (slurp ctrl-file)) (catch Exception _ nil))]
+              (when (contains? ctrl "events_out")
+                (let [daemon-ev (get ctrl "events_out")
+                      canon-target (.getCanonicalPath (io/file events-path))
+                      canon-daemon (when (and (string? daemon-ev) (not (str/blank? daemon-ev)))
+                                     (.getCanonicalPath (io/file daemon-ev)))]
+                  (when (not= canon-target canon-daemon)
+                    (binding [*out* *err*]
+                      (println (str "WARN: events-out-mismatch: wait-event targeting " canon-target
+                                    " but daemon control.json has events_out=" (pr-str canon-daemon)))))))))
         timeout-ms (long (or (:timeout-ms opts) 300000))
         poll-ms (long (or (:poll-ms opts) 50))
         out-writer (or (:out-writer opts) (PrintWriter. System/out true))
@@ -2569,7 +2567,11 @@
                                   (as-> m (enrich-artifact-cmd-map verb m relay-url)))
                 prev-state @state-atom
                 eff-domain-verb (effective-artifact-domain-verb verb effective-map)
-                res (light-core/handle-command @state-atom effective-map (:privkey-bytes identity))
+                effective-map-with-now (if (and (contains? #{"send" "broadcast"} verb)
+                                                (not (contains? effective-map "now_ms")))
+                                         (assoc effective-map "now_ms" (System/currentTimeMillis))
+                                         effective-map)
+                res (light-core/handle-command @state-atom effective-map-with-now (:privkey-bytes identity))
                 _ (maybe-write-artifact-out-file! eff-domain-verb effective-map (:response res))
                 _ (when (contains? #{"artifact-put" "artifact-revoke"} eff-domain-verb)
                     (when-let [art-relay (or (get effective-map "relay_url")
@@ -2619,9 +2621,14 @@
                                              (boolean
                                               (some (fn [env]
                                                       (try
-                                                        (let [r (submit-relay-envelope! relay-url env {:timeout-ms 5000})]
-                                                          (boolean (or (true? (get r "ok")) (true? (:ok r)))))
-                                                        (catch Exception _ false)))
+                                                        (let [r (submit-relay-envelope! relay-url env {:timeout-ms 5000})
+                                                              ok? (boolean (or (true? (get r "ok")) (true? (:ok r))))]
+                                                          (when-not ok?
+                                                            (swap! state-atom update-in [:diagnostics :relay-mirror-failed] (fnil inc 0)))
+                                                          ok?)
+                                                        (catch Exception _
+                                                          (swap! state-atom update-in [:diagnostics :relay-mirror-failed] (fnil inc 0))
+                                                          false)))
                                                     non-direct))))
                                          false))]
                 (if (some #(or (:p2p-direct? %) (:p2p-broadcast? %)) live-envs)
@@ -2690,9 +2697,11 @@
                                       (apply-conn-event! conn-atom {:type :send-failed :error err :generation target-gen} conn-opts))
                                     (if (= verb "send")
                                       (do
+                                        (when-let [intent (:fanout-intent res)]
+                                          (swap! state-atom #(:state (light-core/commit-delivery-outcome % intent {:mesh-submitted? false :p2p-direct? false :error err :now-ms (System/currentTimeMillis)}))))
                                         (sync-conn-diagnostics! state-atom conn-atom)
                                         (when state-file (save-light-state! state-file @state-atom))
-                                        (let [err-map (assoc (or (:response res) {"ok" true}) "ok" true "queued" true "transport_error" err)]
+                                        (let [err-map (assoc (or (:response res) {"ok" false}) "ok" false "queued" true "mesh_submitted" false "transport_error" err "error" err)]
                                           (emit! err-map)
                                           err-map))
                                       (do
@@ -2840,10 +2849,16 @@
         token (basalt/bytes->hex (crypto/random-bytes 32))
         pid (extract-pid)
         ctrl-file (io/file state-dir "control.json")
+        raw-events-out (or (:events-out conn-opts) (:events-out ctx))
+        canon-events-out (when (and (string? raw-events-out) (not (str/blank? raw-events-out)))
+                           (.getCanonicalPath (io/file raw-events-out)))
+        state-atom (:state-atom ctx)
+        _ (when state-atom
+            (swap! state-atom assoc :events-out canon-events-out))
         ctrl-info {"port" actual-port
                    "token" token
-                   "pid" (or pid 0)}
-        state-atom (:state-atom ctx)
+                   "pid" (or pid 0)
+                   "events_out" canon-events-out}
         executor (Executors/newCachedThreadPool
                   (reify ThreadFactory
                     (newThread [_ r]
@@ -2887,17 +2902,30 @@
                                                               (long ms))
                                                     cursor (when-let [c (or (get cmd-map "cursor") (:cursor cmd-map))]
                                                              (long c))
+                                                    sub-filter (or (get cmd-map "subnet_id") (get cmd-map "subnet-id") (:subnet-id cmd-map) (:subnet cmd-map))
+                                                    sid-filter (or (get cmd-map "session_id") (get cmd-map "session-id") (:session-id cmd-map))
+                                                    min-bseq (when-let [mb (or (get cmd-map "min_broadcast_seq") (get cmd-map "min-broadcast-seq") (:min-broadcast-seq cmd-map))]
+                                                               (long mb))
+                                                    after-ts (when-let [at (or (get cmd-map "after_ts") (get cmd-map "after-ts") (:after-ts cmd-map))]
+                                                               (long at))
+                                                    has-filter? (or min-seq cursor sub-filter sid-filter min-bseq after-ts)
+                                                    filter-opts {:enforce-waitable-type? false
+                                                                 :cursor cursor
+                                                                 :session-id sid-filter
+                                                                 :subnet-id sub-filter
+                                                                 :min-seq min-seq
+                                                                 :min-broadcast-seq min-bseq
+                                                                 :after-ts after-ts
+                                                                 :allow-eid-fallback-for-min-seq? (nil? cursor)}
                                                     deadline (+ (System/currentTimeMillis) timeout-ms)]
                                                 (loop []
                                                   (let [popped (locking cmd-lock
-                                                                 (let [q (:event-queue @state-atom)
-                                                                       has-events? (if (or min-seq cursor)
-                                                                                     (some (fn [ev]
-                                                                                             (let [eid (long (or (get ev "event_id") (:event-id ev) (get ev "eid") (:eid ev) 0))
-                                                                                                   s   (long (or (get ev "seq") (:seq ev) 0))]
-                                                                                               (and (or (nil? min-seq) (>= eid min-seq) (>= s min-seq))
-                                                                                                    (or (nil? cursor) (> eid cursor)))))
-                                                                                           q)
+                                                                 (let [st @state-atom
+                                                                       q (if (some? cursor)
+                                                                           (let [h (:event-history st)] (if (seq h) h (:event-queue st)))
+                                                                           (:event-queue st))
+                                                                       has-events? (if has-filter?
+                                                                                     (some #(light-core/event-matches-wait-filter? % filter-opts) q)
                                                                                      (seq q))]
                                                                    (if has-events?
                                                                      (handle-serve-line! cmd-map ctx)

@@ -355,14 +355,19 @@
               base-conn (assoc-in conn [:diagnostics :last-ice-state] norm-state)]
           (case kind
             (:ice-disconnected :ice-failed :ice-closed)
-            (let [new-conn (-> base-conn
+            (let [next-phase (if (= :open (:phase base-conn))
+                               (if (= kind :ice-disconnected) :degraded :closed)
+                               (:phase base-conn))
+                  new-conn (-> base-conn
+                               (assoc :phase next-phase)
+                               (assoc-in [:diagnostics :phase] next-phase)
                                (update-in [:diagnostics :ice-disconnects] (fnil inc 0))
                                (assoc-in [:diagnostics :last-error] (name kind))
                                (record-conn-diagnostic-event
                                 (cond-> {:kind kind
                                          :peer-id peer-id
                                          :generation curr-gen
-                                         :phase (:phase base-conn)
+                                         :phase next-phase
                                          :ice-state norm-state
                                          :prev-ice-state prev-ice
                                          :reason (name kind)}
@@ -372,19 +377,26 @@
                                        :peer-id peer-id
                                        :ice-state norm-state
                                        :prev-ice-state prev-ice
+                                       :phase next-phase
                                        :generation curr-gen}
                                 ts-ms (assoc :timestamp-ms ts-ms))]
               [new-conn [diag-effect]])
 
             :ice-reconnected
-            (let [new-conn (-> base-conn
+            (let [restored-phase (if (and (= :degraded (:phase base-conn))
+                                          (some? (:channel base-conn)))
+                                   :open
+                                   (:phase base-conn))
+                  new-conn (-> base-conn
+                               (assoc :phase restored-phase)
+                               (assoc-in [:diagnostics :phase] restored-phase)
                                (update-in [:diagnostics :ice-reconnects] (fnil inc 0))
                                (assoc-in [:diagnostics :last-error] nil)
                                (record-conn-diagnostic-event
                                 (cond-> {:kind :ice-reconnected
                                          :peer-id peer-id
                                          :generation curr-gen
-                                         :phase (:phase base-conn)
+                                         :phase restored-phase
                                          :ice-state norm-state
                                          :prev-ice-state prev-ice
                                          :reason "ice-reconnected"}
@@ -394,6 +406,7 @@
                                        :peer-id peer-id
                                        :ice-state norm-state
                                        :prev-ice-state prev-ice
+                                       :phase restored-phase
                                        :generation curr-gen}
                                 ts-ms (assoc :timestamp-ms ts-ms))]
               [new-conn [diag-effect]])
@@ -409,13 +422,18 @@
                          "failed" :connection-failed
                          "closed" :connection-closed
                          :connection-disconnected)
+                  next-phase (if (= :open (:phase base-conn))
+                               (if (= norm-state "disconnected") :degraded :closed)
+                               (:phase base-conn))
                   new-conn (-> base-conn
+                               (assoc :phase next-phase)
+                               (assoc-in [:diagnostics :phase] next-phase)
                                (assoc-in [:diagnostics :last-error] (name kind))
                                (record-conn-diagnostic-event
                                 (cond-> {:kind kind
                                          :peer-id peer-id
                                          :generation curr-gen
-                                         :phase (:phase base-conn)
+                                         :phase next-phase
                                          :connection-state norm-state
                                          :prev-connection-state prev-cs
                                          :reason (name kind)}
@@ -425,6 +443,7 @@
                                        :peer-id peer-id
                                        :connection-state norm-state
                                        :prev-connection-state prev-cs
+                                       :phase next-phase
                                        :generation curr-gen}
                                 ts-ms (assoc :timestamp-ms ts-ms))]
               [new-conn [diag-effect]])
@@ -549,7 +568,7 @@
               sorted-pids)
         open-peers (filterv #(= :open (get-in peer-summaries [% :phase])) sorted-pids)
         dialing-peers (filterv #(= :dialing (get-in peer-summaries [% :phase])) sorted-pids)
-        closed-peers (filterv #(= :closed (get-in peer-summaries [% :phase])) sorted-pids)
+        closed-peers (filterv #(contains? #{:closed :degraded} (get-in peer-summaries [% :phase])) sorted-pids)
         sum-field (fn [k] (reduce + 0 (map #(long (or (get-in peer-summaries [% k]) 0)) sorted-pids)))
         ice-disc (sum-field :ice-disconnects)
         ice-reconn (sum-field :ice-reconnects)
@@ -596,6 +615,184 @@
      :last-connection-state (:last-connection-state primary-peer)
      :peers peer-summaries
      :recent-events recent-evs}))
+
+;; =============================================================================
+;; Bounded Generation-Tagged Auto-Redial Reducer (BIP-020 Catch 2 & 3, Rules 4/5)
+;; =============================================================================
+
+(def default-redial-base-backoff-ms
+  "Initial per-peer auto-redial backoff in milliseconds (2s)."
+  2000)
+
+(def default-redial-max-backoff-ms
+  "Maximum per-peer auto-redial backoff in milliseconds (30s)."
+  30000)
+
+(def default-redial-max-attempts
+  "Maximum auto-redial attempts per peer outage before exhaustion (5)."
+  5)
+
+(def default-redial-max-concurrent
+  "Maximum concurrent peer auto-redials allowed simultaneously (2)."
+  2)
+
+(defn initial-redial-state
+  "Initializes single-authority generation-tagged bounded auto-redial state.
+   Enforces e2-micro bounds: backoff 2s -> 30s, max 5 attempts/outage, <= 2 concurrent dials."
+  [& [opts]]
+  (let [peer-ids (mapv (fn [p] (if (or (keyword? p) (symbol? p)) (name p) (str p)))
+                       (or (:peers opts) []))]
+    {:peers (into {}
+                  (map (fn [pid]
+                         [pid {:peer-id pid
+                               :status :open
+                               :generation 0
+                               :attempts 0
+                               :backoff-ms default-redial-base-backoff-ms
+                               :next-retry-ms 0}]))
+                  peer-ids)
+     :in-flight #{}
+     :visibility-state (or (:visibility-state opts) "visible")
+     :max-concurrent (max 1 (long (or (:max-concurrent opts) default-redial-max-concurrent)))
+     :max-attempts (max 1 (long (or (:max-attempts opts) default-redial-max-attempts)))
+     :base-backoff-ms (max 100 (long (or (:base-backoff-ms opts) default-redial-base-backoff-ms)))
+     :max-backoff-ms (max 1000 (long (or (:max-backoff-ms opts) default-redial-max-backoff-ms)))
+     :diagnostics {:redials-started 0
+                   :redials-exhausted 0
+                   :ignored-stale 0
+                   :hidden-throttled 0}}))
+
+(defn transition-redial
+  "Pure single-authority generation-tagged reducer `(transition-redial state event) -> [new-state effects]`.
+   Events:
+   - `{:type :peer-down :peer-id pid :now-ms ms}`
+   - `{:type :peer-open :peer-id pid :generation gen :now-ms ms}`
+   - `{:type :dial-failed :peer-id pid :generation gen :now-ms ms :jitter-ms j}`
+   - `{:type :tick :now-ms ms}`
+   - `{:type :visibility-change :state \"visible\"|\"hidden\" :now-ms ms}`"
+  [state event]
+  (let [st0 (or state (initial-redial-state))
+        ev-type (:type event)
+        now-ms (long (or (:now-ms event) 0))
+        raw-pid (:peer-id event)
+        pid (when raw-pid (if (or (keyword? raw-pid) (symbol? raw-pid)) (name raw-pid) (str raw-pid)))
+        base-bo (long (or (:base-backoff-ms st0) default-redial-base-backoff-ms))
+        max-bo (long (or (:max-backoff-ms st0) default-redial-max-backoff-ms))
+        max-att (long (or (:max-attempts st0) default-redial-max-attempts))
+        max-conc (long (or (:max-concurrent st0) default-redial-max-concurrent))]
+    (case ev-type
+      :peer-down
+      (let [prev (or (get-in st0 [:peers pid])
+                     {:peer-id pid :status :open :generation 0 :attempts 0 :backoff-ms base-bo :next-retry-ms 0})
+            next-peer (if (= :down (:status prev))
+                        prev
+                        (assoc prev
+                               :status :down
+                               :next-retry-ms (+ now-ms (long (or (:backoff-ms prev) base-bo)))))]
+        [(-> st0
+             (assoc-in [:peers pid] next-peer)
+             (update :in-flight disj pid))
+         []])
+
+      :peer-open
+      (let [prev (get-in st0 [:peers pid])
+            ev-gen (:generation event)
+            cur-gen (long (or (:generation prev) 0))]
+        (if (and (some? ev-gen) (< (long ev-gen) cur-gen))
+          [(update-in st0 [:diagnostics :ignored-stale] (fnil inc 0))
+           [{:type :diagnose :kind :ignored-stale :peer-id pid :event-gen ev-gen :current-gen cur-gen}]]
+          [(-> st0
+               (assoc-in [:peers pid] {:peer-id pid
+                                       :status :open
+                                       :generation (max cur-gen (long (or ev-gen cur-gen)))
+                                       :attempts 0
+                                       :backoff-ms base-bo
+                                       :next-retry-ms 0})
+               (update :in-flight disj pid))
+           []]))
+
+      :dial-failed
+      (let [prev (or (get-in st0 [:peers pid])
+                     {:peer-id pid :status :down :generation 0 :attempts 0 :backoff-ms base-bo :next-retry-ms 0})
+            ev-gen (:generation event)
+            cur-gen (long (or (:generation prev) 0))]
+        (if (and (some? ev-gen) (< (long ev-gen) cur-gen))
+          [(update-in st0 [:diagnostics :ignored-stale] (fnil inc 0))
+           [{:type :diagnose :kind :ignored-stale :peer-id pid :event-gen ev-gen :current-gen cur-gen}]]
+          (let [prev-bo (long (or (:backoff-ms prev) base-bo))
+                jitter (long (or (:jitter-ms event) 0))
+                next-bo (min max-bo (max base-bo (+ (* 2 prev-bo) jitter)))
+                att (long (or (:attempts prev) 0))
+                exhausted? (>= att max-att)
+                next-peer (assoc prev
+                                 :status (if exhausted? :exhausted :down)
+                                 :backoff-ms next-bo
+                                 :next-retry-ms (+ now-ms next-bo))
+                st1 (-> st0
+                        (assoc-in [:peers pid] next-peer)
+                        (update :in-flight disj pid)
+                        (cond-> exhausted? (update-in [:diagnostics :redials-exhausted] (fnil inc 0))))
+                effs (if exhausted?
+                       [{:type :diagnose :kind :redial-exhausted :peer-id pid :attempts att :generation cur-gen}]
+                       [])]
+            [st1 effs])))
+
+      :visibility-change
+      (let [new-vis (if (= (str (:state event)) "hidden") "hidden" "visible")
+            st1 (assoc st0 :visibility-state new-vis)]
+        (if (= new-vis "visible")
+          ;; Re-arm exhausted/down peers when tab becomes visible
+          (let [rearmed-peers (reduce-kv
+                               (fn [m k p]
+                                 (if (contains? #{:down :exhausted} (:status p))
+                                   (assoc m k (assoc p
+                                                     :status :down
+                                                     :attempts 0
+                                                     :backoff-ms base-bo
+                                                     :next-retry-ms now-ms))
+                                   (assoc m k p)))
+                               {}
+                               (:peers st1))]
+            [(assoc st1 :peers rearmed-peers) []])
+          [st1 []]))
+
+      :tick
+      (if (= "hidden" (:visibility-state st0))
+        [(update-in st0 [:diagnostics :hidden-throttled] (fnil inc 0)) []]
+        (let [in-flight (or (:in-flight st0) #{})
+              avail-slots (max 0 (- max-conc (count in-flight)))]
+          (if (zero? avail-slots)
+            [st0 []]
+            (let [eligible (->> (sort (keys (:peers st0)))
+                                (map #(get-in st0 [:peers %]))
+                                (filter (fn [p]
+                                          (and (= :down (:status p))
+                                               (not (contains? in-flight (:peer-id p)))
+                                               (< (long (or (:attempts p) 0)) max-att)
+                                               (>= now-ms (long (or (:next-retry-ms p) 0))))))
+                                (take avail-slots)
+                                vec)]
+              (reduce
+               (fn [[s effs] p]
+                 (let [p-id (:peer-id p)
+                       next-gen (inc (long (or (:generation p) 0)))
+                       next-att (inc (long (or (:attempts p) 0)))
+                       updated-p (assoc p
+                                        :status :dialing
+                                        :generation next-gen
+                                        :attempts next-att)]
+                   [(-> s
+                        (assoc-in [:peers p-id] updated-p)
+                        (update :in-flight conj p-id)
+                        (update-in [:diagnostics :redials-started] (fnil inc 0)))
+                    (conj effs {:type :start-dial
+                                :peer-id p-id
+                                :generation next-gen
+                                :attempt next-att})]))
+               [st0 []]
+               eligible)))))
+
+      [st0 []])))
 
 ;; =============================================================================
 ;; State Sanitization & Persistence (Rule 4)
@@ -755,7 +952,22 @@
     "invalid-lab-subnet-rejected" "bip-admission-rejected" "sybil-bounty-claim-rejected"
     "bounty-quorum-invalid" "unsubstantiated-objection-ignored" "paramount-objection-recorded" "unauthorized-circle-member"
     "network-uri" "network-replay-rejected"
-    "raw-public-hex" "stale-browser-bundle"})
+    "raw-public-hex" "stale-browser-bundle"
+    ;; BIP-020 Pillar 1-3 bounded delivery telemetry (Rule 4: runtime liveness strictly excluded)
+    "delivery-telemetry" "ring-buffer" "ring-buffer-count" "ring-buffer-max"
+    "sent" "acked" "unacked-aged" "unacked-age-threshold-ms"
+    "evicted-by-reason" "retries-exhausted" "epoch-skew" "session-not-open"
+    "mesh-disconnected" "capacity-overflow" "expired"
+    "received-but-not-emitted" "cursor-skip" "subnet-mismatch" "session-mismatch"
+    "event-type-mismatch" "min-seq-filter" "min-broadcast-seq-filter" "after-ts-filter"
+    "duplicate-replay" "queue-overflow" "foreign-unicast" "watcher-closed" "admission-drop"
+    "fanout" "mesh-submitted" "p2p-direct" "peers-targeted" "mesh-peers-targeted"
+    "p2p-peers-targeted" "mesh-submit-failed" "route"
+    "broadcast-seen-order" "relay-cursors" "event-history"
+    "broadcast-gap-detected" "foreign-unicast-dropped" "events-out-mismatch"
+    ;; BIP-018 blob-store persistence keys
+    "blob-hot-evicted" "max-pinned-app-bytes" "max-hot-blob-bytes"
+    "pinned-app-bytes" "pinned-app-cap-exceeded" "blob-stored-cold"})
 
 (def ^:private allowed-persistence-keys-compact
   (into #{} (map #(str/replace % #"[-?]" "") allowed-persistence-keys)))

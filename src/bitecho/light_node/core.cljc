@@ -350,6 +350,77 @@
   "Canonical zero-burn DAC-gated 3-way private broadcast & chat subnet ID (Subnet #4)."
   "chat/simon-nexus-axiom")
 
+(defn safe-map-get
+  "Safe lookup that never throws CLJS CompareError when probing keyword keys
+   on a string-keyed sorted-map (e.g. :petnames)."
+  ([m k] (safe-map-get m k nil))
+  ([m k not-found]
+   (if (map? m)
+     (try
+       (get m k not-found)
+       (catch #?(:clj Exception :cljs :default) _
+         not-found))
+     not-found)))
+
+(def delivery-ring-max-entries
+  "Pillar 1 bound: max entries in per-envelope sender lifecycle ring buffer (256)."
+  256)
+
+(def delivery-ring-max-entry-bytes
+  "Pillar 1 bound: max UTF-8 serialized byte size per ring buffer entry (1 KiB)."
+  1024)
+
+(def broadcast-seen-max-entries
+  "e2-micro bound: max entries retained in :broadcast-seen FIFO/LRU set (1024)."
+  1024)
+
+(def inbox-max-entries
+  "e2-micro bound: max entries retained in :inbox and :broadcast-inbox."
+  512)
+
+(def default-unacked-age-threshold-ms
+  "Default age threshold (60s) for classifying unacked outbox entries as unacked_aged."
+  60000)
+
+(def eviction-reasons
+  "Closed enum of Pillar 2 outbox eviction reasons."
+  #{:retries-exhausted :epoch-skew :session-not-open
+    :mesh-disconnected :capacity-overflow :expired})
+
+(def suppression-reasons
+  "Closed enum of Pillar 3 receiver/watcher received_but_not_emitted suppression reasons."
+  #{:cursor-skip :subnet-mismatch :session-mismatch :event-type-mismatch
+    :min-seq-filter :min-broadcast-seq-filter :after-ts-filter
+    :duplicate-replay :queue-overflow :foreign-unicast :watcher-closed :admission-drop})
+
+(def initial-delivery-telemetry
+  "Initial pure Sans-IO Pillar 1-3 delivery telemetry structure."
+  {:ring-buffer []
+   :sent 0
+   :acked 0
+   :evicted-by-reason {:retries-exhausted 0
+                       :epoch-skew 0
+                       :session-not-open 0
+                       :mesh-disconnected 0
+                       :capacity-overflow 0
+                       :expired 0}
+   :received-but-not-emitted {:cursor-skip 0
+                              :subnet-mismatch 0
+                              :session-mismatch 0
+                              :event-type-mismatch 0
+                              :min-seq-filter 0
+                              :min-broadcast-seq-filter 0
+                              :after-ts-filter 0
+                              :duplicate-replay 0
+                              :queue-overflow 0
+                              :foreign-unicast 0
+                              :watcher-closed 0
+                              :admission-drop 0}
+   :fanout {:mesh-submitted 0
+            :p2p-direct 0
+            :peers-targeted 0
+            :mesh-submit-failed 0}})
+
 (def default-subscribed-subnets
   "Default set of subscribed subnets for light node instances (F-D25-8, F-D29-21)."
   #{})
@@ -381,9 +452,13 @@
    :inbox []
    :broadcast-seq 0
    :broadcast-seen #{}
+   :broadcast-seen-order []
    :broadcast-inbox []
    :relay-since-seq 0
    :relay-since-broadcast-seq 0
+   :relay-cursors {}
+   :event-history []
+   :delivery-telemetry initial-delivery-telemetry
    :local-accounting {:burned-ech 0}
    :vouchers []
    :account nil
@@ -2920,24 +2995,282 @@
       state
       (:sessions state)))))
 
+;; =============================================================================
+;; BIP-020 Shared-Core Delivery Telemetry (Pillars 1-4, Pure Sans-IO)
+;; =============================================================================
+
+(defn- truncate-utf8-str
+  [s max-chars]
+  (let [sv (str s)]
+    (if (> (count sv) max-chars)
+      (subs sv 0 max-chars)
+      sv)))
+
+(defn- cap-ring-entry
+  "Ensures a Pillar 1 ring-buffer entry serializes to <= 1024 UTF-8 bytes."
+  [entry]
+  (let [base (reduce-kv
+              (fn [m k v]
+                (assoc m k (if (string? v) (truncate-utf8-str v 200) v)))
+              {}
+              (select-keys (or entry {}) [:msg-id :kind :state :route :reason :session-id
+                                          :subnet-id :seq :peers-targeted :error :ts-ms]))]
+    (if (<= (fressian/count-bytes (fressian/utf8->bytes (pr-str base))) delivery-ring-max-entry-bytes)
+      base
+      (let [trimmed (cond-> (dissoc base :error)
+                      (:msg-id base) (assoc :msg-id (truncate-utf8-str (:msg-id base) 64))
+                      (:session-id base) (assoc :session-id (truncate-utf8-str (:session-id base) 64))
+                      (:subnet-id base) (assoc :subnet-id (truncate-utf8-str (:subnet-id base) 64)))]
+        (if (<= (fressian/count-bytes (fressian/utf8->bytes (pr-str trimmed))) delivery-ring-max-entry-bytes)
+          trimmed
+          {:msg-id (truncate-utf8-str (or (:msg-id base) "") 64)
+           :kind (or (:kind base) :unknown)
+           :state (or (:state base) :submitted)
+           :ts-ms (long (or (:ts-ms base) 0))})))))
+
+(defn append-delivery-ring-entry
+  "Pure helper (Pillar 1): appends a bounded <= 1 KiB sender lifecycle entry into
+   `[:delivery-telemetry :ring-buffer]`, FIFO-capped at 256 entries."
+  [state entry]
+  (let [capped (cap-ring-entry entry)
+        prev (vec (or (get-in state [:delivery-telemetry :ring-buffer]) []))
+        next-ring (let [r (conj prev capped)]
+                    (if (> (count r) delivery-ring-max-entries)
+                      (subvec r (- (count r) delivery-ring-max-entries))
+                      r))]
+    (assoc-in state [:delivery-telemetry :ring-buffer] next-ring)))
+
+(defn record-eviction
+  "Pure helper (Pillar 1 & 2): increments `[:delivery-telemetry :evicted-by-reason reason]`,
+   `[:diagnostics :outbox-evicted]`, and appends an `:evicted` entry to the ring buffer."
+  [state reason meta]
+  (let [norm-reason (if (contains? eviction-reasons reason) reason :expired)
+        entry (merge {:kind :direct
+                      :state :evicted
+                      :reason norm-reason}
+                     (when (map? meta) meta))]
+    (-> state
+        (update-in [:delivery-telemetry :evicted-by-reason norm-reason] (fnil inc 0))
+        (update-in [:diagnostics :outbox-evicted] (fnil inc 0))
+        (append-delivery-ring-entry entry))))
+
+(defn record-suppression
+  "Pure helper (Pillar 3): increments closed-enum `[:delivery-telemetry :received-but-not-emitted reason]`
+   and `[:diagnostics :received-but-not-emitted]`."
+  ([state reason]
+   (record-suppression state reason 1))
+  ([state reason delta]
+   (let [norm-reason (if (contains? suppression-reasons reason) reason :admission-drop)
+         d (long (or delta 1))]
+     (if (pos? d)
+       (-> state
+           (update-in [:delivery-telemetry :received-but-not-emitted norm-reason] (fnil + 0) d)
+           (update-in [:diagnostics :received-but-not-emitted] (fnil + 0) d))
+       state))))
+
+(defn record-broadcast-seen
+  "Pure helper (e2-micro bound): records `dedup-key` into bounded 1024-entry FIFO `:broadcast-seen`."
+  [state dedup-key]
+  (let [seen (or (:broadcast-seen state) #{})]
+    (if (contains? seen dedup-key)
+      state
+      (let [order0 (let [o (:broadcast-seen-order state)]
+                     (if (vector? o)
+                       o
+                       (vec seen)))
+            order1 (conj order0 dedup-key)
+            seen1 (conj seen dedup-key)]
+        (if (> (count order1) broadcast-seen-max-entries)
+          (let [overflow (- (count order1) broadcast-seen-max-entries)
+                evicted (subvec order1 0 overflow)
+                kept-order (subvec order1 overflow)
+                kept-seen (apply disj seen1 evicted)]
+            (assoc state
+                   :broadcast-seen kept-seen
+                   :broadcast-seen-order kept-order))
+          (assoc state
+                 :broadcast-seen seen1
+                 :broadcast-seen-order order1))))))
+
+(defn append-bounded-inbox
+  "Pure helper (e2-micro bound): appends `item` to inbox vector capped at `inbox-max-entries`."
+  [items item]
+  (let [v (conj (vec (or items [])) item)]
+    (if (> (count v) inbox-max-entries)
+      (subvec v (- (count v) inbox-max-entries))
+      v)))
+
+(defn compute-unacked-aged-count
+  "Pure helper (Pillar 2): counts unacked outbox entries across all sessions whose age
+   `(now-ms - created-ms) >= threshold-ms` (default 60000 ms). Never uses `:epoch`."
+  ([state now-ms]
+   (compute-unacked-aged-count state now-ms (or (:unacked-age-threshold-ms state)
+                                                default-unacked-age-threshold-ms)))
+  ([state now-ms threshold-ms]
+   (let [now (long (or now-ms 0))
+         thresh (max 1 (long (or threshold-ms default-unacked-age-threshold-ms)))]
+     (if-not (pos? now)
+       0
+       (reduce
+        (fn [cnt [_ sess]]
+          (let [outbox (or (:outbox sess) {})]
+            (+ cnt
+               (count (filter (fn [entry]
+                                (let [created (long (or (:created-ms entry) (:sent-at-ms entry) 0))]
+                                  (and (pos? created)
+                                       (>= (- now created) thresh))))
+                              (if (map? outbox) (vals outbox) outbox))))))
+        0
+        (:sessions state))))))
+
+(defn detect-relay-broadcast-gap
+  "Pure helper (Catch 4): detects evicted relay broadcast ring-buffer slots when a peer's
+   local cursor for `relay-id` is strictly below `min-available-broadcast-seq` (and local-cursor > 0)
+   or when a relay failover gap is observed. Emits counted `:diagnose` `{:reason :broadcast-gap-detected}`."
+  [state {:keys [relay-id local-cursor min-available-broadcast-seq last-broadcast-seq]}]
+  (let [rid (str (or relay-id "default"))
+        prev-cursor (long (or local-cursor (get-in state [:relay-cursors rid :broadcast-seq]) 0))
+        min-avail (long (or min-available-broadcast-seq 0))
+        last-bseq (long (or last-broadcast-seq prev-cursor))
+        gap? (and (pos? prev-cursor)
+                  (pos? min-avail)
+                  (< prev-cursor (dec min-avail)))
+        ;; Also detect if min-avail > prev-cursor + 1 OR if prev-cursor < min-avail when min-avail > 1
+        strict-gap? (or gap?
+                        (and (pos? prev-cursor)
+                             (> min-avail 1)
+                             (< prev-cursor min-avail)))
+        updated-cursor (max prev-cursor last-bseq)
+        st1 (assoc-in state [:relay-cursors rid :broadcast-seq] updated-cursor)]
+    (if strict-gap?
+      (let [missed (max 1 (- min-avail prev-cursor))
+            diag-evt {"event" "diagnostic"
+                      "reason" "broadcast-gap-detected"
+                      "relay_id" rid
+                      "local_cursor" prev-cursor
+                      "min_available_broadcast_seq" min-avail
+                      "missed_slots" missed}
+            st2 (-> st1
+                    (update-in [:diagnostics :broadcast-gap-detected] (fnil inc 0))
+                    (enqueue-actionable-events [diag-evt]))]
+        {:state st2
+         :gap-detected? true
+         :missed-slots missed
+         :stdout-events [diag-evt]})
+      {:state st1
+       :gap-detected? false
+       :missed-slots 0
+       :stdout-events []})))
+
+(def waitable-event-types
+  "Unified set of incoming asynchronous event types eligible to wake `wait-event`."
+  #{"message-received" "offer-received" "channel-opened" "session-established"
+    "rendezvous-header-received" "rendezvous-reveal-received"
+    "p2p-offer-received" "p2p-connected" "broadcast-received"})
+
+(defn classify-wait-filter-drop-reason
+  "Pure helper (Catch 4 / Pillar 3): returns `nil` if `evt` satisfies `opts`, or the exact
+   closed-enum suppression keyword from `suppression-reasons` explaining why it was not emitted."
+  [evt opts]
+  (if-not (map? evt)
+    :admission-drop
+    (let [ev-type (or (safe-map-get evt "event") (some-> (safe-map-get evt :event) name))
+          enforce-type? (if (contains? opts :enforce-waitable-type?)
+                          (boolean (:enforce-waitable-type? opts))
+                          true)
+          target-cursor (when-let [c (or (:cursor opts) (get opts "cursor"))]
+                          (parse-long-safe c nil))
+          ev-eid (parse-long-safe (or (safe-map-get evt "event_id")
+                                      (safe-map-get evt :event-id)
+                                      (safe-map-get evt "eid")
+                                      (safe-map-get evt :eid))
+                                  nil)
+          target-sid (or (:session-id opts) (get opts "session_id") (get opts "session-id"))
+          ev-sid (or (safe-map-get evt "session_id") (safe-map-get evt "session-id")
+                     (safe-map-get evt :session-id) (safe-map-get evt :session_id))
+          target-subnet (or (:subnet-id opts) (:subnet opts) (get opts "subnet_id") (get opts "subnet-id"))
+          ev-subnet (or (safe-map-get evt "subnet_id") (safe-map-get evt "subnet-id")
+                        (safe-map-get evt :subnet-id) (safe-map-get evt :subnet_id))
+          net-uri (or (:network-uri opts) "devnet.bitecho.org")
+          min-seq (when-let [ms (or (:min-seq opts) (get opts "min_seq") (get opts "min-seq"))]
+                    (parse-long-safe ms nil))
+          ev-seq (parse-long-safe (or (safe-map-get evt "seq") (safe-map-get evt :seq)) nil)
+          min-bseq (when-let [mb (or (:min-broadcast-seq opts) (get opts "min_broadcast_seq") (get opts "min-broadcast-seq"))]
+                     (parse-long-safe mb nil))
+          ev-bseq (parse-long-safe (or (safe-map-get evt "broadcast_seq")
+                                       (safe-map-get evt "broadcast-seq")
+                                       (safe-map-get evt :broadcast-seq)
+                                       (safe-map-get evt :broadcast_seq))
+                                   nil)
+          after-ts (when-let [at (or (:after-ts opts) (get opts "after_ts") (get opts "after-ts"))]
+                     (parse-long-safe at nil))
+          ev-ts (parse-long-safe (or (safe-map-get evt "timestamp_ms")
+                                     (safe-map-get evt :timestamp-ms)
+                                     (safe-map-get evt :timestamp_ms))
+                                 0)]
+      (cond
+        (and enforce-type? (not (contains? waitable-event-types ev-type)))
+        :event-type-mismatch
+
+        (and (some? target-cursor) (or (nil? ev-eid) (<= (long ev-eid) (long target-cursor))))
+        :cursor-skip
+
+        (and (some? target-sid) (not= (str ev-sid) (str target-sid)))
+        :session-mismatch
+
+        (and (some? target-subnet)
+             (not (and (some? ev-subnet)
+                       (or (= (str ev-subnet) (str target-subnet))
+                           (config/equivalent-subnet-id? (str ev-subnet) (str target-subnet) net-uri)))))
+        :subnet-mismatch
+
+        (and (some? min-seq)
+             (let [eff-seq (if (and (nil? ev-seq) (nil? target-cursor) (true? (:allow-eid-fallback-for-min-seq? opts)))
+                             ev-eid
+                             ev-seq)]
+               (or (nil? eff-seq) (< (long eff-seq) (long min-seq)))))
+        :min-seq-filter
+
+        (and (some? min-bseq)
+             (or (nil? ev-bseq) (< (long ev-bseq) (long min-bseq))))
+        :min-broadcast-seq-filter
+
+        (and (some? after-ts) (<= (long (or ev-ts 0)) (long after-ts)))
+        :after-ts-filter
+
+        :else nil))))
+
+(defn event-matches-wait-filter?
+  "Unified pure predicate (Catch 4) checking whether an emitted JSON event map satisfies
+   a `wait-event` or `ctl wait` filter, supporting `broadcast_seq` and `config/equivalent-subnet-id?`."
+  [evt opts]
+  (nil? (classify-wait-filter-drop-reason evt opts)))
+
 (defn retransmit-unacked-outbox
   "Pure helper. Collects unacknowledged outbox entries for session `sid` in oldest-first order.
    If rto-ms is positive, filters to entries where (now-ms - last-sent-ms) >= rto-ms.
    If rto-ms is 0 or nil (e.g. on reconnect), retransmits all unacked outbox entries.
-   When an entry has >= 5 retries, evicts it from :outbox, increments :outbox-evicted diagnostic,
-   and emits an actionable diagnostic event.
-   For eligible entries with < 5 retries, increments :retries, updates :last-sent-ms to now-ms,
-   and re-emits original msg-payload tagged with :p2p-direct? true (if P2P is connected)
-   or original gossip-env, preserving the original seq without re-minting.
+   When all transports are disconnected (`:connected? false` and P2P closed), pauses retry aging
+   so entries do not burn retries while offline.
+   When an entry has >= 5 retries, evicts it from :outbox, records `:retries-exhausted` in
+   `delivery-telemetry`, increments `:outbox-evicted` diagnostic, and emits an actionable event.
    Returns {:state updated-state :net-envelopes retransmitted-envs :stdout-events evts :count count}."
   ([state sid]
-   (retransmit-unacked-outbox state sid (:epoch state 0) 0 nil))
+   (retransmit-unacked-outbox state sid 0 0 nil))
   ([state sid now-ms rto-ms]
    (retransmit-unacked-outbox state sid now-ms rto-ms nil))
   ([state sid now-ms rto-ms privkey-bytes]
-   (let [sess (get-in state [:sessions sid])]
-     (if-not sess
+   (let [sess (get-in state [:sessions sid])
+         p2p-open? (true? (get-in sess [:p2p :connected?]))
+         all-disconnected? (and (false? (:connected? state)) (not p2p-open?))]
+     (cond
+       (not sess)
        {:state state :net-envelopes [] :stdout-events [] :count 0}
+
+       all-disconnected?
+       {:state state :net-envelopes [] :stdout-events [] :count 0 :paused? true}
+
+       :else
        (let [outbox-raw (get sess :outbox {})
              outbox (if (map? outbox-raw)
                       outbox-raw
@@ -2945,12 +3278,12 @@
              order (get sess :outbox-order (vec (sort (keys outbox))))
              now (long (or now-ms 0))
              rto (when rto-ms (long rto-ms))
-             p2p-open? (true? (get-in sess [:p2p :connected?]))
              sorted-entries (mapv (fn [sq] (get outbox sq)) (sort order))
              initial-acc {:outbox outbox
                           :order order
                           :retransmit-envs []
                           :events []
+                          :evicted-entries []
                           :evicted-count 0}
              res (reduce
                   (fn [acc entry]
@@ -2973,12 +3306,15 @@
                                              :seq sq
                                              "msg_id" msg-id
                                              :msg_id msg-id
+                                             "reason" "retries-exhausted"
+                                             :reason "retries-exhausted"
                                              "retries" retries
                                              :retries retries}]
                               (-> acc
                                   (update :outbox dissoc sq)
                                   (update :order (fn [ord] (filterv #(not= % sq) ord)))
                                   (update :events conj evict-evt)
+                                  (update :evicted-entries conj {:msg-id msg-id :session-id sid :seq sq :ts-ms now})
                                   (update :evicted-count inc)))
                             ;; Retransmit entry (< 5 retries)
                             (let [raw-env (or (:gossip-env entry) (:env entry))
@@ -3035,15 +3371,17 @@
              all-events (cond-> (:events res)
                           p2p-disconn-evt (conj p2p-disconn-evt))
              st'' (if (pos? (:evicted-count res))
-                    (cond-> (-> st'
-                                (update-in [:diagnostics :outbox-evicted] (fnil + 0) (:evicted-count res))
-                                (update-in [:sessions sid :outbox-evicted] (fnil + 0) (:evicted-count res)))
-                      p2p-open?
-                      (-> (assoc-in [:sessions sid :p2p :connected?] false)
-                          (assoc-in [:sessions sid :p2p :zero-burn?] false)
-                          (assoc-in [:sessions sid :p2p :phase] :closed)
-                          (assoc-in [:sessions sid :p2p :error] "ack-timeout")
-                          (assoc-in [:sessions sid :p2p-meta :reconnect-needed?] true)))
+                    (let [st-rec (reduce (fn [s ev-meta]
+                                           (record-eviction s :retries-exhausted ev-meta))
+                                         (update-in st' [:sessions sid :outbox-evicted] (fnil + 0) (:evicted-count res))
+                                         (:evicted-entries res))]
+                      (cond-> st-rec
+                        p2p-open?
+                        (-> (assoc-in [:sessions sid :p2p :connected?] false)
+                            (assoc-in [:sessions sid :p2p :zero-burn?] false)
+                            (assoc-in [:sessions sid :p2p :phase] :closed)
+                            (assoc-in [:sessions sid :p2p :error] "ack-timeout")
+                            (assoc-in [:sessions sid :p2p-meta :reconnect-needed?] true))))
                     st')
              st-final (if (seq all-events)
                         (enqueue-actionable-events st'' all-events)
@@ -3194,21 +3532,35 @@
                 (and (pos? burn) (some? (:balance acct)))
                 (update-in [:account :balance] - burn))})))
 
-(defn- exec-broadcast [state cmd-map privkey-bytes]
+(defn prepare-broadcast
+  "Pure two-phase broadcast preparation (BIP-020 Catch 1 & 2).
+   Signs wire broadcast payload with ZERO route metadata inside wire bytes (N-1 compatible).
+   NEVER returns `ok: true` or `mesh_submitted: true` prior to shell transport confirmation via
+   `commit-delivery-outcome`."
+  [state cmd-map privkey-bytes]
   (let [raw-text (or (get cmd-map "text") (get cmd-map "message") (:text cmd-map) (:message cmd-map))
         text (when (some? raw-text) (str raw-text))]
     (if (or (nil? text) (str/blank? text))
-      {:state state :response {"ok" false "error" "empty-payload"} :net-envelopes [] :stdout-events []}
+      {:ok? false
+       :state state
+       :response {"ok" false "error" "empty-payload" "mesh_submitted" false "p2p" false "peers_targeted" 0}
+       :net-envelopes []
+       :stdout-events []}
       (let [burn-amt (max 0 (long (or (parse-long-safe (or (get cmd-map "burn") (:burn cmd-map)) 0) 0)))
             burn-chk (check-and-deduct-burn state burn-amt)]
         (if-not (:ok? burn-chk)
-          {:state state :response {"ok" false "error" (:error burn-chk)} :net-envelopes [] :stdout-events []}
+          {:ok? false
+           :state state
+           :response {"ok" false "error" (:error burn-chk) "mesh_submitted" false "p2p" false "peers_targeted" 0}
+           :net-envelopes []
+           :stdout-events []}
           (let [st-after-burn (:state burn-chk)
                 sub-id (str (or (get cmd-map "subnet_id") (get cmd-map "subnet-id") (:subnet-id cmd-map) (:subnet-id state) "global"))
                 sender (normalize-pubkey-hex (:pubkey state))
                 next-seq (inc (long (or (:broadcast-seq state) 0)))
                 msg-id (compute-broadcast-msg-id sub-id sender next-seq text)
                 epoch (long (or (:epoch state) 0))
+                now-ms (long (or (parse-long-safe (or (get cmd-map "now_ms") (:now-ms cmd-map)) nil) 0))
                 explicit-dac (or (get cmd-map "dac") (:dac cmd-map))
                 dac (or explicit-dac
                         (when-let [d (:dac state)]
@@ -3221,6 +3573,7 @@
                 sig-str (canonical-broadcast-str sub-id sender next-seq msg-id text epoch dac-id)
                 sig-bytes (crypto/sign privkey-bytes (fressian/utf8->bytes sig-str))
                 sig-hex (if (string? sig-bytes) sig-bytes (basalt/bytes->hex sig-bytes))
+                ;; N-1 wire invariant: ZERO route metadata inside signed wire payload
                 payload (cond-> {:protocol-version current-wire-version
                                  :wire-format current-wire-format
                                  :subnet-id sub-id
@@ -3240,11 +3593,9 @@
                 env (assoc (dissoc raw-env :p2p-direct? :p2p-peer :p2p-session-id)
                            :p2p-broadcast? true
                            :mesh-broadcast? true)
-                peers-targeted (max 1 (count (or (:home-set st-after-burn)
-                                                 (:bootstrap-peers st-after-burn)
-                                                 [])))
                 dedup-key [sender next-seq msg-id]
-                b-entry {:from sender
+                b-entry {:type :broadcast
+                         :from sender
                          :seq next-seq
                          :msg-id msg-id
                          :msg_id msg-id
@@ -3257,41 +3608,80 @@
                          :broadcast? true
                          :self true
                          "self" true}
+                intent {:kind :broadcast
+                        :msg-id msg-id
+                        :subnet-id sub-id
+                        :seq next-seq
+                        :burn burn-amt
+                        :zero-burn? (zero? burn-amt)
+                        :ts-ms now-ms}
                 new-state (-> st-after-burn
                               (assoc :broadcast-seq next-seq)
-                              (update :broadcast-seen (fnil conj #{}) dedup-key)
-                              (update :broadcast-inbox (fnil conj []) b-entry))]
-            {:state new-state
-             :response {"ok" true
+                              (record-broadcast-seen dedup-key)
+                              (update :broadcast-inbox append-bounded-inbox b-entry)
+                              (append-delivery-ring-entry {:msg-id msg-id
+                                                           :kind :broadcast
+                                                           :state :submitted
+                                                           :subnet-id sub-id
+                                                           :seq next-seq
+                                                           :ts-ms now-ms}))]
+            {:ok? true
+             :state new-state
+             :fanout-intent intent
+             :response {"ok" false
+                        "pending" true
+                        "status" "prepared"
                         "subnet_id" sub-id
                         "seq" next-seq
                         "msg_id" msg-id
                         "burn" burn-amt
                         "zero_burn" (zero? burn-amt)
                         "p2p" false
-                        "mesh_submitted" true
-                        "peers_targeted" peers-targeted
-                        "fanout" {"route" "mesh"
-                                  "mesh_submitted" true
+                        "p2p_direct" false
+                        "mesh_submitted" false
+                        "peers_targeted" 0
+                        "fanout" {"route" "pending"
+                                  "mesh_submitted" false
                                   "p2p_direct" false
-                                  "peers_targeted" peers-targeted}}
+                                  "peers_targeted" 0}}
              :net-envelopes [env]
              :stdout-events []}))))))
 
-(defn- exec-send [state cmd-map privkey-bytes]
+(defn prepare-send
+  "Pure two-phase sealed send preparation (BIP-020 Catch 1).
+   Requires explicit wall-clock `now_ms` (never falls back to `:epoch`).
+   NEVER returns `ok: true` or `mesh_submitted: true` prior to shell transport confirmation via
+   `commit-delivery-outcome`."
+  [state cmd-map privkey-bytes]
   (let [resolved-sid (resolve-session-id state cmd-map :open)]
     (cond
       (and (map? resolved-sid) (false? (:ok? resolved-sid)))
-      {:state state :response {"ok" false "error" (:error resolved-sid) "matches" (:matches resolved-sid)} :net-envelopes [] :stdout-events []}
+      {:ok? false
+       :state state
+       :response {"ok" false "error" (:error resolved-sid) "matches" (:matches resolved-sid)
+                  "mesh_submitted" false "p2p" false "peers_targeted" 0}
+       :net-envelopes []
+       :stdout-events []}
 
       (nil? resolved-sid)
-      {:state state :response {"ok" false "error" "session-not-open"} :net-envelopes [] :stdout-events []}
+      {:ok? false
+       :state (record-eviction state :session-not-open {:ts-ms (long (or (parse-long-safe (or (get cmd-map "now_ms") (:now-ms cmd-map)) nil) 0))})
+       :response {"ok" false "error" "session-not-open"
+                  "mesh_submitted" false "p2p" false "peers_targeted" 0}
+       :net-envelopes []
+       :stdout-events []}
 
       :else
       (let [session-id resolved-sid
             session (get-in state [:sessions session-id])]
         (if-not (and session (= "open" (:state session)))
-          {:state state :response {"ok" false "error" "session-not-open"} :net-envelopes [] :stdout-events []}
+          {:ok? false
+           :state (record-eviction state :session-not-open {:session-id session-id
+                                                            :ts-ms (long (or (parse-long-safe (or (get cmd-map "now_ms") (:now-ms cmd-map)) nil) 0))})
+           :response {"ok" false "error" "session-not-open"
+                      "mesh_submitted" false "p2p" false "peers_targeted" 0}
+           :net-envelopes []
+           :stdout-events []}
           (let [pname (pubkey->petname state (:peer session))
                 text (or (get cmd-map "text") (get cmd-map "message")
                          (:text cmd-map) (:message cmd-map))
@@ -3301,7 +3691,12 @@
                                     (some? payload-hex) (basalt/hex->bytes payload-hex)
                                     :else empty-bytes)]
             (if (zero? (fressian/count-bytes payload-bytes))
-              {:state state :response {"ok" false "error" "empty-payload"} :net-envelopes [] :stdout-events []}
+              {:ok? false
+               :state state
+               :response {"ok" false "error" "empty-payload"
+                          "mesh_submitted" false "p2p" false "peers_targeted" 0}
+               :net-envelopes []
+               :stdout-events []}
               (let [p2p-open? (true? (get-in session [:p2p :connected?]))
                     burn-amt (if p2p-open?
                                0
@@ -3330,7 +3725,9 @@
                     max-outbox (long (or (:max-outbox-size state) 64))
                     curr-outbox (or (:outbox session) {})
                     curr-order (or (:outbox-order session) [])
-                    sent-at (long (or (get cmd-map "now_ms") (:now-ms cmd-map) (:epoch state 0)))
+                    ;; BIP-020 Catch 1: Explicit wall-clock now_ms ONLY — NEVER fall back to :epoch!
+                    sent-at (long (or (parse-long-safe (or (get cmd-map "now_ms") (:now-ms cmd-map)) nil) 0))
+                    msg-id (or (:message-id (:event gossip-env)) "")
                     next-order (conj curr-order seq-num)
                     next-outbox (assoc curr-outbox seq-num {:seq seq-num
                                                             :msg-payload msg-payload
@@ -3340,7 +3737,7 @@
                                                             :last-sent-ms sent-at
                                                             :created-ms sent-at
                                                             :retries 0
-                                                            :msg-id (:message-id (:event gossip-env))})
+                                                            :msg-id msg-id})
                     [final-outbox final-order evicted-seqs] (if (> (count next-order) max-outbox)
                                                               (let [overflow (- (count next-order) max-outbox)
                                                                     evicted (subvec next-order 0 overflow)
@@ -3351,30 +3748,179 @@
                     diag-events (if (pos? overflow)
                                   [{"event" "diagnostic"
                                     "reason" "outbox-evicted"
+                                    "eviction_reason" "capacity-overflow"
                                     "session_id" session-id
                                     "evicted_seqs" evicted-seqs}]
                                   [])
-                    new-state (cond-> (-> state
-                                          (assoc-in [:sessions session-id :tx-seq] seq-num)
-                                          (assoc-in [:sessions session-id :outbox] final-outbox)
-                                          (assoc-in [:sessions session-id :outbox-order] final-order)
-                                          (update-in [:local-accounting :burned-ech] (fnil + 0) burn-amt))
-                                (and (pos? burn-amt) (some? (get-in state [:account :spendable])))
-                                (update-in [:account :spendable] - burn-amt)
-                                (pos? overflow)
-                                (-> (update-in [:sessions session-id :outbox-evicted] (fnil + 0) overflow)
-                                    (update-in [:sessions session-id :outbox-evicted-seqs] (fnil (fn [v sqs] (vec (take-last 64 (into (vec v) sqs)))) []) evicted-seqs)))]
-                {:state new-state
-                 :response (cond-> {"ok" true
+                    st0 (cond-> (-> state
+                                    (assoc-in [:sessions session-id :tx-seq] seq-num)
+                                    (assoc-in [:sessions session-id :outbox] final-outbox)
+                                    (assoc-in [:sessions session-id :outbox-order] final-order)
+                                    (update-in [:local-accounting :burned-ech] (fnil + 0) burn-amt)
+                                    (append-delivery-ring-entry {:msg-id msg-id
+                                                                 :kind :direct
+                                                                 :state :submitted
+                                                                 :session-id session-id
+                                                                 :subnet-id sub-id
+                                                                 :seq seq-num
+                                                                 :ts-ms sent-at}))
+                          (and (pos? burn-amt) (some? (get-in state [:account :spendable])))
+                          (update-in [:account :spendable] - burn-amt))
+                    new-state (if (pos? overflow)
+                                (let [st-ev (reduce (fn [s ev-sq]
+                                                      (record-eviction s :capacity-overflow
+                                                                       {:session-id session-id :seq ev-sq :ts-ms sent-at}))
+                                                    (-> st0
+                                                        (update-in [:sessions session-id :outbox-evicted] (fnil + 0) overflow)
+                                                        (update-in [:sessions session-id :outbox-evicted-seqs]
+                                                                   (fnil (fn [v sqs] (vec (take-last 64 (into (vec v) sqs)))) [])
+                                                                   evicted-seqs))
+                                                    evicted-seqs)]
+                                  st-ev)
+                                st0)
+                    bytes-sent (fressian/count-bytes payload-bytes)
+                    tr-label (if p2p-open?
+                               (or (get-in session [:p2p :transport])
+                                   (get-in session [:p2p-meta :preferred-transport])
+                                   "p2p")
+                               "mesh")
+                    intent (cond-> {:kind :direct
+                                    :msg-id msg-id
+                                    :session-id session-id
+                                    :subnet-id sub-id
+                                    :seq seq-num
+                                    :bytes-sent bytes-sent
+                                    :burn burn-amt
+                                    :transport tr-label
+                                    :p2p-open? p2p-open?
+                                    :ts-ms sent-at}
+                             pname (assoc :peer-petname pname))]
+                {:ok? true
+                 :state new-state
+                 :fanout-intent intent
+                 :response (cond-> {"ok" false
+                                    "pending" true
+                                    "status" "prepared"
                                     "session_id" session-id
                                     "seq" seq-num
-                                    "bytes_sent" (fressian/count-bytes payload-bytes)
+                                    "msg_id" msg-id
+                                    "bytes_sent" bytes-sent
                                     "burn" burn-amt
-                                    "transport" (if p2p-open? (or (get-in session [:p2p :transport]) (get-in session [:p2p-meta :preferred-transport]) "p2p") "mesh")
-                                    "p2p" p2p-open?}
+                                    "transport" tr-label
+                                    "p2p" false
+                                    "p2p_direct" false
+                                    "mesh_submitted" false
+                                    "peers_targeted" 0}
                              pname (assoc "peer_petname" pname))
                  :net-envelopes [gossip-env]
                  :stdout-events diag-events}))))))))
+
+(defn commit-delivery-outcome
+  "Pure shell-confirmation reducer (BIP-020 Catch 1, Pillar 1 & 2).
+   Reduces actual transport outcome (`{:mesh-submitted? :p2p-direct? :mesh-peers-targeted :p2p-peers-targeted :error :now-ms}`)
+   into confirmed response fields, delivery-telemetry counters, ring-buffer lifecycle entry,
+   and counted `:diagnose {:reason :mesh-submit-failed}` on failure."
+  [state intent outcome]
+  (let [mesh-ok? (boolean (:mesh-submitted? outcome))
+        p2p-ok? (boolean (:p2p-direct? outcome))
+        delivered? (or mesh-ok? p2p-ok?)
+        mesh-peers (long (or (:mesh-peers-targeted outcome) (if mesh-ok? 1 0)))
+        p2p-peers (long (or (:p2p-peers-targeted outcome) (if p2p-ok? 1 0)))
+        peers-targeted (+ mesh-peers p2p-peers)
+        route (cond
+                (and mesh-ok? p2p-ok?) :mesh+p2p
+                mesh-ok? :mesh
+                p2p-ok? :p2p
+                :else :none)
+        now-ms (long (or (:now-ms outcome) (:ts-ms intent) 0))
+        err-str (or (:error outcome) (when-not delivered? "mesh-submit-failed"))
+        kind (or (:kind intent) :broadcast)
+        msg-id (or (:msg-id intent) "")
+        diag-evt (when-not delivered?
+                   (cond-> {"event" "diagnostic"
+                            "reason" "mesh-submit-failed"
+                            "kind" (name kind)
+                            "msg_id" msg-id
+                            "error" (str err-str)}
+                     (:subnet-id intent) (assoc "subnet_id" (:subnet-id intent))
+                     (:session-id intent) (assoc "session_id" (:session-id intent))
+                     (:seq intent) (assoc "seq" (:seq intent))))
+        st1 (if delivered?
+              (cond-> (-> state
+                          (update-in [:delivery-telemetry :sent] (fnil inc 0))
+                          (update-in [:delivery-telemetry :fanout :peers-targeted] (fnil + 0) peers-targeted)
+                          (append-delivery-ring-entry
+                           (cond-> {:msg-id msg-id
+                                    :kind kind
+                                    :state :fanned-out
+                                    :route route
+                                    :peers-targeted peers-targeted
+                                    :ts-ms now-ms}
+                             (:subnet-id intent) (assoc :subnet-id (:subnet-id intent))
+                             (:session-id intent) (assoc :session-id (:session-id intent))
+                             (:seq intent) (assoc :seq (:seq intent)))))
+                mesh-ok? (update-in [:delivery-telemetry :fanout :mesh-submitted] (fnil inc 0))
+                p2p-ok? (update-in [:delivery-telemetry :fanout :p2p-direct] (fnil inc 0)))
+              (-> state
+                  (update-in [:delivery-telemetry :fanout :mesh-submit-failed] (fnil inc 0))
+                  (update-in [:diagnostics :mesh-submit-failed] (fnil inc 0))
+                  (update-in [:diagnostics :dropped] (fnil inc 0))
+                  (append-delivery-ring-entry
+                   (cond-> {:msg-id msg-id
+                            :kind kind
+                            :state :evicted
+                            :route :none
+                            :reason :mesh-disconnected
+                            :error (str err-str)
+                            :ts-ms now-ms}
+                     (:subnet-id intent) (assoc :subnet-id (:subnet-id intent))
+                     (:session-id intent) (assoc :session-id (:session-id intent))
+                     (:seq intent) (assoc :seq (:seq intent))))
+                  (enqueue-actionable-events [diag-evt])))
+        base-resp (cond-> {"ok" delivered?
+                           "mesh_submitted" mesh-ok?
+                           "p2p" p2p-ok?
+                           "p2p_direct" p2p-ok?
+                           "peers_targeted" peers-targeted
+                           "fanout" {"route" (name route)
+                                     "mesh_submitted" mesh-ok?
+                                     "p2p_direct" p2p-ok?
+                                     "mesh_peers_targeted" mesh-peers
+                                     "p2p_peers_targeted" p2p-peers
+                                     "peers_targeted" peers-targeted}}
+                    (:subnet-id intent) (assoc "subnet_id" (:subnet-id intent))
+                    (:session-id intent) (assoc "session_id" (:session-id intent))
+                    (:seq intent) (assoc "seq" (:seq intent))
+                    (seq msg-id) (assoc "msg_id" msg-id)
+                    (some? (:burn intent)) (assoc "burn" (:burn intent))
+                    (some? (:zero-burn? intent)) (assoc "zero_burn" (:zero-burn? intent))
+                    (some? (:bytes-sent intent)) (assoc "bytes_sent" (:bytes-sent intent))
+                    (:transport intent) (assoc "transport" (:transport intent))
+                    (:peer-petname intent) (assoc "peer_petname" (:peer-petname intent))
+                    (not delivered?) (assoc "error" (str err-str)))]
+    {:ok? delivered?
+     :state st1
+     :response base-resp
+     :stdout-events (if diag-evt [diag-evt] [])}))
+
+(defn- exec-broadcast [state cmd-map privkey-bytes]
+  (let [prep (prepare-broadcast state cmd-map privkey-bytes)]
+    (if-not (:ok? prep)
+      (dissoc prep :ok?)
+      ;; Synchronous handle-command compatibility: preserves "ok" true for pure unit callers,
+      ;; while keeping "mesh_submitted" false and "peers_targeted" 0 until shell commits outcome.
+      (assoc (dissoc prep :ok?)
+             :response (assoc (:response prep) "ok" true "pending_delivery" true)))))
+
+(defn- exec-send [state cmd-map privkey-bytes]
+  (let [prep (prepare-send state cmd-map privkey-bytes)]
+    (if-not (:ok? prep)
+      (dissoc prep :ok?)
+      (assoc (dissoc prep :ok?)
+             :response (assoc (:response prep)
+                              "ok" true
+                              "pending_delivery" true
+                              "p2p" (boolean (get-in prep [:fanout-intent :p2p-open?])))))))
 
 (defn- exec-inbox
   ([state] (exec-inbox state {}))
@@ -4348,99 +4894,133 @@
                  :net-envelopes []
                  :stdout-events []}))))))))
 
+(defn- kw-map->snake-str-map
+  [m]
+  (reduce-kv (fn [acc k v]
+               (assoc acc (str/replace (if (keyword? k) (name k) (str k)) "-" "_") v))
+             {}
+             (or m {})))
+
 (defn exec-status
-  "Pure status query returning balances, inbox counts, sessions, and diagnostics."
-  [state]
-  (let [inbox-items (or (:inbox state) [])
-        inbox-direct (count (filter (fn [m] (= (or (:type m) (get m "type")) :direct)) inbox-items))
-        inbox-broadcast-items (filter (fn [m] (= (or (:type m) (get m "type")) :broadcast)) inbox-items)
-        inbox-broadcast (count inbox-broadcast-items)
-        inbox-by-subnet (reduce (fn [acc m]
-                                  (if-let [sub (or (:subnet-id m) (:subnet m) (get m "subnet-id") (get m "subnet_id"))]
-                                    (update acc (str sub) (fnil inc 0))
-                                    acc))
-                                {}
-                                inbox-broadcast-items)
-        sessions-summary (vec (for [[_ s] (:sessions state)
-                                    :let [pname (pubkey->petname state (:peer s))]]
-                                (cond-> (select-keys s [:session-id :peer :role :state :tx-seq :epoch :acked-seq :rx-high-seq :replays-deduped :outbox-evicted])
-                                  true (assoc :unacked-count (count (:outbox s)))
-                                  pname (assoc :peer-petname pname :peer_petname pname))))
-        sessions-detail (vec (for [[sid s] (:sessions state)
-                                   :let [p2p (get s :p2p {})
-                                         connected? (boolean (or (:connected? p2p) false))
-                                         transport (or (:transport p2p) (:remote-transport p2p) (get-in s [:p2p-meta :preferred-transport]) "mesh")]]
-                               {"session_id" sid
-                                "peer" (:peer s)
-                                "status" (:state s)
-                                "p2p_connected" connected?
-                                "p2p_transport" transport
-                                "acked_seq" (long (or (:acked-seq s) 0))
-                                "unacked_count" (count (:outbox s {}))
-                                "outbox_evicted" (long (or (:outbox-evicted s) 0))}))
-        stalled? (boolean (get-in state [:auto-sync-stall-tracker :stalled?] false))
-        stall-duration-ms (long (or (get-in state [:auto-sync-stall-tracker :stall-duration-ms]) 0))
-        stalled-count (long (or (get-in state [:diagnostics :finalized-epoch-stalled]) 0))
-        resp (cond-> {"ok" true
-                      "connected" (boolean (:connected? state false))
-                      "connection_error" (:connection-error state)
-                      "auto_sync_last_error" (or (:auto-sync-last-error state)
-                                                 (get-in state [:diagnostics :auto-sync-last-error])
-                                                 (get-in state [:conn-diagnostics :auto-sync-last-error]))
-                      "stalled" stalled?
-                      "stall_duration_ms" stall-duration-ms
-                      "finalized_epoch_stalled_count" stalled-count
-                      "transport_healthy" (and (boolean (:connected? state false))
-                                               (nil? (:connection-error state)))
-                      "pubkey" (:pubkey state)
-                      "subnet_id" (or (:subnet-id state) "global")
-                      "subscribed_subnets" (vec (sort (or (:subscribed-subnets state) #{})))
-                      "autonomous" (:autonomous? state)
-                      "epoch" (:epoch state)
-                      "finalized_epoch" (long (or (get-in state [:account :finalized-epoch]) (:epoch state) 0))
-                      "balance" (long (or (get-in state [:account :balance]) 0))
-                      "spendable" (long (or (get-in state [:account :spendable]) (get-in state [:account :balance]) 0))
-                      "unread_events" (count (:event-queue state []))
-                      "sessions" sessions-summary
-                      "sessions_detail" sessions-detail
-                      "pending_offers_count" (count (:pending-offers state))
-                      "pending_rendezvous_count" (count (:pending-rendezvous state {}))
-                      "rendezvous_policy" (:rendezvous-policy state)
-                      "inbox_count" (count inbox-items)
-                      "inbox_direct_count" inbox-direct
-                      "inbox_broadcast_count" inbox-broadcast
-                      "inbox_by_subnet" inbox-by-subnet
-                      "account" (:account state)
-                      "petnames" (into (sorted-map) (:petnames state {}))
-                      "petnames_count" (count (:petnames state {}))
-                      "dac" (dac-summary (:dac state))
-                      "revoked_dacs_count" (count (:revoked-dacs state #{}))
-                      "directory_cache_count" (count (:directory-cache state {}))
-                      "escrows_count" (count (:escrows state {}))
-                      "accounting" {"scope" "local-non-consensus"
-                                    "note" "Locally computed devnet totals; never consensus finalized"
-                                    "burned_ech" (get-in state [:local-accounting :burned-ech] 0)
-                                    "vouchers_count" (count (:vouchers state []))}
-                      "wire_protocol" {"version" current-wire-version
-                                       "min_supported" min-supported-wire-version
-                                       "max_supported" max-supported-wire-version
-                                       "unsupported_dropped" (get-in state [:wire-version-diagnostics :unsupported-dropped] 0)
-                                       "last_unsupported_version" (get-in state [:wire-version-diagnostics :last-unsupported-version])
-                                       "wire_format" current-wire-format
-                                       "supported_formats" ["fressian-v1" "legacy-nippy"]
-                                       "unsupported_format_dropped" (get-in state [:wire-version-diagnostics :unsupported-format-dropped] 0)
-                                       "last_unsupported_format" (get-in state [:wire-version-diagnostics :last-unsupported-format])}}
-               (:conn-diagnostics state) (assoc "diagnostics" (:conn-diagnostics state))
-               (:mdns-hostname state) (assoc "mdns_hostname" (:mdns-hostname state))
-               (:lan-ip state) (assoc "lan_ip" (:lan-ip state))
-               (seq (:default-p2p-candidates state)) (assoc "default_p2p_candidates" (:default-p2p-candidates state)))]
-    (merge resp
-           {:state state
-            :stalled? stalled?
-            :stall-duration-ms stall-duration-ms
-            :response resp
-            :net-envelopes []
-            :stdout-events []})))
+  "Pure status query returning balances, inbox counts, sessions, merged diagnostics,
+   and BIP-020 Pillars 1-3 delivery telemetry."
+  ([state] (exec-status state nil))
+  ([state now-ms]
+   (let [inbox-items (or (:inbox state) [])
+         inbox-direct (count (filter (fn [m] (= (or (:type m) (get m "type")) :direct)) inbox-items))
+         inbox-broadcast-items (filter (fn [m] (or (= (or (:type m) (get m "type")) :broadcast)
+                                                   (true? (:broadcast? m))))
+                                       inbox-items)
+         inbox-broadcast (count inbox-broadcast-items)
+         inbox-by-subnet (reduce (fn [acc m]
+                                   (if-let [sub (or (:subnet-id m) (:subnet m) (get m "subnet-id") (get m "subnet_id"))]
+                                     (update acc (str sub) (fnil inc 0))
+                                     acc))
+                                 {}
+                                 inbox-broadcast-items)
+         sessions-summary (vec (for [[_ s] (:sessions state)
+                                     :let [pname (pubkey->petname state (:peer s))]]
+                                 (cond-> (select-keys s [:session-id :peer :role :state :tx-seq :epoch :acked-seq :rx-high-seq :replays-deduped :outbox-evicted])
+                                   true (assoc :unacked-count (count (:outbox s)))
+                                   pname (assoc :peer-petname pname :peer_petname pname))))
+         sessions-detail (vec (for [[sid s] (:sessions state)
+                                    :let [p2p (get s :p2p {})
+                                          connected? (boolean (or (:connected? p2p) false))
+                                          transport (or (:transport p2p) (:remote-transport p2p) (get-in s [:p2p-meta :preferred-transport]) "mesh")]]
+                                {"session_id" sid
+                                 "peer" (:peer s)
+                                 "status" (:state s)
+                                 "p2p_connected" connected?
+                                 "p2p_transport" transport
+                                 "acked_seq" (long (or (:acked-seq s) 0))
+                                 "unacked_count" (count (:outbox s {}))
+                                 "outbox_evicted" (long (or (:outbox-evicted s) 0))}))
+         stalled? (boolean (get-in state [:auto-sync-stall-tracker :stalled?] false))
+         stall-duration-ms (long (or (get-in state [:auto-sync-stall-tracker :stall-duration-ms]) 0))
+         stalled-count (long (or (get-in state [:diagnostics :finalized-epoch-stalled]) 0))
+         merged-diags (merge (or (:diagnostics state) {})
+                             (or (:conn-diagnostics state) {}))
+         dt (merge initial-delivery-telemetry (or (:delivery-telemetry state) {}))
+         ev-by-reason (merge (:evicted-by-reason initial-delivery-telemetry)
+                             (or (:evicted-by-reason dt) {}))
+         rx-not-emitted (merge (:received-but-not-emitted initial-delivery-telemetry)
+                               (or (:received-but-not-emitted dt) {}))
+         fanout (merge (:fanout initial-delivery-telemetry)
+                       (or (:fanout dt) {}))
+         ring-buf (vec (or (:ring-buffer dt) []))
+         eff-now (long (or now-ms (:now-ms state) 0))
+         unacked-aged (compute-unacked-aged-count state eff-now)
+         delivery-telemetry-resp {"sent" (long (or (:sent dt) 0))
+                                  "acked" (long (or (:acked dt) 0))
+                                  "unacked_aged" unacked-aged
+                                  "unacked_age_threshold_ms" (long (or (:unacked-age-threshold-ms state) default-unacked-age-threshold-ms))
+                                  "evicted_by_reason" (kw-map->snake-str-map ev-by-reason)
+                                  "received_but_not_emitted" (kw-map->snake-str-map rx-not-emitted)
+                                  "fanout" (kw-map->snake-str-map fanout)
+                                  "ring_buffer_count" (count ring-buf)
+                                  "ring_buffer_max" delivery-ring-max-entries}
+         resp (cond-> {"ok" true
+                       "connected" (boolean (:connected? state false))
+                       "connection_error" (:connection-error state)
+                       "auto_sync_last_error" (or (:auto-sync-last-error state)
+                                                  (get-in state [:diagnostics :auto-sync-last-error])
+                                                  (get-in state [:conn-diagnostics :auto-sync-last-error]))
+                       "stalled" stalled?
+                       "stall_duration_ms" stall-duration-ms
+                       "finalized_epoch_stalled_count" stalled-count
+                       "transport_healthy" (and (boolean (:connected? state false))
+                                                (nil? (:connection-error state)))
+                       "pubkey" (:pubkey state)
+                       "subnet_id" (or (:subnet-id state) "global")
+                       "subscribed_subnets" (vec (sort (or (:subscribed-subnets state) #{})))
+                       "autonomous" (:autonomous? state)
+                       "epoch" (:epoch state)
+                       "finalized_epoch" (long (or (get-in state [:account :finalized-epoch]) (:epoch state) 0))
+                       "balance" (long (or (get-in state [:account :balance]) 0))
+                       "spendable" (long (or (get-in state [:account :spendable]) (get-in state [:account :balance]) 0))
+                       "unread_events" (count (:event-queue state []))
+                       "sessions" sessions-summary
+                       "sessions_detail" sessions-detail
+                       "pending_offers_count" (count (:pending-offers state))
+                       "pending_rendezvous_count" (count (:pending-rendezvous state {}))
+                       "rendezvous_policy" (:rendezvous-policy state)
+                       "inbox_count" (count inbox-items)
+                       "inbox_direct_count" inbox-direct
+                       "inbox_broadcast_count" inbox-broadcast
+                       "inbox_by_subnet" inbox-by-subnet
+                       "account" (:account state)
+                       "petnames" (into (sorted-map) (:petnames state {}))
+                       "petnames_count" (count (:petnames state {}))
+                       "dac" (dac-summary (:dac state))
+                       "revoked_dacs_count" (count (:revoked-dacs state #{}))
+                       "directory_cache_count" (count (:directory-cache state {}))
+                       "escrows_count" (count (:escrows state {}))
+                       "delivery_telemetry" delivery-telemetry-resp
+                       "accounting" {"scope" "local-non-consensus"
+                                     "note" "Locally computed devnet totals; never consensus finalized"
+                                     "burned_ech" (get-in state [:local-accounting :burned-ech] 0)
+                                     "vouchers_count" (count (:vouchers state []))}
+                       "wire_protocol" {"version" current-wire-version
+                                        "min_supported" min-supported-wire-version
+                                        "max_supported" max-supported-wire-version
+                                        "unsupported_dropped" (get-in state [:wire-version-diagnostics :unsupported-dropped] 0)
+                                        "last_unsupported_version" (get-in state [:wire-version-diagnostics :last-unsupported-version])
+                                        "wire_format" current-wire-format
+                                        "supported_formats" ["fressian-v1" "legacy-nippy"]
+                                        "unsupported_format_dropped" (get-in state [:wire-version-diagnostics :unsupported-format-dropped] 0)
+                                        "last_unsupported_format" (get-in state [:wire-version-diagnostics :last-unsupported-format])}}
+                (seq merged-diags) (assoc "diagnostics" merged-diags)
+                (contains? state :events-out) (assoc "events_out" (:events-out state))
+                (:mdns-hostname state) (assoc "mdns_hostname" (:mdns-hostname state))
+                (:lan-ip state) (assoc "lan_ip" (:lan-ip state))
+                (seq (:default-p2p-candidates state)) (assoc "default_p2p_candidates" (:default-p2p-candidates state)))]
+     (merge resp
+            {:state state
+             :stalled? stalled?
+             :stall-duration-ms stall-duration-ms
+             :response resp
+             :net-envelopes []
+             :stdout-events []}))))
 
 ;; -----------------------------------------------------------------------------
 ;; Actionable Event Queue & Shuttle Verbs (A2, A2a, F-Bb-6)
@@ -4482,13 +5062,19 @@
           q (conj (vec (or (:event-queue state) [])) tagged)
           overflow? (> (count q) max-q)
           dropped (if overflow? (- (count q) max-q) 0)
-          trimmed-q (if overflow? (subvec q dropped) q)]
+          trimmed-q (if overflow? (subvec q dropped) q)
+          hist0 (conj (vec (or (:event-history state) [])) tagged)
+          trimmed-hist (if (> (count hist0) max-q)
+                         (subvec hist0 (- (count hist0) max-q))
+                         hist0)]
       (-> state
           (assoc :last-event-id next-id)
           (assoc :event-queue trimmed-q)
+          (assoc :event-history trimmed-hist)
           (cond-> overflow?
             (-> (update-in [:diagnostics :event-queue-overflow] (fnil + 0) dropped)
-                (update-in [:diagnostics :dropped] (fnil + 0) dropped)))))
+                (update-in [:diagnostics :dropped] (fnil + 0) dropped)
+                (record-suppression :queue-overflow dropped)))))
     state))
 
 (defn enqueue-actionable-events
@@ -4497,10 +5083,11 @@
   (reduce tag-and-enqueue-event state events))
 
 (defn exec-wait
-  "Pure reducer for 'wait' command. Pops actionable events from :event-queue,
-   optionally filtered by min_seq or cursor. Advances event-ack cursor.
-   When block is true and queue is empty, returns timeout: true.
-   When peek is true, returns eligible unread events without advancing cursor or mutating :event-queue."
+  "Pure reducer for 'wait' command (BIP-020 Catch 4).
+   Separates global `event_id` cursor from per-stream `seq`/`broadcast_seq`, supports
+   `subnet_id`, `session_id`, `min_seq`, `min_broadcast_seq`, `after_ts`, and non-destructive
+   cursor-based reads so concurrent/reconnecting watchers never lose events.
+   Counts every suppressed event in `received_but_not_emitted`."
   [state cmd-map]
   (let [peek? (or (true? (get cmd-map "peek"))
                   (true? (:peek cmd-map))
@@ -4508,23 +5095,52 @@
         block? (or (true? (get cmd-map "block"))
                    (true? (:block cmd-map))
                    (= (get cmd-map "block") "true"))
+        non-destructive? (or (contains? cmd-map "cursor")
+                             (contains? cmd-map :cursor)
+                             (true? (get cmd-map "non_destructive"))
+                             (true? (:non-destructive cmd-map)))
         req-cursor (when-let [c (or (get cmd-map "cursor") (:cursor cmd-map))]
-                     (long c))
+                     (parse-long-safe c nil))
         min-seq (when-let [ms (or (get cmd-map "min_seq") (get cmd-map "min-seq") (:min-seq cmd-map))]
-                  (long ms))
-        threshold (or req-cursor (when min-seq (dec min-seq)))
-        raw-q (vec (or (:event-queue state) []))
-        eligible-evs (if threshold
-                       (filterv (fn [ev]
-                                  (let [eid (long (or (get ev "event_id") (:event-id ev) (get ev "eid") (:eid ev) 0))
-                                        s   (long (or (get ev "seq") (:seq ev) 0))]
-                                    (or (> eid threshold) (> s threshold))))
-                                raw-q)
-                       raw-q)
-        cursor (long (or (:event-ack-cursor state) 0))]
+                  (parse-long-safe ms nil))
+        min-bseq (when-let [mb (or (get cmd-map "min_broadcast_seq") (get cmd-map "min-broadcast-seq") (:min-broadcast-seq cmd-map))]
+                   (parse-long-safe mb nil))
+        sub-filter (or (get cmd-map "subnet_id") (get cmd-map "subnet-id") (:subnet-id cmd-map) (:subnet cmd-map))
+        sid-filter (or (get cmd-map "session_id") (get cmd-map "session-id") (:session-id cmd-map))
+        after-ts (when-let [at (or (get cmd-map "after_ts") (get cmd-map "after-ts") (:after-ts cmd-map))]
+                   (parse-long-safe at nil))
+        net-uri (or (:network-uri state)
+                    (config/resolve-network-uri (:bootstrap state))
+                    "devnet.bitecho.org")
+        filter-opts {:enforce-waitable-type? false
+                     :cursor req-cursor
+                     :session-id sid-filter
+                     :subnet-id sub-filter
+                     :network-uri net-uri
+                     :min-seq min-seq
+                     :min-broadcast-seq min-bseq
+                     :after-ts after-ts
+                     :allow-eid-fallback-for-min-seq? (not non-destructive?)}
+        has-filter? (or (some? req-cursor) (some? min-seq) (some? min-bseq)
+                        (some? sub-filter) (some? sid-filter) (some? after-ts))
+        raw-q (if non-destructive?
+                (let [hist (vec (or (:event-history state) []))]
+                  (if (seq hist) hist (vec (or (:event-queue state) []))))
+                (vec (or (:event-queue state) [])))
+        [eligible-evs drop-reasons]
+        (if has-filter?
+          (reduce (fn [[matched drops] ev]
+                    (if-let [reason (classify-wait-filter-drop-reason ev filter-opts)]
+                      [matched (conj drops reason)]
+                      [(conj matched ev) drops]))
+                  [[] []]
+                  raw-q)
+          [raw-q []])
+        st-counted (reduce (fn [s r] (record-suppression s r 1)) state drop-reasons)
+        cursor (long (or (:event-ack-cursor st-counted) 0))]
     (if peek?
       (let [resp {"ok" true "events" eligible-evs "cursor" cursor "peek" true}]
-        (merge resp {:state state :response resp :net-envelopes [] :stdout-events []}))
+        (merge resp {:state st-counted :response resp :net-envelopes [] :stdout-events []}))
       (if (seq eligible-evs)
         (let [norm-evs (mapv (fn [ev]
                                (let [eid (or (get ev "event_id") (:event-id ev) (get ev "eid") (:eid ev))]
@@ -4534,20 +5150,18 @@
               last-ev (last norm-evs)
               last-id (long (or (get last-ev "event_id") (:event-id last-ev) (get last-ev "eid") (:eid last-ev) (count norm-evs)))
               new-cursor (max cursor last-id)
-              remaining (if req-cursor
-                          (filterv (fn [ev]
-                                     (let [eid (long (or (get ev "event_id") (:event-id ev) (get ev "eid") (:eid ev) 0))]
-                                       (and (not (contains? (set eligible-evs) ev))
-                                            (> eid req-cursor))))
-                                   raw-q)
-                          (filterv (fn [ev] (not (contains? (set eligible-evs) ev))) raw-q))
-              new-state (assoc state :event-queue remaining :event-ack-cursor new-cursor)
+              new-state (if non-destructive?
+                          (assoc st-counted :event-ack-cursor new-cursor)
+                          (let [matched-set (set eligible-evs)
+                                remaining (filterv (fn [ev] (not (contains? matched-set ev)))
+                                                   (vec (or (:event-queue st-counted) [])))]
+                            (assoc st-counted :event-queue remaining :event-ack-cursor new-cursor)))
               resp {"ok" true "events" norm-evs "cursor" new-cursor}]
           (merge resp {:state new-state :response resp :net-envelopes [] :stdout-events []}))
         (let [resp (cond-> {"ok" true "events" [] "cursor" cursor}
                      block? (assoc "timeout" true)
                      (not block?) (assoc "park" true))]
-          (merge resp {:state state :response resp :net-envelopes [] :stdout-events []}))))))
+          (merge resp {:state st-counted :response resp :net-envelopes [] :stdout-events []}))))))
 
 (defn verify-and-strip-chunk-prefixes
   "Verifies per-chunk 8-char SHA-256 checksums if declared, returning:
@@ -7005,7 +7619,8 @@
                         ack-env (build-session-ack-envelope state session-id (:sender msg) new-contiguous (:seq msg) seen-seqs privkey-bytes)
                         text (try (fressian/bytes->utf8 decrypted) (catch #?(:clj Exception :cljs :default) _ nil))
                         sender-pname (pubkey->petname state (:sender msg))
-                        inbox-item {:session-id session-id
+                        inbox-item {:type :direct
+                                    :session-id session-id
                                     :session_id session-id
                                     :from (:sender msg)
                                     :seq (:seq msg)
@@ -7018,7 +7633,7 @@
                                             :contiguous-rx-seq new-contiguous)
                         new-state (-> state
                                       (assoc-in [:sessions session-id] updated-sess)
-                                      (update :inbox (fnil conj []) inbox-item))
+                                      (update :inbox append-bounded-inbox inbox-item))
                         event (cond-> {"event" "message-received"
                                        "session_id" session-id
                                        "from" (:sender msg)
@@ -7033,11 +7648,13 @@
               (let [ct (try (basalt/hex->bytes (:ciphertext msg)) (catch #?(:clj Exception :cljs :default) _ nil))
                     decrypted (when ct (sealed/open-message (:rx-key session) (:seq msg) ct (fressian/utf8->bytes session-id) (:suite session) (:suite msg)))]
                 (if-not decrypted
-                  {:state state :net-envelopes [] :stdout-events []}
+                  {:state (record-suppression state :admission-drop) :net-envelopes [] :stdout-events []}
                   (let [contig (:contiguous-rx-seq session 0)
                         seen-seqs (vec (sort (:seen (:replay-window session))))
                         ack-env (build-session-ack-envelope state session-id (:sender msg) contig (:seq msg) seen-seqs privkey-bytes)
-                        new-state (update-in state [:sessions session-id :replays-deduped] (fnil inc 0))]
+                        new-state (-> state
+                                      (update-in [:sessions session-id :replays-deduped] (fnil inc 0))
+                                      (record-suppression :duplicate-replay))]
                     {:state new-state
                      :net-envelopes (if ack-env [ack-env] [])
                      :stdout-events []})))
@@ -7085,11 +7702,14 @@
                                              {}
                                              curr-outbox)
                     purged-order (filterv #(not (acked? %)) curr-order)
+                    newly-acked (max 0 (- (count curr-outbox) (count purged-outbox)))
                     updated-sess (assoc session
                                         :acked-seq new-acked-seq
                                         :outbox purged-outbox
                                         :outbox-order purged-order)
-                    new-state (assoc-in state [:sessions session-id] updated-sess)]
+                    new-state (cond-> (assoc-in state [:sessions session-id] updated-sess)
+                                (pos? newly-acked)
+                                (update-in [:delivery-telemetry :acked] (fnil + 0) newly-acked))]
                 {:state new-state
                  :net-envelopes []
                  :stdout-events []}))))))
@@ -8034,18 +8654,24 @@
                                         (contains? trusted-anchors
                                                    (normalize-pubkey-hex (get-in v [:dac :anchor-pubkey])))))))]
            (if-not (and sig-valid? dac-valid?)
-             {:state (update-in state [:diagnostics :broadcast-rejected] (fnil inc 0))
+             {:state (-> state
+                         (update-in [:diagnostics :broadcast-rejected] (fnil inc 0))
+                         (record-suppression :admission-drop))
               :net-envelopes []
               :stdout-events []}
              (let [dedup-key [norm-sender seq-num msg-id]
                    seen (:broadcast-seen state #{})]
                (if (contains? seen dedup-key)
-                 {:state (update-in state [:diagnostics :broadcast-duplicates-dropped] (fnil inc 0))
+                 {:state (-> state
+                             (update-in [:diagnostics :broadcast-duplicates-dropped] (fnil inc 0))
+                             (record-suppression :duplicate-replay))
                   :net-envelopes []
                   :stdout-events []}
                  (let [pname (pubkey->petname state norm-sender)
-                       b-entry (cond-> {:from norm-sender
+                       b-entry (cond-> {:type :broadcast
+                                        :from norm-sender
                                         :seq seq-num
+                                        :broadcast-seq seq-num
                                         :msg-id msg-id
                                         :msg_id msg-id
                                         "msg_id" msg-id
@@ -8060,6 +8686,7 @@
                                     "subnet_id" sub-id
                                     "from" norm-sender
                                     "seq" seq-num
+                                    "broadcast_seq" seq-num
                                     "msg_id" msg-id
                                     "text" text}
                              pname (assoc "from_petname" pname))
@@ -8082,9 +8709,9 @@
                                                  :p2p-session-id (:session-id target)))
                                         open-p2p-peers)
                        new-state (-> state
-                                     (update :broadcast-seen (fnil conj #{}) dedup-key)
-                                     (update :broadcast-inbox (fnil conj []) b-entry)
-                                     (update :inbox (fnil conj []) b-entry)
+                                     (record-broadcast-seen dedup-key)
+                                     (update :broadcast-inbox append-bounded-inbox b-entry)
+                                     (update :inbox append-bounded-inbox b-entry)
                                      (update-in [:diagnostics :p2p-relayed] (fnil + 0) (count relay-envs)))]
                    {:state new-state
                     :net-envelopes relay-envs
@@ -8679,7 +9306,8 @@
                         new-state (-> state
                                       (update :subnet-mismatch-dropped (fnil inc 0))
                                       (update-in [:diagnostics :subnet-mismatch-dropped] (fnil inc 0))
-                                      (update-in [:wire-version-diagnostics :subnet-mismatch-dropped] (fnil inc 0)))
+                                      (update-in [:wire-version-diagnostics :subnet-mismatch-dropped] (fnil inc 0))
+                                      (record-suppression :subnet-mismatch))
                         diag-event {"event" "subnet-mismatch-dropped"
                                     "error" "subnet-mismatch"
                                     "outer_subnet" outer-subnet
@@ -8752,7 +9380,11 @@
                                             msg-epoch ref-epoch
                                             (> (math-abs (- msg-epoch (long ref-epoch))) max-skew))]
                     (if foreign-unicast?
-                      {:state state :net-envelopes [] :stdout-events []}
+                      {:state (-> state
+                                  (update-in [:diagnostics :foreign-unicast-dropped] (fnil inc 0))
+                                  (record-suppression :foreign-unicast))
+                       :net-envelopes []
+                       :stdout-events []}
                       (if skew-exceeded?
                         (let [p2p-sig? (contains? #{:p2p-offer :p2p-answer} msg-type)
                               sid (or target-sid (:offer-hash msg) (get msg "offer_hash"))
@@ -8768,8 +9400,9 @@
                                           {"event" "p2p-signaling-rejected" "reason" "epoch-skew-exceeded"})
                               evts (cond-> [diag-event]
                                      p2p-event (conj p2p-event))
-                              new-state (cond-> state
-                                          true (update-in [:diagnostics :epoch-skew-dropped] (fnil inc 0))
+                              new-state (cond-> (-> state
+                                                    (update-in [:diagnostics :epoch-skew-dropped] (fnil inc 0))
+                                                    (record-suppression :admission-drop))
                                           p2p-sig? (update-in [:diagnostics :p2p-signaling-rejected] (fnil inc 0)))
                               st-enq (enqueue-actionable-events new-state evts)]
                           {:state st-enq
