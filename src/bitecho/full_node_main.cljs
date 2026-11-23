@@ -3344,10 +3344,12 @@
                                             (log-diagnostic! {:effect :diagnose :reason :mesh-chunk-send-failed :cid req-cid :detail (.-message e)})))))]
                                 (if (fressian/bytes? hot-bytes)
                                   (send-chunk-reply! hot-bytes)
-                                  (if-let [sdir (:state-dir ctx)]
+                                  (if-let [sdir (or (:state-dir ctx) (get-in ctx [:config :state-dir]))]
                                     (read-disk-blob-async! sdir req-cid (:shell-atom ctx)
                                                            (fn [disk-res]
-                                                             (send-chunk-reply! (when (:ok? disk-res) (:bytes disk-res)))))
+                                                             (send-chunk-reply! (when (:ok? disk-res)
+                                                                                  (or (get-in disk-res [:blob :blob/bytes])
+                                                                                      (:bytes disk-res))))))
                                     (send-chunk-reply! nil))))
 
                               query-only?
