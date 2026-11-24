@@ -22,10 +22,21 @@
 
 (def ^:private bytes? fressian/bytes?)
 
+(def ^:private ed25519-spki-prefix-hex "302a300506032b6570032100")
+
 (defn- normalize-hex
   [s]
   (when (and (string? s) (not (str/blank? s)))
     (str/lower-case (str/trim s))))
+
+(defn- normalize-pubkey-hex
+  "Normalizes 88-char X.509 SPKI-DER Ed25519 hex and 64-char raw Ed25519 hex identically."
+  [s]
+  (when-let [h (normalize-hex s)]
+    (if (and (= 88 (count h))
+             (str/starts-with? h ed25519-spki-prefix-hex))
+      (subs h 24)
+      h)))
 
 ;; =============================================================================
 ;; 1. Subnet Policy Hashing & Constrained-Axis Validation (Gaps G5 & G10)
@@ -320,6 +331,72 @@
               (keep normalize-hex))
         (:subnet/path-acl policy)))
 
+(def ^:private default-self-owner-max-blob-bytes (* 512 1024))
+
+(defn- policy-has-self-path-owner?
+  [policy]
+  (boolean (some #(= :self-path-owner (get-in % [:principal :type]))
+                 (:subnet/path-acl policy))))
+
+(defn- check-self-path-owner-admission
+  "Pure helper (BIP-022 Stage C §3.3): evaluates `:self-path-owner` admission for non-allowlisted
+   senders on `:allowlist` subnets.
+   - `:publish-pointer`: admits ONLY if `:pointer/path` matches a `:self-path-owner` ACL rule AND
+     `(normalize-pubkey-hex (:pointer/authority ptr)) == (normalize-pubkey-hex (:owner match-info))`
+     (matching `sender` when supplied). Rejects cross-owner writes with `:unauthorized-pointer-authority`.
+   - `:put-blob`: admits ONLY if policy declares `:self-path-owner`, blob verifies `SHA-256 == CID`,
+     and blob size is within `max-chunk-bytes` (512 KiB) and unpinned quota."
+  [policy state event sender]
+  (case (:type event)
+    :publish-pointer
+    (let [ptr (:pointer event)
+          path (:pointer/path ptr)
+          matched (some (fn [rule]
+                          (when (= :self-path-owner (get-in rule [:principal :type]))
+                            (let [m (data/match-path-pattern (:pattern rule) path)]
+                              (when (:matched? m) m))))
+                        (:subnet/path-acl policy))]
+      (when matched
+        (let [owner (normalize-pubkey-hex (:owner matched))
+              ptr-auth (normalize-pubkey-hex (:pointer/authority ptr))
+              norm-sender (normalize-pubkey-hex sender)]
+          (if (and owner ptr-auth (= ptr-auth owner)
+                   (or (nil? norm-sender) (= norm-sender owner)))
+            {:admitted? true :member ptr-auth :admission-via :self-path-owner}
+            {:admitted? false :error :unauthorized-pointer-authority}))))
+
+    :put-blob
+    (when (policy-has-self-path-owner? policy)
+      (let [blob (:blob event)
+            media-type (:blob/media-type blob)
+            self-storage-blob? (or (= "application/x-bitecho-e2ee-fressian" media-type)
+                                   (true? (:self-path-owner? event)))
+            max-bytes (long (or (get-in policy [:subnet/storage :max-chunk-bytes])
+                                default-self-owner-max-blob-bytes))
+            blob-len (if (and (map? blob) (:blob/bytes blob))
+                       (fressian/count-bytes (:blob/bytes blob))
+                       -1)
+            unpinned-cur (long (or (get-in state [:data :blobs :unpinned-bytes]) 0))
+            unpinned-max (long (or (get-in state [:data :blobs :max-unpinned-bytes])
+                                   data/default-max-unpinned-bytes))]
+        (when self-storage-blob?
+          (cond
+            (not (data/verify-blob blob))
+            {:admitted? false :error :invalid-blob-cid}
+
+            (> blob-len max-bytes)
+            {:admitted? false :error :payload-too-large}
+
+            (> (+ unpinned-cur blob-len) unpinned-max)
+            {:admitted? false :error :chunk-store-quota-exceeded}
+
+            :else
+            {:admitted? true
+             :member (or (normalize-pubkey-hex sender) :self-storage)
+             :admission-via :self-path-owner-blob}))))
+
+    nil))
+
 (defn check-gate-admission
   "Purely evaluates whether `event` satisfies `(:subnet/gate policy)`."
   [policy state event]
@@ -357,7 +434,8 @@
         (if (and sender (or (contains? anchors sender)
                             (contains? acl-signers sender)))
           {:admitted? true :member sender}
-          {:admitted? false :error :not-in-allowlist})
+          (or (check-self-path-owner-admission policy state event sender)
+              {:admitted? false :error :not-in-allowlist}))
 
         :dac
         (if (and sender (or (contains? anchors sender)

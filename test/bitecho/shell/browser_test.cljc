@@ -529,7 +529,11 @@
             "broadcast-sig-invalid-queue-throttled" "dac-required-missing"
             "session-replay-detected" "session-stale-seq-detected" "session-rx-gap-detected"
             "session-tx-seq-rollback-detected" "session-tx-seq-rollback-evicted" "session-ack-invalid"
-            "rollback-collision" "auto-update-mesh-fallback" "update-poll-suppressed"}
+            "rollback-collision" "auto-update-mesh-fallback" "update-poll-suppressed"
+            "keystore-security-tier" "backup-seq" "backup-last-cid" "backup-path"
+            "petname-tombstones" "artifact-tombstones" "session-high-water"
+            "quarantined?" "quarantine-reason"
+            "session-rollback-quarantined" "session-quarantined" "backup-publish-failed"}
           test-map (into {}
                          (concat (map (fn [k] [k "SENSITIVE"]) all-forbidden-keys)
                                  (map (fn [k] [k "UNLISTED"]) unlisted-keys)
@@ -697,8 +701,8 @@
                                     (collect-keys populated-light)
                                     (collect-keys base-anchor)
                                     (collect-keys base-conn)))))
-        ;; All 50 top-level init-light-state keys and all non-secret init-anchor-state / initial-conn-state keys survive intact
-        (is (= 50 (count (keys base-light))))
+        ;; All 51 top-level init-light-state keys and all non-secret init-anchor-state / initial-conn-state keys survive intact
+        (is (= 51 (count (keys base-light))))
         (is (= (set (keys base-light)) (set (keys sanitized-light))))
         (is (= (set (keys base-light)) (set (keys @loaded-light))))
         (is (= (disj (set (keys base-anchor)) :privkey-bytes)
@@ -1197,6 +1201,8 @@
                                     process.exit(1);
                                   }
                                   console.log('REFRESH_WIRING_OK:' + origAddr);
+                                  api.stopNode();
+                                  process.exit(0);
                                 }).catch(function (e) {
                                   console.error(e);
                                   process.exit(1);

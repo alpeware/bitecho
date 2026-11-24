@@ -2,10 +2,12 @@
   "Light-node boundary shell for Bitecho.
    Handles CLI invocation, JSONL STDIN/STDOUT serve loop, state persistence
    with atomic rename (0600 permissions), and WebRTC DataChannel agent connections."
-  (:require [bitecho.basalt.core :as basalt]
+  (:require [bitecho.backup.core :as backup]
+            [bitecho.basalt.core :as basalt]
             [bitecho.config.flags :as flags]
             [bitecho.core.protocol.relay :as relay]
             [bitecho.crypto :as crypto]
+            [bitecho.crypto.key-provider :as kp]
             [bitecho.deploy.core :as deploy]
             [bitecho.errors.core :as errors]
             [bitecho.fressian :as fressian]
@@ -311,6 +313,8 @@
          relay-cli (extract-flag-value clean-args "--relay-url" nil)
          relay-url (resolve-relay-url relay-cli getenv-fn)
          subnet-id (extract-flag-value clean-args "--subnet-id" nil)
+         keystore-passphrase-file (extract-flag-value clean-args "--keystore-passphrase-file" nil)
+         backup-slot (extract-flag-value clean-args "--slot" nil)
          reset-network-state? (boolean (some #(= % "--reset-network-state") clean-args))
          trusted-dac-anchors-spec (flags/parse-trusted-dac-anchors-arg clean-args)
          trusted-dac-anchors (when (= :set (:action trusted-dac-anchors-spec))
@@ -392,6 +396,8 @@
        min-balance (assoc :min-balance min-balance)
        after-ts (assoc :after-ts after-ts)
        subnet-id (assoc :subnet-id subnet-id)
+       keystore-passphrase-file (assoc :keystore-passphrase-file keystore-passphrase-file)
+       backup-slot (assoc :slot backup-slot)
        reset-network-state? (assoc :reset-network-state? true)
        timeout-ms (assoc :timeout-ms timeout-ms)
        ingress-tcp-port (assoc :ingress-tcp-port (int ingress-tcp-port))
@@ -554,15 +560,176 @@
                  (light-core/migrate-light-state decoded))))))))))
 
 (defn load-or-create-light-identity!
-  "Loads or creates persistent light-node identity in state-dir.
-   Throws descriptive exception on corrupt identity file."
-  [state-dir]
-  (let [node-id :light-node
-        id-data (identity/load-or-create-node-identity! state-dir node-id)
-        priv-bytes (if-let [kp (:keypair id-data)]
-                     (:private kp)
-                     (basalt/hex->bytes (:privkey-hex id-data)))]
-    (assoc id-data :privkey-bytes priv-bytes)))
+  "Loads or creates persistent light-node identity in state-dir (supporting Row 11 Phase 1
+   encrypted `keystore.enc.edn` and seamless legacy `node-identity.edn` read-migration).
+   Throws descriptive exception on corrupt identity file or fail-closed unlock error."
+  ([state-dir]
+   (load-or-create-light-identity! state-dir {}))
+  ([state-dir opts]
+   (let [node-id :light-node
+         kp-opts (cond-> {}
+                   (:passphrase opts) (assoc :passphrase (:passphrase opts))
+                   (:keystore-passphrase-file opts) (assoc :passphrase-file (:keystore-passphrase-file opts))
+                   (:passphrase-file opts) (assoc :passphrase-file (:passphrase-file opts))
+                   (:kdf-iterations opts) (assoc :kdf-iterations (:kdf-iterations opts)))
+         id-data (identity/load-key-provider-identity! state-dir node-id kp-opts)]
+     (when (false? (:ok? id-data))
+       (throw (ex-info (str "Keystore unlock failed: " (name (or (:error id-data) :keystore-unlock-failed)))
+                       {:error (:error id-data)
+                        :diagnostics (:diagnostics id-data)})))
+     (let [priv-bytes (if-let [kp-m (:keypair id-data)]
+                        (:private kp-m)
+                        (basalt/hex->bytes (:privkey-hex id-data)))]
+       (assoc id-data :privkey-bytes priv-bytes)))))
+
+;; -----------------------------------------------------------------------------
+;; Row 6: Fail-Closed Encrypted On-Network State Backup & Restore (`:bitecho.backup/v1`)
+;; -----------------------------------------------------------------------------
+
+(defn- default-http-post-blob!
+  [relay-base-url pubkey blob]
+  (try
+    (let [client (default-http-client)
+          url (str (str/replace (str relay-base-url) #"/+$" "") "/artifact/v1/blob")
+          req (-> (HttpRequest/newBuilder (URI/create url))
+                  (.timeout (Duration/ofSeconds 10))
+                  (.header "Content-Type" (or (:blob/media-type blob) "application/x-bitecho-e2ee-fressian"))
+                  (.header "X-Bitecho-Blob-Cid" (:blob/cid blob))
+                  (.header "X-Bitecho-Pubkey" (str pubkey))
+                  (.POST (HttpRequest$BodyPublishers/ofByteArray ^bytes (:blob/bytes blob)))
+                  (.build))
+          resp (.send client req (HttpResponse$BodyHandlers/ofString))
+          code (.statusCode resp)]
+      (if (<= 200 code 299)
+        {:ok? true :status code :body (.body resp)}
+        {:ok? false :status code :error (str "http-" code) :body (.body resp)}))
+    (catch Exception e
+      {:ok? false :status 0 :error (.getMessage e)})))
+
+(defn- default-http-post-pointer!
+  [relay-base-url pubkey pointer]
+  (try
+    (let [client (default-http-client)
+          url (str (str/replace (str relay-base-url) #"/+$" "") "/artifact/v1/pointer")
+          body-json (json/write-str
+                     {"subnet" (:pointer/subnet pointer)
+                      "path" (:pointer/path pointer)
+                      "authority" (:pointer/authority pointer)
+                      "seq" (:pointer/seq pointer)
+                      "leader_term" (:pointer/leader-term pointer)
+                      "target" (:pointer/target pointer)
+                      "proof" {"type" (name (or (get-in pointer [:pointer/proof :proof/type]) :self))}
+                      "sig" (:pointer/sig pointer)})
+          req (-> (HttpRequest/newBuilder (URI/create url))
+                  (.timeout (Duration/ofSeconds 10))
+                  (.header "Content-Type" "application/json; charset=utf-8")
+                  (.header "X-Bitecho-Pubkey" (str pubkey))
+                  (.POST (HttpRequest$BodyPublishers/ofString body-json StandardCharsets/UTF_8))
+                  (.build))
+          resp (.send client req (HttpResponse$BodyHandlers/ofString))
+          code (.statusCode resp)]
+      (if (<= 200 code 299)
+        {:ok? true :status code :body (.body resp)}
+        {:ok? false :status code :error (str "http-" code) :body (.body resp)}))
+    (catch Exception e
+      {:ok? false :status 0 :error (.getMessage e)})))
+
+(defn publish-encrypted-backup!
+  "Row 6 fail-closed 2-step encrypted state backup publisher:
+   1. Packs encrypted `:bitecho.backup/v1` blob + signed monotonic pointer via `backup/pack-encrypted-backup`.
+   2. Publishes `POST /artifact/v1/blob` FIRST.
+   3. ONLY after verified HTTP 2xx blob ack publishes `POST /artifact/v1/pointer`.
+   On ANY failure (e.g. HTTP 503), fails closed with canonical `:storage-publish-failed` + counted
+   `:backup-publish-failed` `:diagnose`, ZERO partial pointer commit, and unchanged local `:backup-seq`."
+  [{:keys [key-provider state subnet-id slot node-role now-ms relay-url
+           http-post-blob-fn http-post-pointer-fn]}]
+  (let [prev-seq (long (or (:backup-seq state) 0))
+        next-seq (inc prev-seq)
+        packed (backup/pack-encrypted-backup {:key-provider key-provider
+                                              :state state
+                                              :subnet-id (or subnet-id "bitecho.org/infra")
+                                              :slot slot
+                                              :seq next-seq
+                                              :node-role (or node-role :jvm)
+                                              :now-ms (or now-ms (System/currentTimeMillis))})]
+    (if-not (:ok? packed)
+      (let [err (errors/canonical-error (:error packed) {:stage "backup-pack"})
+            st' (errors/record-error-diagnostic state err)]
+        {:ok? false
+         :error (:error err)
+         :state st'
+         :effects (vec (:effects packed))})
+      (let [own-pk (kp/public-key key-provider)
+            post-blob! (or http-post-blob-fn #(default-http-post-blob! relay-url own-pk %))
+            post-ptr! (or http-post-pointer-fn #(default-http-post-pointer! relay-url own-pk %))
+            blob-res (post-blob! (:blob packed))]
+        (if-not (:ok? blob-res)
+          (let [diag {:effect :diagnose
+                      :reason :backup-publish-failed
+                      :stage :blob
+                      :status (or (:status blob-res) 0)
+                      :error (:error blob-res)}
+                err (errors/canonical-error :storage-publish-failed {:stage "blob" :status (:status blob-res)})
+                st' (-> (errors/record-error-diagnostic state err)
+                        (update-in [:diagnostics :backup-publish-failed] (fnil inc 0)))]
+            {:ok? false
+             :error :storage-publish-failed
+             :stage :blob
+             :status (:status blob-res)
+             :state st'
+             :effects [diag (errors/diagnose-effect err)]})
+          (let [ptr-res (post-ptr! (:pointer packed))]
+            (if-not (:ok? ptr-res)
+              (let [diag {:effect :diagnose
+                          :reason :backup-publish-failed
+                          :stage :pointer
+                          :status (or (:status ptr-res) 0)
+                          :error (:error ptr-res)}
+                    err (errors/canonical-error :storage-publish-failed {:stage "pointer" :status (:status ptr-res)})
+                    st' (-> (errors/record-error-diagnostic state err)
+                            (update-in [:diagnostics :backup-publish-failed] (fnil inc 0)))]
+                {:ok? false
+                 :error :storage-publish-failed
+                 :stage :pointer
+                 :status (:status ptr-res)
+                 :state st'
+                 :effects [diag (errors/diagnose-effect err)]})
+              (let [st' (assoc state
+                               :backup-seq next-seq
+                               :backup-last-cid (:cid packed)
+                               :backup-path (:path packed))]
+                {:ok? true
+                 :seq next-seq
+                 :cid (:cid packed)
+                 :path (:path packed)
+                 :blob (:blob packed)
+                 :pointer (:pointer packed)
+                 :state st'
+                 :effects []}))))))))
+
+(defn restore-encrypted-backup!
+  "Row 6 encrypted backup restore helper: verifies & decrypts backup via `backup/unpack-encrypted-backup`
+   and merges into `local-state` via `backup/merge-restored-state` (honoring BIP-016 tombstones and
+   Lumen `seq 7` per-session auto-quarantine)."
+  [{:keys [key-provider local-state blob pointer slot min-expected-seq observed-hwm]}]
+  (let [unpacked (backup/unpack-encrypted-backup {:key-provider key-provider
+                                                  :blob blob
+                                                  :pointer pointer
+                                                  :slot slot
+                                                  :min-expected-seq min-expected-seq})]
+    (if-not (:ok? unpacked)
+      {:ok? false
+       :error (:error unpacked)
+       :state local-state
+       :effects (:effects unpacked)}
+      (let [merged (backup/merge-restored-state local-state (:payload unpacked) observed-hwm)]
+        {:ok? true
+         :seq (:seq unpacked)
+         :cid (:cid unpacked)
+         :path (:path unpacked)
+         :summary (:summary merged)
+         :state (:state merged)
+         :effects (:effects merged)}))))
 
 ;; -----------------------------------------------------------------------------
 ;; Validator Connection Manager

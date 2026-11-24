@@ -4,13 +4,15 @@
    epoch skew tolerance, and Wire/JSONL conversions without side effects.
    Portable across Clojure (JVM) and ClojureScript (Node/Browser)."
   (:refer-clojure :exclude [bytes?])
-  (:require [bitecho.basalt.core :as basalt]
+  (:require [bitecho.backup.core :as backup]
+            [bitecho.basalt.core :as basalt]
             [bitecho.bech32m :as bech32m]
             [bitecho.config :as config]
             [bitecho.core.data :as data]
             [bitecho.core.storage :as storage]
             [bitecho.core.subnet :as core-subnet]
             [bitecho.crypto :as crypto]
+            [bitecho.crypto.key-provider :as kp]
             [bitecho.crypto.sealed :as sealed]
             [bitecho.economy.account :as account]
             [bitecho.economy.bundle :as bundle]
@@ -438,6 +440,9 @@
    Private keys are never stored in the returned state map."
   [identity-pub-map opts]
   {:pubkey (or (:pubkey-hex identity-pub-map) (:pubkey identity-pub-map))
+   :keystore-security-tier (or (:keystore-security-tier identity-pub-map)
+                               (:keystore-security-tier opts)
+                               :legacy-file-0600)
    :fingerprint (:fingerprint identity-pub-map)
    :ice-creds (:ice-creds identity-pub-map)
    :autonomous? (boolean (:autonomous? opts false))
@@ -3811,6 +3816,26 @@
              :net-envelopes []
              :stdout-events []})
 
+          (true? (:quarantined? session))
+          (let [err (errors/canonical-error :session-quarantined
+                                            {:session_id session-id
+                                             :rekey_required true
+                                             :reoffer_recommended true
+                                             :quarantine_reason (name (or (:quarantine-reason session)
+                                                                          :stale-backup-tx-seq-rollback))})
+                st-err (errors/record-error-diagnostic state err)]
+            {:ok? false
+             :state st-err
+             :response (errors/canonical-error->wire err {"session_id" session-id
+                                                          "rekey_required" true
+                                                          "reoffer_recommended" true
+                                                          "mesh_submitted" false
+                                                          "p2p" false
+                                                          "peers_targeted" 0})
+             :effects [(errors/diagnose-effect err)]
+             :net-envelopes []
+             :stdout-events []})
+
           (or (true? (:tx-tainted? session)) (true? (:rekey-required? session)))
           {:ok? false
            :state state
@@ -4790,7 +4815,19 @@
                   (when raw-pub (pubkey->petname state raw-pub)))
         pub (when pname (get-in state [:petnames pname]))]
     (if (and pname pub)
-      (let [new-state (update state :petnames dissoc pname)]
+      (let [norm-pub (or (kp/normalize-pubkey-hex pub) pub)
+            prev-seq (long (or (get-in state [:petname-tombstones norm-pub :seq])
+                               (get-in state [:rolodex :seq])
+                               (:backup-seq state)
+                               0))
+            now-ms (long (or (parse-long-safe (or (get cmd-map "now_ms") (:now-ms cmd-map)) nil) 0))
+            new-state (-> state
+                          (update :petnames dissoc pname)
+                          (update :petname-meta dissoc norm-pub pub)
+                          (assoc-in [:petname-tombstones norm-pub]
+                                    {:deleted-ms now-ms
+                                     :seq (inc prev-seq)
+                                     :petname pname}))]
         {:state new-state
          :response {"ok" true "removed" true "petname" pname "pubkey" pub}
          :net-envelopes []
@@ -7380,24 +7417,51 @@
        :stdout-events []}
       (let [pnames (or (:petnames raw-snap) (get raw-snap "petnames") {})
             pmeta (or (:petname-meta raw-snap) (get raw-snap "petname-meta") (get raw-snap "petname_meta") {})
+            ptomb (or (:petname-tombstones raw-snap) (get raw-snap "petname-tombstones") (get raw-snap "petname_tombstones") {})
             subs (or (:subscribed-subnets raw-snap) (get raw-snap "subscribed-subnets") (get raw-snap "subscribed_subnets") [])
+            sessions (or (:sessions raw-snap) (get raw-snap "sessions") {})
             restored-seq (long (or (:seq raw-snap) (get raw-snap "seq") (get-in state [:rolodex :seq]) 0))
             clean-snap (dissoc raw-snap :private-key "private-key" :privkey "privkey")
             snap-cid (crypto/sha256-hex (pr-str clean-snap))
-            new-state (-> state
-                          (update :petnames #(merge (or % {}) pnames))
-                          (update :petname-meta #(merge (or % {}) pmeta))
-                          (update :subscribed-subnets #(into (into #{} (or % [])) (map str subs)))
-                          (assoc :rolodex {:seq restored-seq :cid snap-cid :snapshot clean-snap}))]
+            merged (backup/merge-restored-state
+                    state
+                    {:schema backup/backup-schema-version
+                     :seq restored-seq
+                     :petnames pnames
+                     :petname-meta pmeta
+                     :petname-tombstones ptomb
+                     :subscribed-subnets subs
+                     :sessions sessions}
+                    (or (:observed-hwm cmd-map) (get cmd-map "observed_hwm")))
+            new-state (assoc (:state merged) :rolodex {:seq restored-seq :cid snap-cid :snapshot clean-snap})]
         {:state new-state
          :response {"ok" true
                     "restored" true
                     "seq" restored-seq
                     "cid" snap-cid
                     "petnames" (count (:petnames new-state))
-                    "subnets" (count (:subscribed-subnets new-state))}
+                    "subnets" (count (:subscribed-subnets new-state))
+                    "quarantined_sessions" (get-in merged [:summary :quarantined-sessions] 0)}
+         :effects (:effects merged)
          :net-envelopes []
          :stdout-events []}))))
+
+(defn- exec-backup-status [state]
+  (let [pk (kp/normalize-pubkey-hex (:pubkey state))
+        q-ids (vec (sort (keep (fn [[sid s]] (when (:quarantined? s) (str sid))) (:sessions state))))]
+    {:state state
+     :response {"ok" true
+                "schema" backup/backup-schema-version
+                "path" (when pk (backup/backup-pointer-path pk))
+                "backup_seq" (long (or (:backup-seq state) 0))
+                "last_cid" (:backup-last-cid state)
+                "petnames" (count (or (:petnames state) {}))
+                "petname_tombstones" (count (or (:petname-tombstones state) {}))
+                "quarantined_sessions" (count q-ids)
+                "quarantined_session_ids" q-ids
+                "keystore_security_tier" (name (or (:keystore-security-tier state) :legacy-file-0600))}
+     :net-envelopes []
+     :stdout-events []}))
 
 (defn handle-command
   "Dispatches a parsed JSON command map to its corresponding protocol verb reducer.
@@ -7532,6 +7596,7 @@
                   "rolodex-put" (exec-rolodex-put state effective-map)
                   "rolodex-status" (exec-rolodex-status state)
                   "rolodex-restore" (exec-rolodex-restore state effective-map)
+                  "backup-status" (exec-backup-status state)
                   {:state state :response {"ok" false "error" "unknown-command"} :net-envelopes [] :stdout-events []})
             res' (if (seq (:net-envelopes res))
                    (update res :net-envelopes (fn [envs]

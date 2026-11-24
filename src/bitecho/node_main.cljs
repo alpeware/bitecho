@@ -4,13 +4,15 @@
    and transport (`UDP` via `node:dgram` + RFC 4571 `TCP` / `HTTP CONNECT` via `node:net`) parity
    with the JVM `bitecho.shell.light-node` shell, backed by `bitecho.light-node.core`,
    `bitecho.fressian`, and `datachannel.api`."
-  (:require [bitecho.basalt.core :as basalt]
+  (:require [bitecho.backup.core :as backup]
+            [bitecho.basalt.core :as basalt]
             [bitecho.config :as config]
             [bitecho.config.flags :as flags]
             [bitecho.core.infra :as core-infra]
             [bitecho.core.mesh :as core-mesh]
             [bitecho.core.protocol.relay :as relay]
             [bitecho.crypto :as crypto]
+            [bitecho.crypto.key-provider :as kp]
             [bitecho.deploy.core :as deploy]
             [bitecho.errors.core :as errors]
             [bitecho.fressian :as fressian]
@@ -1186,6 +1188,8 @@
          relay-cli (extract-flag-value clean-args "--relay-url" nil)
          relay-url (resolve-relay-url relay-cli getenv-fn)
          subnet-id (extract-flag-value clean-args "--subnet-id" nil)
+         keystore-passphrase-file (extract-flag-value clean-args "--keystore-passphrase-file" nil)
+         backup-slot (extract-flag-value clean-args "--slot" nil)
          reset-network-state? (boolean (some #(= % "--reset-network-state") clean-args))
          trusted-dac-anchors-spec (flags/parse-trusted-dac-anchors-arg clean-args)
          trusted-dac-anchors (when (= :set (:action trusted-dac-anchors-spec))
@@ -1251,6 +1255,8 @@
        min-balance (assoc :min-balance min-balance)
        after-ts (assoc :after-ts after-ts)
        subnet-id (assoc :subnet-id subnet-id)
+       keystore-passphrase-file (assoc :keystore-passphrase-file keystore-passphrase-file)
+       backup-slot (assoc :slot backup-slot)
        reset-network-state? (assoc :reset-network-state? true)
        timeout-ms (assoc :timeout-ms timeout-ms)
        ingress-tcp-port (assoc :ingress-tcp-port ingress-tcp-port)
@@ -1451,62 +1457,224 @@
                 (try (write-bytes-atomic! bak-path buf) (catch :default _ nil)))))
           (light-core/migrate-light-state decoded))))))
 
+(defn- resolve-node-keystore-passphrase!
+  [{:keys [passphrase passphrase-file keystore-passphrase-file]}]
+  (let [pw-file (or passphrase-file keystore-passphrase-file)]
+    (cond
+      (and (string? passphrase) (not (str/blank? passphrase)))
+      {:passphrase passphrase :diagnostics []}
+
+      (and (string? pw-file) (not (str/blank? pw-file)))
+      (if-not (.existsSync node-fs pw-file)
+        {:passphrase nil
+         :diagnostics [{:effect :diagnose
+                        :reason :keystore-passphrase-file-not-found
+                        :path pw-file}]}
+        (let [st (.statSync node-fs pw-file)
+              mode (bit-and (.-mode st) 0777)
+              insecure? (pos? (bit-and mode 0077))
+              pw (str/trim (.readFileSync node-fs pw-file "utf8"))]
+          {:passphrase (when-not (str/blank? pw) pw)
+           :diagnostics (if insecure?
+                          [{:effect :diagnose
+                            :reason :keystore-passphrase-file-insecure-perms
+                            :path pw-file}]
+                          [])}))
+
+      :else
+      (let [env-pw (aget (.-env js/process) "BITECHO_KEYSTORE_PASSPHRASE")]
+        {:passphrase (when (and (string? env-pw) (not (str/blank? env-pw))) env-pw)
+         :diagnostics []}))))
+
 (defn load-or-create-light-identity!
-  "Loads or creates persistent light-node identity in `<state-dir>/identity/node-identity.edn`
-   with `0600` permissions, fully interchangeable with JVM `bitecho.shell.identity`."
-  [state-dir]
-  (let [identity-dir (.join node-path (str state-dir) "identity")
-        _ (.mkdirSync node-fs identity-dir #js {:recursive true})
-        identity-file (.join node-path identity-dir "node-identity.edn")]
-    (if (.existsSync node-fs identity-file)
-      (let [edn-data (edn/read-string (.readFileSync node-fs identity-file "utf8"))]
-        (when-not (and (map? edn-data)
-                       (:pubkey-hex edn-data)
-                       (:privkey-hex edn-data)
-                       (:cert-pem edn-data)
-                       (:key-pem edn-data)
-                       (:fingerprint edn-data)
-                       (:ice-creds edn-data))
-          (throw (ex-info "Corrupt node-identity.edn file: missing required fields"
-                          {:file identity-file})))
-        (let [pub-bytes (basalt/hex->bytes (:pubkey-hex edn-data))
-              priv-bytes (basalt/hex->bytes (:privkey-hex edn-data))
-              fp (normalize-fingerprint (:fingerprint edn-data))]
-          {:node-id :light-node
-           :pubkey-hex (:pubkey-hex edn-data)
-           :privkey-hex (:privkey-hex edn-data)
-           :privkey-bytes priv-bytes
-           :keypair {:public pub-bytes :private priv-bytes}
-           :fingerprint fp
-           :ice-creds (:ice-creds edn-data)
-           :cert-data {:cert (:cert-pem edn-data)
-                       :key (:key-pem edn-data)
-                       :fingerprint fp}}))
-      (let [cert-data (dtls/generate-cert)
-            fp (normalize-fingerprint (:fingerprint cert-data))
-            cert-pem (:cert-pem cert-data)
-            key-pem (:key-pem cert-data)
-            ice-creds (generate-random-ice-creds :light-node fp)
-            kp (crypto/generate-keypair)
-            pub-hex (basalt/bytes->hex (:public kp))
-            priv-hex (basalt/bytes->hex (:private kp))
-            data-to-save {:pubkey-hex pub-hex
-                          :privkey-hex priv-hex
-                          :cert-pem cert-pem
-                          :key-pem key-pem
-                          :fingerprint fp
-                          :ice-creds ice-creds}]
-        (write-bytes-atomic! identity-file (js/Buffer.from (pr-str data-to-save) "utf8"))
-        {:node-id :light-node
-         :pubkey-hex pub-hex
-         :privkey-hex priv-hex
-         :privkey-bytes (:private kp)
-         :keypair kp
-         :fingerprint fp
-         :ice-creds ice-creds
-         :cert-data {:cert cert-pem
-                     :key key-pem
-                     :fingerprint fp}}))))
+  "Loads or creates persistent light-node identity in `<state-dir>/identity/` with `0600` permissions,
+   supporting Row 11 Phase 1 encrypted `keystore.enc.edn` and seamless read-migration from legacy
+   `node-identity.edn`, fully interchangeable with JVM `bitecho.shell.identity`."
+  ([state-dir]
+   (load-or-create-light-identity! state-dir {}))
+  ([state-dir opts]
+   (let [identity-dir (.join node-path (str state-dir) "identity")
+         _ (.mkdirSync node-fs identity-dir #js {:recursive true})
+         enc-file (.join node-path identity-dir "keystore.enc.edn")
+         identity-file (.join node-path identity-dir "node-identity.edn")
+         {:keys [passphrase diagnostics]} (resolve-node-keystore-passphrase! opts)
+         kdf-iters (long (or (:kdf-iterations opts) kp/min-kdf-iterations))]
+     (cond
+       ;; Case 1: Encrypted keystore exists -> fail-closed unlock
+       (.existsSync node-fs enc-file)
+       (if (str/blank? (str passphrase))
+         (throw (ex-info "Keystore unlock failed: missing passphrase"
+                         {:error :keystore-unlock-failed
+                          :diagnostics (conj (vec diagnostics)
+                                             {:effect :diagnose :reason :keystore-unlock-failed :detail :missing-passphrase})}))
+         (let [ks-map (try (edn/read-string (.readFileSync node-fs enc-file "utf8")) (catch :default _ nil))
+               opened (kp/open-keystore-edn ks-map passphrase)]
+           (when-not (:ok? opened)
+             (throw (ex-info (str "Keystore unlock failed: " (name (or (:error opened) :invalid-passphrase-or-corrupt)))
+                             {:error :keystore-unlock-failed
+                              :diagnostics (conj (vec diagnostics)
+                                                 {:effect :diagnose :reason :keystore-unlock-failed :detail (:error opened)})})))
+           (let [seed (:seed-bytes opened)
+                 provider (kp/make-memory-key-provider seed :encrypted-keystore-0600)
+                 kp-map (crypto/pure-ed25519-keypair seed)
+                 pub-hex (basalt/bytes->hex (:public kp-map))
+                 priv-hex (basalt/bytes->hex (:private kp-map))
+                 cert-data (dtls/generate-cert)
+                 fp (normalize-fingerprint (:fingerprint cert-data))
+                 ice-creds (generate-random-ice-creds :light-node fp)]
+             {:node-id :light-node
+              :key-provider provider
+              :keystore-security-tier :encrypted-keystore-0600
+              :raw-pubkey-hex (kp/public-key provider)
+              :pubkey-hex pub-hex
+              :privkey-hex priv-hex
+              :privkey-bytes (:private kp-map)
+              :keypair kp-map
+              :fingerprint fp
+              :ice-creds ice-creds
+              :cert-data {:cert (:cert-pem cert-data)
+                          :key (:key-pem cert-data)
+                          :fingerprint fp}
+              :diagnostics (vec diagnostics)})))
+
+       ;; Case 2: Legacy node-identity.edn exists -> migrate if passphrase supplied, else loud advisory
+       (.existsSync node-fs identity-file)
+       (let [edn-data (edn/read-string (.readFileSync node-fs identity-file "utf8"))]
+         (when-not (and (map? edn-data)
+                        (:pubkey-hex edn-data)
+                        (:privkey-hex edn-data)
+                        (:cert-pem edn-data)
+                        (:key-pem edn-data)
+                        (:fingerprint edn-data)
+                        (:ice-creds edn-data))
+           (throw (ex-info "Corrupt node-identity.edn file: missing required fields"
+                           {:file identity-file})))
+         (let [pub-bytes (basalt/hex->bytes (:pubkey-hex edn-data))
+               priv-bytes (basalt/hex->bytes (:privkey-hex edn-data))
+               seed (kp/extract-ed25519-seed priv-bytes)
+               fp (normalize-fingerprint (:fingerprint edn-data))
+               base {:node-id :light-node
+                     :pubkey-hex (:pubkey-hex edn-data)
+                     :privkey-hex (:privkey-hex edn-data)
+                     :privkey-bytes priv-bytes
+                     :keypair {:public pub-bytes :private priv-bytes}
+                     :fingerprint fp
+                     :ice-creds (:ice-creds edn-data)
+                     :cert-data {:cert (:cert-pem edn-data)
+                                 :key (:key-pem edn-data)
+                                 :fingerprint fp}}]
+           (if-not (str/blank? (str passphrase))
+             (let [sealed-ks (kp/seal-keystore-edn {:pubkey (:pubkey-hex edn-data)
+                                                    :seed-bytes seed
+                                                    :passphrase passphrase
+                                                    :iterations kdf-iters
+                                                    :created-ms (.now js/Date)})
+                   _ (write-bytes-atomic! enc-file (js/Buffer.from (pr-str sealed-ks) "utf8"))
+                   verify-open (kp/open-keystore-edn (edn/read-string (.readFileSync node-fs enc-file "utf8")) passphrase)]
+               (when-not (:ok? verify-open)
+                 (throw (ex-info "Keystore migration verification failed"
+                                 {:error :keystore-unlock-failed})))
+               (let [provider (kp/make-memory-key-provider seed :encrypted-keystore-0600)]
+                 (assoc base
+                        :key-provider provider
+                        :keystore-security-tier :encrypted-keystore-0600
+                        :raw-pubkey-hex (kp/public-key provider)
+                        :diagnostics (conj (vec diagnostics)
+                                           {:effect :diagnose :reason :keystore-migrated-to-encrypted :path enc-file}))))
+             (let [provider (kp/make-memory-key-provider seed :legacy-file-0600)]
+               (assoc base
+                      :key-provider provider
+                      :keystore-security-tier :legacy-file-0600
+                      :raw-pubkey-hex (kp/public-key provider)
+                      :diagnostics (conj (vec diagnostics)
+                                         {:effect :diagnose
+                                          :reason :legacy-plaintext-keystore-in-use
+                                          :hint "Provide --keystore-passphrase-file or BITECHO_KEYSTORE_PASSPHRASE to migrate to keystore.enc.edn (0600)."}))))))
+
+       ;; Case 3: Fresh state-dir
+       :else
+       (let [cert-data (dtls/generate-cert)
+             fp (normalize-fingerprint (:fingerprint cert-data))
+             cert-pem (:cert-pem cert-data)
+             key-pem (:key-pem cert-data)
+             ice-creds (generate-random-ice-creds :light-node fp)
+             kp-map (crypto/generate-keypair)
+             seed (kp/extract-ed25519-seed (:private kp-map))
+             pub-hex (basalt/bytes->hex (:public kp-map))
+             priv-hex (basalt/bytes->hex (:private kp-map))]
+         (if-not (str/blank? (str passphrase))
+           (let [sealed-ks (kp/seal-keystore-edn {:pubkey pub-hex
+                                                  :seed-bytes seed
+                                                  :passphrase passphrase
+                                                  :iterations kdf-iters
+                                                  :created-ms (.now js/Date)})
+                 _ (write-bytes-atomic! enc-file (js/Buffer.from (pr-str sealed-ks) "utf8"))
+                 provider (kp/make-memory-key-provider seed :encrypted-keystore-0600)]
+             {:node-id :light-node
+              :key-provider provider
+              :keystore-security-tier :encrypted-keystore-0600
+              :raw-pubkey-hex (kp/public-key provider)
+              :pubkey-hex pub-hex
+              :privkey-hex priv-hex
+              :privkey-bytes (:private kp-map)
+              :keypair kp-map
+              :fingerprint fp
+              :ice-creds ice-creds
+              :cert-data {:cert cert-pem :key key-pem :fingerprint fp}
+              :diagnostics (vec diagnostics)})
+           (let [data-to-save {:pubkey-hex pub-hex
+                               :privkey-hex priv-hex
+                               :cert-pem cert-pem
+                               :key-pem key-pem
+                               :fingerprint fp
+                               :ice-creds ice-creds}
+                 _ (write-bytes-atomic! identity-file (js/Buffer.from (pr-str data-to-save) "utf8"))
+                 provider (kp/make-memory-key-provider seed :legacy-file-0600)]
+             {:node-id :light-node
+              :key-provider provider
+              :keystore-security-tier :legacy-file-0600
+              :raw-pubkey-hex (kp/public-key provider)
+              :pubkey-hex pub-hex
+              :privkey-hex priv-hex
+              :privkey-bytes (:private kp-map)
+              :keypair kp-map
+              :fingerprint fp
+              :ice-creds ice-creds
+              :cert-data {:cert cert-pem :key key-pem :fingerprint fp}
+              :diagnostics (conj (vec diagnostics)
+                                 {:effect :diagnose
+                                  :reason :legacy-plaintext-keystore-in-use
+                                  :hint "Provide --keystore-passphrase-file or BITECHO_KEYSTORE_PASSPHRASE to use encrypted keystore.enc.edn (0600)."})})))))))
+
+(defn pack-node-encrypted-backup
+  "Node.js Light encrypted backup packer backed by `bitecho.backup.core` (Row 6)."
+  [{:keys [key-provider state subnet-id slot seq now-ms]}]
+  (backup/pack-encrypted-backup {:key-provider key-provider
+                                 :state state
+                                 :subnet-id (or subnet-id "bitecho.org/infra")
+                                 :slot slot
+                                 :seq (or seq (inc (long (or (:backup-seq state) 0))))
+                                 :node-role :nodejs
+                                 :now-ms (or now-ms (.now js/Date))}))
+
+(defn restore-node-encrypted-backup
+  "Node.js Light encrypted backup restore backed by `bitecho.backup.core` (Row 6)."
+  [{:keys [key-provider local-state blob pointer slot min-expected-seq observed-hwm]}]
+  (let [unpacked (backup/unpack-encrypted-backup {:key-provider key-provider
+                                                  :blob blob
+                                                  :pointer pointer
+                                                  :slot slot
+                                                  :min-expected-seq min-expected-seq})]
+    (if-not (:ok? unpacked)
+      {:ok? false :error (:error unpacked) :state local-state :effects (:effects unpacked)}
+      (let [merged (backup/merge-restored-state local-state (:payload unpacked) observed-hwm)]
+        {:ok? true
+         :seq (:seq unpacked)
+         :cid (:cid unpacked)
+         :path (:path unpacked)
+         :summary (:summary merged)
+         :state (:state merged)
+         :effects (:effects merged)}))))
 
 ;; =============================================================================
 ;; 4. Single-Authority Shell Lifecycle State Machine (Rules 4 & 5)
@@ -4618,7 +4786,7 @@
                                  events-out))
             state-file (.join node-path state-dir "state.fressian")
             cmd-file (:cmd-file opts)
-            identity (load-or-create-light-identity! state-dir)]
+            identity (load-or-create-light-identity! state-dir opts)]
         (load-bootstrap-descriptor!
          (:bootstrap opts) nil
          (fn [b-res]
@@ -5139,7 +5307,7 @@
            (emit-json-line! delegated)
            (.exit js/process (if (and (map? delegated) (false? (get delegated "ok"))) 1 0)))
          (let [state-file (.join node-path state-dir "state.fressian")
-               identity (load-or-create-light-identity! state-dir)]
+               identity (load-or-create-light-identity! state-dir opts)]
            (load-bootstrap-descriptor!
             (:bootstrap opts) nil
             (fn [b-res]
@@ -5549,7 +5717,7 @@
   [opts]
   (let [state-dir (:state-dir opts)
         state-file (.join node-path state-dir "state.fressian")
-        identity (load-or-create-light-identity! state-dir)
+        identity (load-or-create-light-identity! state-dir opts)
         loaded-state (load-light-state! state-file)
         base-state (or loaded-state
                        (light-core/init-light-state identity (cond-> {}

@@ -2176,18 +2176,35 @@
                                                                       "bytes_at_rest" (:bytes-at-rest quota-res)
                                                                       "quota_bytes" (:quota-bytes quota-res)})})
                       (let [sender (or (first (get (:request/headers req) :header/x-bitecho-pubkey))
-                                       (:default-sender target-rt))]
-                        (infra/submit-event! target-rt
-                                             {:type :put-blob
-                                              :blob blob
-                                              :sender sender
-                                              :now-ms now-ms})
-                        (send-response exchange
-                                       {:response/status 200
-                                        :response/headers {"Content-Type" "application/json; charset=utf-8"}
-                                        :response/body (json/write-str {"ok" true
-                                                                        "cid" (:blob/cid blob)
-                                                                        "size_bytes" blob-len})})))))))))
+                                       (:default-sender target-rt))
+                            sub-res (infra/submit-event! target-rt
+                                                         {:type :put-blob
+                                                          :blob blob
+                                                          :sender sender
+                                                          :now-ms now-ms})]
+                        (if-not (:applied? sub-res)
+                          (let [err-kw (or (:error sub-res) :put-blob-rejected)
+                                status (cond
+                                         (contains? #{:not-in-allowlist :unauthorized-pointer-authority
+                                                      :invalid-or-missing-dac :mtls-admission-denied
+                                                      :insufficient-stake :invalid-blob-cid}
+                                                    err-kw) 403
+                                         (= :payload-too-large err-kw) 413
+                                         (= :chunk-store-quota-exceeded err-kw) 507
+                                         :else 503)]
+                            (when-let [da (:diagnostics-atom target-rt)]
+                              (swap! da update :http-blob-rejected (fnil inc 0)))
+                            (send-response exchange
+                                           {:response/status status
+                                            :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                                            :response/body (json/write-str {"ok" false
+                                                                            "error" (name err-kw)})}))
+                          (send-response exchange
+                                         {:response/status 200
+                                          :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                                          :response/body (json/write-str {"ok" true
+                                                                          "cid" (:blob/cid blob)
+                                                                          "size_bytes" blob-len})}))))))))))
 
         (str/starts-with? clean-path "/artifact/v1/blob/")
         (if-not (or (= method :GET) (= method :HEAD))

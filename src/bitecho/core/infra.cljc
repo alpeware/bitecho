@@ -241,6 +241,7 @@
                                         {:pattern "bounty/*"         :principal {:type :allowlist}}
                                         {:pattern "head/*"           :principal {:type :allowlist}}
                                         {:pattern "mail/*"           :principal {:type :allowlist}}
+                                        {:pattern "storage/<pubkey>/*" :principal {:type :self-path-owner}}
                                         dns-rule]
                       :subnet/economy {:economy/mode :none
                                        :economy/burn-floor 0

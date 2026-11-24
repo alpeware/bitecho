@@ -866,11 +866,14 @@
     :else x))
 
 (defn sign
-  "Signs a message byte array using an Ed25519 private key byte array (PKCS#8).
+  "Signs a message byte array using an Ed25519 private key byte array (PKCS#8 DER or raw 32-byte seed).
    Returns signature bytes (byte[] on JVM, Uint8Array on CLJS)."
   ^bytes [private-key message]
   (let [msg-bytes (if (string? message) (fressian/utf8->bytes message) (ensure-bytes message))
-        priv-bytes (ensure-bytes private-key)]
+        raw-priv (ensure-bytes private-key)
+        priv-bytes (if (= 32 (fressian/count-bytes raw-priv))
+                     (fressian/concat-bytes (fressian/hex->bytes "302e020100300506032b657004220420") raw-priv)
+                     raw-priv)]
     #?(:clj
        (let [kf (KeyFactory/getInstance "Ed25519")
              ks (PKCS8EncodedKeySpec. ^bytes priv-bytes)
@@ -889,12 +892,15 @@
          (pure-ed25519-sign priv-bytes msg-bytes)))))
 
 (defn verify
-  "Verifies an Ed25519 signature of a message using a public key byte array (X.509 SPKI).
+  "Verifies an Ed25519 signature of a message using a public key byte array (X.509 SPKI DER or raw 32-byte key).
    Returns true if valid, false otherwise."
   [public-key message signature]
   (try
     (let [msg-bytes (if (string? message) (fressian/utf8->bytes message) (ensure-bytes message))
-          pub-bytes (ensure-bytes public-key)
+          raw-pub (ensure-bytes public-key)
+          pub-bytes (if (= 32 (fressian/count-bytes raw-pub))
+                      (fressian/concat-bytes (fressian/hex->bytes "302a300506032b6570032100") raw-pub)
+                      raw-pub)
           sig-bytes (ensure-bytes signature)]
       #?(:clj
          (let [kf (KeyFactory/getInstance "Ed25519")

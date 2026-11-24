@@ -435,10 +435,21 @@
 ;; 2. Pointer Schema, Path-Prefix ACL, Proofs, Fencing & Tombstones
 ;; =============================================================================
 
+(def ^:private ed25519-spki-prefix-hex "302a300506032b6570032100")
+
 (defn- normalize-hex
   [s]
   (when (and (string? s) (not (str/blank? s)))
     (str/lower-case (str/trim s))))
+
+(defn- normalize-pubkey-hex
+  "Normalizes 88-char X.509 SPKI-DER Ed25519 hex and 64-char raw Ed25519 hex identically."
+  [s]
+  (when-let [h (normalize-hex s)]
+    (if (and (= 88 (count h))
+             (str/starts-with? h ed25519-spki-prefix-hex))
+      (subs h 24)
+      h)))
 
 (defn canonical-pointer-map
   "Produces the canonical Pointer map (without `:pointer/sig`) used for deterministic Fressian signing."
@@ -579,11 +590,13 @@
                 {:ok? false :error :unauthorized-pointer-authority})
 
               :self-path-owner
-              (let [owner (:owner match-info)
+              (let [owner (normalize-pubkey-hex (:owner match-info))
+                    norm-auth (normalize-pubkey-hex auth)
                     admitted (:admitted-members ctx)]
                 (if (and owner
-                         (= auth owner)
-                         (or (nil? admitted) (contains? (set (map normalize-hex admitted)) auth)))
+                         (= norm-auth owner)
+                         (or (nil? admitted)
+                             (contains? (set (map normalize-pubkey-hex admitted)) norm-auth)))
                   {:ok? true :principal-type :self-path-owner}
                   {:ok? false :error :unauthorized-pointer-authority}))
 

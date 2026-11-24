@@ -978,7 +978,12 @@
     "broadcast-sig-invalid-queue-throttled" "dac-required-missing"
     "session-replay-detected" "session-stale-seq-detected" "session-rx-gap-detected"
     "session-tx-seq-rollback-detected" "session-tx-seq-rollback-evicted" "session-ack-invalid"
-    "rollback-collision" "auto-update-mesh-fallback" "update-poll-suppressed"})
+    "rollback-collision" "auto-update-mesh-fallback" "update-poll-suppressed"
+    ;; BIP-022 Stage C (Row 6 + Row 11 Phase 1) persisted state & diagnostics keys
+    "keystore-security-tier" "backup-seq" "backup-last-cid" "backup-path"
+    "petname-tombstones" "artifact-tombstones" "session-high-water"
+    "quarantined?" "quarantine-reason"
+    "session-rollback-quarantined" "session-quarantined" "backup-publish-failed"})
 
 (def ^:private allowed-persistence-keys-compact
   (into #{} (map #(str/replace % #"[-?]" "") allowed-persistence-keys)))

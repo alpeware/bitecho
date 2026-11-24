@@ -2,13 +2,15 @@
   "Bitecho Browser Node static bundle entry point.
    Exposes high-level browser API on js/globalThis.BitechoBrowser and unified CLI parity API
    on js/globalThis.BitechoLightNode conforming to Rules 1-6."
-  (:require [bitecho.basalt.core :as basalt]
+  (:require [bitecho.backup.core :as backup]
+            [bitecho.basalt.core :as basalt]
             [bitecho.bech32m :as bech32m]
             [bitecho.browser-cli :as browser-cli]
             [bitecho.config :as config]
             [bitecho.config.flags :as flags]
             [bitecho.core.protocol.relay :as relay]
             [bitecho.crypto :as crypto]
+            [bitecho.crypto.key-provider :as kp]
             [bitecho.crypto.sealed :as sealed]
             [bitecho.deploy.core :as deploy]
             [bitecho.errors.core :as errors]
@@ -828,6 +830,65 @@
             (:timestamp-ms e) (assoc :timestampMs (:timestamp-ms e))))
         (or events [])))
 
+(defn- browser-webcrypto-available?
+  "Closure :advanced-safe feature detection for WebCrypto SubtleCrypto + IndexedDB."
+  []
+  (let [gt js/globalThis
+        crypto-obj (when gt (gobj/get gt "crypto"))
+        subtle-obj (when crypto-obj (gobj/get crypto-obj "subtle"))
+        idb-obj (when gt (gobj/get gt "indexedDB"))]
+    (boolean (and subtle-obj idb-obj))))
+
+(defn- browser-webauthn-available?
+  "Closure :advanced-safe feature detection for navigator.credentials + PublicKeyCredential."
+  []
+  (let [gt js/globalThis
+        nav (when gt (gobj/get gt "navigator"))
+        creds (when nav (gobj/get nav "credentials"))
+        pkc (when gt (gobj/get gt "PublicKeyCredential"))]
+    (boolean (and creds pkc))))
+
+(defn- detect-browser-keystore-tier
+  "Determines accurate Row 11 Phase 1 `keystore_security_tier` for Browser runtime."
+  [node]
+  (cond
+    (:key-provider node)
+    (kp/security-tier (:key-provider node))
+
+    (and (:keystore-security-tier node) (contains? kp/security-tiers (:keystore-security-tier node)))
+    (:keystore-security-tier node)
+
+    (nil? (get-in node [:keypair :private-key]))
+    :webauthn-locked
+
+    (and (true? (get-in node [:webauthn :prf-supported?]))
+         (browser-webauthn-available?))
+    :webauthn-prf-non-extractable
+
+    (browser-webcrypto-available?)
+    :webcrypto-non-extractable
+
+    :else
+    :ephemeral-memory))
+
+(defn- active-browser-key-provider
+  "Returns the active `IKeyProvider` for `node` (never exposing raw private-key bytes to callers).
+   Returns a locked provider (`:webauthn-locked`) when unlocked key material is absent."
+  [node]
+  (let [pub-hex (or (get-in node [:light-state :pubkey])
+                    (when-let [pk (get-in node [:keypair :public-key])]
+                      (fressian/bytes->hex pk)))
+        priv (get-in node [:keypair :private-key])]
+    (cond
+      (:key-provider node)
+      (:key-provider node)
+
+      (some? priv)
+      (kp/make-memory-key-provider priv (detect-browser-keystore-tier node))
+
+      :else
+      (kp/make-locked-key-provider pub-hex))))
+
 (defn get-status
   "Returns canonical `bitecho.status/v1` status via `bitecho.status.core/render-status`
    projected with backwards-compatible browser camelCase aliases (BIP-022 Stage B Row 4; Rules 4 & 5)."
@@ -903,9 +964,7 @@
                             :trusted-deploy-authorities (:trusted-deploy-authorities light-st)
                             :pin-version (:pin-version light-st)
                             :auto-update-pointer (:auto-update-pointer light-st)
-                            :keystore-security-tier (if (nil? (get-in node [:keypair :private-key]))
-                                                      :webauthn-locked
-                                                      :legacy-file-0600)})
+                            :keystore-security-tier (detect-browser-keystore-tier node)})
            st-for-render (assoc (or light-st {})
                                 :pubkey pubkey-hex
                                 :subnet-id (or (:subnet-id light-st) (:subnet-id node) "global")
@@ -4240,6 +4299,143 @@
                                (reset! st-atom st1)
                                (run-effects! (into (:effects init-res) start-effs)))))))))))))))))))
 
+(defn- record-browser-backup-diag!
+  [na reason detail]
+  (when na
+    (swap! na update-in [:light-state :diagnostics reason] (fnil inc 0))
+    (swap! na update-in [:diagnostics reason] (fnil inc 0)))
+  {:effect :diagnose :reason reason :detail detail})
+
+(defn- browser-backup-status-v1
+  []
+  (let [na @active-node-atom
+        node (when na @na)
+        st (or (:light-state node) {})
+        tier (detect-browser-keystore-tier node)
+        pk (kp/normalize-pubkey-hex (:pubkey st))
+        q-ids (vec (sort (keep (fn [[sid s]] (when (:quarantined? s) (str sid))) (:sessions st))))]
+    (js/Promise.resolve
+     (clj->js {"ok" (some? node)
+               "schema" backup/backup-schema-version
+               "path" (when pk (backup/backup-pointer-path pk))
+               "backup_seq" (long (or (:backup-seq st) 0))
+               "last_cid" (:backup-last-cid st)
+               "petnames" (count (or (:petnames st) {}))
+               "petname_tombstones" (count (or (:petname-tombstones st) {}))
+               "quarantined_sessions" (count q-ids)
+               "quarantined_session_ids" q-ids
+               "keystore_security_tier" (name tier)}))))
+
+(defn- browser-backup-put-v1
+  [& [opts-js]]
+  (let [na @active-node-atom
+        opts (if opts-js (js->clj opts-js :keywordize-keys true) {})]
+    (if-not na
+      (js/Promise.resolve (clj->js (errors/canonical-error->wire (errors/canonical-error :invalid-request {:reason "node-not-initialized"}))))
+      (let [node @na
+            provider (active-browser-key-provider node)
+            st (or (:light-state node) {})
+            next-seq (inc (long (or (:backup-seq st) 0)))
+            relay-base (str/replace (str (or (:relay-url opts) (:relay_url opts) (:relay-url node) "https://bitecho.org")) #"/+$" "")
+            packed (backup/pack-encrypted-backup {:key-provider provider
+                                                  :state st
+                                                  :subnet-id (or (:subnet-id opts) (:subnet_id opts) "bitecho.org/infra")
+                                                  :slot (or (:slot opts) backup/default-backup-slot)
+                                                  :seq next-seq
+                                                  :node-role :browser
+                                                  :now-ms (.now js/Date)})]
+        (if-not (:ok? packed)
+          (let [err (errors/canonical-error (:error packed) {:stage "backup-pack"})]
+            (record-browser-backup-diag! na (:error err) {:stage "backup-pack"})
+            (js/Promise.resolve (clj->js (errors/canonical-error->wire err))))
+          (let [fetch-fn (gobj/get js/globalThis "fetch")
+                own-pk (kp/public-key provider)
+                blob (:blob packed)
+                ptr (:pointer packed)
+                blob-url (str relay-base "/artifact/v1/blob")
+                ptr-url (str relay-base "/artifact/v1/pointer")
+                blob-headers (js-obj "Content-Type" (or (:blob/media-type blob) "application/x-bitecho-e2ee-fressian")
+                                     "X-Bitecho-Blob-Cid" (:blob/cid blob)
+                                     "X-Bitecho-Pubkey" own-pk)
+                blob-init (js-obj "method" "POST" "headers" blob-headers "body" (:blob/bytes blob))]
+            (if-not (fn? fetch-fn)
+              (do
+                (record-browser-backup-diag! na :backup-publish-failed {:stage :blob :error "fetch-unavailable"})
+                (js/Promise.resolve (clj->js (errors/canonical-error->wire (errors/canonical-error :storage-publish-failed {:stage "blob"})))))
+              (-> (fetch-fn blob-url blob-init)
+                  (.then (fn [resp]
+                           (let [ok? (boolean (gobj/get resp "ok"))
+                                 status (gobj/get resp "status")]
+                             (if-not ok?
+                               (do
+                                 (record-browser-backup-diag! na :backup-publish-failed {:stage :blob :status status})
+                                 (clj->js (errors/canonical-error->wire (errors/canonical-error :storage-publish-failed {:stage "blob" :status status}))))
+                               (let [ptr-body (.stringify js/JSON
+                                                          (js-obj "subnet" (:pointer/subnet ptr)
+                                                                  "path" (:pointer/path ptr)
+                                                                  "authority" (:pointer/authority ptr)
+                                                                  "seq" (:pointer/seq ptr)
+                                                                  "leader_term" (:pointer/leader-term ptr)
+                                                                  "target" (:pointer/target ptr)
+                                                                  "proof" (js-obj "type" "self")
+                                                                  "sig" (:pointer/sig ptr)))
+                                     ptr-headers (js-obj "Content-Type" "application/json; charset=utf-8"
+                                                         "X-Bitecho-Pubkey" own-pk)
+                                     ptr-init (js-obj "method" "POST" "headers" ptr-headers "body" ptr-body)]
+                                 (-> (fetch-fn ptr-url ptr-init)
+                                     (.then (fn [p-resp]
+                                              (let [p-ok? (boolean (gobj/get p-resp "ok"))
+                                                    p-status (gobj/get p-resp "status")]
+                                                (if-not p-ok?
+                                                  (do
+                                                    (record-browser-backup-diag! na :backup-publish-failed {:stage :pointer :status p-status})
+                                                    (clj->js (errors/canonical-error->wire (errors/canonical-error :storage-publish-failed {:stage "pointer" :status p-status}))))
+                                                  (do
+                                                    (swap! na update :light-state assoc
+                                                           :backup-seq next-seq
+                                                           :backup-last-cid (:cid packed)
+                                                           :backup-path (:path packed))
+                                                    (clj->js {"ok" true
+                                                              "seq" next-seq
+                                                              "cid" (:cid packed)
+                                                              "path" (:path packed)}))))))))))))
+                  (.catch (fn [e]
+                            (let [msg (or (when e (gobj/get e "message")) (str e))]
+                              (record-browser-backup-diag! na :backup-publish-failed {:stage :network :error msg})
+                              (clj->js (errors/canonical-error->wire (errors/canonical-error :storage-publish-failed {:detail msg}))))))))))))))
+
+(defn- browser-backup-restore-v1
+  [& [opts-js]]
+  (let [na @active-node-atom
+        opts (if opts-js (js->clj opts-js :keywordize-keys true) {})]
+    (if-not na
+      (js/Promise.resolve (clj->js (errors/canonical-error->wire (errors/canonical-error :invalid-request {:reason "node-not-initialized"}))))
+      (let [node @na
+            provider (active-browser-key-provider node)
+            st (or (:light-state node) {})
+            blob (:blob opts)
+            ptr (:pointer opts)]
+        (if (and (map? blob) (map? ptr))
+          (let [unpacked (backup/unpack-encrypted-backup {:key-provider provider
+                                                          :blob blob
+                                                          :pointer ptr
+                                                          :slot (:slot opts)
+                                                          :min-expected-seq (:min-expected-seq opts)})]
+            (if-not (:ok? unpacked)
+              (do
+                (record-browser-backup-diag! na (:error unpacked) {:stage :backup-restore})
+                (js/Promise.resolve (clj->js {"ok" false "error" (name (:error unpacked))})))
+              (let [merged (backup/merge-restored-state st (:payload unpacked) (:observed-hwm opts))]
+                (swap! na assoc :light-state (:state merged))
+                (js/Promise.resolve (clj->js {"ok" true
+                                              "restored" true
+                                              "seq" (:seq unpacked)
+                                              "cid" (:cid unpacked)
+                                              "summary" (:summary merged)})))))
+          (do
+            (record-browser-backup-diag! na :backup-restore-missing-input {:stage :backup-restore})
+            (js/Promise.resolve (clj->js {"ok" false "error" "missing-backup-blob-or-pointer"}))))))))
+
 (defn build-light-node-api
   "Constructs the unified `BitechoLightNode` browser console CLI & v1.1.0 Headless API object
    exposing EVERY Node/JVM CLI verb from `browser-cli/browser-cli-verb-inventory` as a camelCase
@@ -4286,6 +4482,10 @@
     (gobj/set obj "recoverYubiKey" recover-yubikey-v11)
     (gobj/set obj "saveIdentity" save-identity-v11)
     (gobj/set obj "getChunkedArtifact" get-chunked-artifact-v11)
+    ;; BIP-022 Stage C Row 6 + Row 11 Phase 1 backup/keystore API
+    (gobj/set obj "backupPut" browser-backup-put-v1)
+    (gobj/set obj "backupRestore" browser-backup-restore-v1)
+    (gobj/set obj "backupStatus" browser-backup-status-v1)
     obj))
 
 (def light-node-api
@@ -4298,6 +4498,9 @@
 (gobj/set api "verbs" (fn [] (js/Promise.resolve (clj->js browser-cli/browser-cli-verb-inventory))))
 (gobj/set api "peers" (fn [] (get-peers-status @active-node-atom)))
 (gobj/set api "reconnect" (fn [& [opts]] (js/Promise.resolve (connect-mesh opts))))
+(gobj/set api "backupPut" browser-backup-put-v1)
+(gobj/set api "backupRestore" browser-backup-restore-v1)
+(gobj/set api "backupStatus" browser-backup-status-v1)
 
 (when (exists? js/goog)
   (.exportSymbol js/goog "BitechoBrowser" api)

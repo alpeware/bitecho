@@ -37,6 +37,7 @@
             [bitecho.d48-bip021-subnet-session-updater-test]
             [bitecho.d49-bip022-stage-a-operator-safety-test]
             [bitecho.d50-bip022-stage-b-contracts-test]
+            [bitecho.d51-bip022-stage-c-state-identity-test]
             [bitecho.e2e.d29-remediation-scenario-test]
             [bitecho.economy.account-fuzz-test]
             [bitecho.economy.account-test]

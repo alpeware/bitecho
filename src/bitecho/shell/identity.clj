@@ -4,14 +4,15 @@
    and Ed25519 node signing keypairs."
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.crypto :as crypto]
+            [bitecho.crypto.key-provider :as kp]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
             [datachannel.dtls :as dtls])
-  (:import [java.io ByteArrayInputStream File]
+  (:import [java.io ByteArrayInputStream File FileOutputStream]
            [java.nio.charset StandardCharsets]
            [java.nio.file Files StandardCopyOption]
-           [java.nio.file.attribute PosixFilePermissions]
+           [java.nio.file.attribute PosixFilePermission PosixFilePermissions]
            [java.security KeyFactory MessageDigest PrivateKey SecureRandom]
            [java.security.cert CertificateFactory X509Certificate]
            [java.security.spec PKCS8EncodedKeySpec]
@@ -271,3 +272,200 @@
          :fingerprint fp
          :ice-creds ice-creds
          :cert-data {:cert cert :key key :fingerprint fp}}))))
+
+;; ---------------------------------------------------------------------------
+;; Row 11 Phase 1: Encrypted Keystore (`keystore.enc.edn`, 0600) & Migration
+;; ---------------------------------------------------------------------------
+
+(defn- check-passphrase-file-perms
+  [^File f]
+  (try
+    (let [perms (Files/getPosixFilePermissions (.toPath f) (into-array java.nio.file.LinkOption []))
+          insecure? (some #(contains? perms %)
+                          [PosixFilePermission/GROUP_READ
+                           PosixFilePermission/GROUP_WRITE
+                           PosixFilePermission/GROUP_EXECUTE
+                           PosixFilePermission/OTHERS_READ
+                           PosixFilePermission/OTHERS_WRITE
+                           PosixFilePermission/OTHERS_EXECUTE])]
+      (when insecure?
+        {:effect :diagnose
+         :reason :keystore-passphrase-file-insecure-perms
+         :path (.getAbsolutePath f)}))
+    (catch UnsupportedOperationException _ nil)
+    (catch Exception _ nil)))
+
+(defn resolve-keystore-passphrase!
+  "Resolves keystore passphrase from `:passphrase`, `:passphrase-file` (`--keystore-passphrase-file`),
+   or `BITECHO_KEYSTORE_PASSPHRASE` env var. Never echoes passphrase in logs/diagnostics.
+   Returns `{:passphrase <str-or-nil> :diagnostics [...]}`."
+  [{:keys [passphrase passphrase-file]}]
+  (cond
+    (and (string? passphrase) (not (str/blank? passphrase)))
+    {:passphrase passphrase :diagnostics []}
+
+    (and (string? passphrase-file) (not (str/blank? passphrase-file)))
+    (let [f (io/file passphrase-file)]
+      (if-not (.exists f)
+        {:passphrase nil
+         :diagnostics [{:effect :diagnose
+                        :reason :keystore-passphrase-file-not-found
+                        :path (.getAbsolutePath f)}]}
+        (let [perm-diag (check-passphrase-file-perms f)
+              pw (str/trim (slurp f))]
+          {:passphrase (when-not (str/blank? pw) pw)
+           :diagnostics (cond-> [] perm-diag (conj perm-diag))})))
+
+    :else
+    (let [env-pw (System/getenv "BITECHO_KEYSTORE_PASSPHRASE")]
+      {:passphrase (when (and (string? env-pw) (not (str/blank? env-pw))) env-pw)
+       :diagnostics []})))
+
+(defn- write-atomic-0600-edn!
+  [^File parent-dir ^File target-file edn-map]
+  (.mkdirs parent-dir)
+  (let [tmp-file (File/createTempFile "keystore-" ".tmp" parent-dir)
+        payload (.getBytes (pr-str edn-map) StandardCharsets/UTF_8)]
+    (with-open [fos (FileOutputStream. tmp-file)]
+      (.write fos payload)
+      (.flush fos)
+      (.sync (.getFD fos)))
+    (try
+      (Files/setPosixFilePermissions (.toPath tmp-file) (PosixFilePermissions/fromString "rw-------"))
+      (catch UnsupportedOperationException _ nil))
+    (try
+      (Files/move (.toPath tmp-file) (.toPath target-file)
+                  (into-array java.nio.file.CopyOption [StandardCopyOption/ATOMIC_MOVE
+                                                        StandardCopyOption/REPLACE_EXISTING]))
+      (catch Exception _
+        (Files/move (.toPath tmp-file) (.toPath target-file)
+                    (into-array java.nio.file.CopyOption [StandardCopyOption/REPLACE_EXISTING]))))))
+
+(defn load-key-provider-identity!
+  "Row 11 Phase 1 uniform identity loader for JVM Light & Full Nodes.
+   - If `<state-dir>/identity/keystore.enc.edn` exists: unlocks via `kp/open-keystore-edn`
+     (tier `:encrypted-keystore-0600`). Wrong/missing passphrase fails closed with
+     `{:ok? false :error :keystore-unlock-failed :diagnostics [...]}` (never generates a new key!).
+   - Else if legacy `<state-dir>/identity/node-identity.edn` exists:
+     - If passphrase supplied: migrates atomically to `keystore.enc.edn` (`0600`), verifies round-trip open,
+       and emits `:keystore-migrated-to-encrypted` `:diagnose` (tier `:encrypted-keystore-0600`).
+     - Else: loads legacy key through `kp/make-memory-key-provider` with tier `:legacy-file-0600`
+       and emits loud `:legacy-plaintext-keystore-in-use` `:diagnose`.
+   - Else (new state-dir): generates Ed25519 identity, writing `keystore.enc.edn` if passphrase supplied
+     or `node-identity.edn` with loud advisory otherwise."
+  ([state-dir node-id]
+   (load-key-provider-identity! state-dir node-id {}))
+  ([state-dir node-id opts]
+   (let [identity-dir (io/file state-dir "identity")
+         _ (.mkdirs identity-dir)
+         enc-file (io/file identity-dir "keystore.enc.edn")
+         legacy-file (io/file identity-dir "node-identity.edn")
+         {:keys [passphrase diagnostics]} (resolve-keystore-passphrase! opts)
+         kdf-iters (long (or (:kdf-iterations opts) kp/min-kdf-iterations))]
+     (cond
+       ;; Case 1: Encrypted keystore exists -> MUST unlock (fail-closed)
+       (.exists enc-file)
+       (if (str/blank? (str passphrase))
+         {:ok? false
+          :error :keystore-unlock-failed
+          :diagnostics (conj (vec diagnostics)
+                             {:effect :diagnose
+                              :reason :keystore-unlock-failed
+                              :detail :missing-passphrase})}
+         (let [ks-map (try (edn/read-string (slurp enc-file)) (catch Exception _ nil))
+               opened (kp/open-keystore-edn ks-map passphrase)]
+           (if-not (:ok? opened)
+             {:ok? false
+              :error :keystore-unlock-failed
+              :diagnostics (conj (vec diagnostics)
+                                 {:effect :diagnose
+                                  :reason :keystore-unlock-failed
+                                  :detail (:error opened)})}
+             (let [seed (:seed-bytes opened)
+                   provider (kp/make-memory-key-provider seed :encrypted-keystore-0600)
+                   kp-map (crypto/pure-ed25519-keypair seed)
+                   spki-hex (basalt/bytes->hex (:public kp-map))
+                   pkcs8-hex (basalt/bytes->hex (:private kp-map))]
+               {:ok? true
+                :node-id node-id
+                :key-provider provider
+                :keystore-security-tier :encrypted-keystore-0600
+                :raw-pubkey-hex (kp/public-key provider)
+                :pubkey-hex spki-hex
+                :privkey-hex pkcs8-hex
+                :keypair kp-map
+                :diagnostics (vec diagnostics)}))))
+
+       ;; Case 2: Legacy node-identity.edn exists -> migrate if passphrase supplied, else loud advisory
+       (.exists legacy-file)
+       (let [legacy (load-or-create-node-identity! state-dir node-id)
+             seed (kp/extract-ed25519-seed (get-in legacy [:keypair :private]))]
+         (if-not (str/blank? (str passphrase))
+           (let [sealed-ks (kp/seal-keystore-edn {:pubkey (:pubkey-hex legacy)
+                                                  :seed-bytes seed
+                                                  :passphrase passphrase
+                                                  :iterations kdf-iters
+                                                  :created-ms (System/currentTimeMillis)})
+                 _ (write-atomic-0600-edn! identity-dir enc-file sealed-ks)
+                 verify-open (kp/open-keystore-edn (edn/read-string (slurp enc-file)) passphrase)]
+             (if-not (:ok? verify-open)
+               {:ok? false
+                :error :keystore-unlock-failed
+                :diagnostics (conj (vec diagnostics)
+                                   {:effect :diagnose
+                                    :reason :keystore-migration-verify-failed
+                                    :detail (:error verify-open)})}
+               (let [provider (kp/make-memory-key-provider seed :encrypted-keystore-0600)]
+                 (assoc legacy
+                        :ok? true
+                        :key-provider provider
+                        :keystore-security-tier :encrypted-keystore-0600
+                        :raw-pubkey-hex (kp/public-key provider)
+                        :diagnostics (conj (vec diagnostics)
+                                           {:effect :diagnose
+                                            :reason :keystore-migrated-to-encrypted
+                                            :path (.getAbsolutePath enc-file)})))))
+           (let [provider (kp/make-memory-key-provider seed :legacy-file-0600)]
+             (assoc legacy
+                    :ok? true
+                    :key-provider provider
+                    :keystore-security-tier :legacy-file-0600
+                    :raw-pubkey-hex (kp/public-key provider)
+                    :diagnostics (conj (vec diagnostics)
+                                       {:effect :diagnose
+                                        :reason :legacy-plaintext-keystore-in-use
+                                        :hint "Provide --keystore-passphrase-file or BITECHO_KEYSTORE_PASSPHRASE to migrate to keystore.enc.edn (0600)."})))))
+
+       ;; Case 3: Fresh state-dir
+       :else
+       (if-not (str/blank? (str passphrase))
+         (let [seed (crypto/random-bytes 32)
+               provider (kp/make-memory-key-provider seed :encrypted-keystore-0600)
+               kp-map (crypto/pure-ed25519-keypair seed)
+               sealed-ks (kp/seal-keystore-edn {:pubkey (kp/public-key provider)
+                                                :seed-bytes seed
+                                                :passphrase passphrase
+                                                :iterations kdf-iters
+                                                :created-ms (System/currentTimeMillis)})
+               _ (write-atomic-0600-edn! identity-dir enc-file sealed-ks)]
+           {:ok? true
+            :node-id node-id
+            :key-provider provider
+            :keystore-security-tier :encrypted-keystore-0600
+            :raw-pubkey-hex (kp/public-key provider)
+            :pubkey-hex (basalt/bytes->hex (:public kp-map))
+            :privkey-hex (basalt/bytes->hex (:private kp-map))
+            :keypair kp-map
+            :diagnostics (vec diagnostics)})
+         (let [legacy (load-or-create-node-identity! state-dir node-id)
+               seed (kp/extract-ed25519-seed (get-in legacy [:keypair :private]))
+               provider (kp/make-memory-key-provider seed :legacy-file-0600)]
+           (assoc legacy
+                  :ok? true
+                  :key-provider provider
+                  :keystore-security-tier :legacy-file-0600
+                  :raw-pubkey-hex (kp/public-key provider)
+                  :diagnostics (conj (vec diagnostics)
+                                     {:effect :diagnose
+                                      :reason :legacy-plaintext-keystore-in-use
+                                      :hint "Provide --keystore-passphrase-file or BITECHO_KEYSTORE_PASSPHRASE to use encrypted keystore.enc.edn (0600)."}))))))))

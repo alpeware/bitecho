@@ -624,4 +624,15 @@
           (is (= #{pk1 pk2} (:trusted-deploy-authorities p-csv)))
           (is (= #{} (:trusted-deploy-authorities p-empty)))
           (is (= #{} (:trusted-deploy-authorities p-none)))
-          (is (not (contains? p-omitted :trusted-deploy-authorities))))))))
+          (is (not (contains? p-omitted :trusted-deploy-authorities)))))
+
+      (testing "BIP-022 Stage C backup/identity verbs and --keystore-passphrase-file / --slot flags"
+        (let [flags (set cli/known-command-flags)
+              p-ks (shell/parse-light-node-args ["serve" "--keystore-passphrase-file" "/etc/bitecho/ks.pw" "--slot" "state-backup-v1"])]
+          (is (contains? flags "--keystore-passphrase-file"))
+          (is (contains? flags "--slot"))
+          (is (= "/etc/bitecho/ks.pw" (:keystore-passphrase-file p-ks)))
+          (is (= "state-backup-v1" (:slot p-ks)))
+          (doseq [v ["backup-put" "backup-restore" "backup-status" "identity-migrate"]]
+            (is (contains? cli/all-recognized-cli-verbs-set v))
+            (is (some? (get (cli/desugar-cli-cmd-map {"cmd" v}) "canonical_cmd")))))))))

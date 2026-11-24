@@ -1477,30 +1477,49 @@
                                             :error "chunk-store-quota-exceeded"
                                             :bytes_at_rest (:bytes-at-rest quota-res)
                                             :quota_bytes (:quota-bytes quota-res)})
-                       (let [sender (or (get-header req "x-bitecho-pubkey") (:default-sender rt))]
-                         (-> (write-disk-blob-async! (:state-dir rt) blob (:shell-atom rt))
-                             (.then (fn [persist-res]
-                                      (if-not (:ok? persist-res)
-                                        (send-json! res 500 {:ok false
-                                                             :error "blob-persist-failed"
-                                                             :detail (or (:detail persist-res) "disk-write-failed")})
-                                        (let [sub-res (submit-subnet-event! rt {:type :put-blob
-                                                                                :blob blob
-                                                                                :sender sender
-                                                                                :now-ms now-ms
-                                                                                :from-peer? replicated?
-                                                                                :skip-disk-write? true})]
-                                          (if-not (:applied? sub-res)
-                                            (send-json! res 500 {:ok false
-                                                                 :error "blob-index-failed"
-                                                                 :detail (name (or (:error sub-res) :put-blob-rejected))})
-                                            (send-json! res 200 {:ok true
-                                                                 :cid (:blob/cid blob)
-                                                                 :size_bytes blob-len}))))))
-                             (.catch (fn [e]
-                                       (send-json! res 500 {:ok false
-                                                            :error "blob-persist-failed"
-                                                            :detail (or (.-message e) (str e))}))))))))))))))
+                       (let [sender (or (get-header req "x-bitecho-pubkey") (:default-sender rt))
+                             adm (subnet/check-gate-admission (:policy inst) inst {:type :put-blob
+                                                                                   :blob blob
+                                                                                   :sender sender})]
+                         (if-not (:admitted? adm)
+                           (let [err-kw (or (:error adm) :not-in-allowlist)
+                                 status (cond
+                                          (= :payload-too-large err-kw) 413
+                                          (= :chunk-store-quota-exceeded err-kw) 507
+                                          :else 403)]
+                             (when (:shell-atom rt)
+                               (swap! (:shell-atom rt) core-infra/record-shell-diagnostic
+                                      {:effect :diagnose :reason :http-blob-rejected :error err-kw}))
+                             (send-json! res status {:ok false :error (name err-kw)}))
+                           (-> (write-disk-blob-async! (:state-dir rt) blob (:shell-atom rt))
+                               (.then (fn [persist-res]
+                                        (if-not (:ok? persist-res)
+                                          (send-json! res 503 {:ok false
+                                                               :error "blob-persist-failed"
+                                                               :detail (or (:detail persist-res) "disk-write-failed")})
+                                          (let [sub-res (submit-subnet-event! rt {:type :put-blob
+                                                                                  :blob blob
+                                                                                  :sender sender
+                                                                                  :now-ms now-ms
+                                                                                  :from-peer? replicated?
+                                                                                  :skip-disk-write? true})]
+                                            (if-not (:applied? sub-res)
+                                              (let [err-kw (or (:error sub-res) :put-blob-rejected)
+                                                    status (if (contains? #{:not-in-allowlist :unauthorized-pointer-authority
+                                                                            :invalid-or-missing-dac :mtls-admission-denied
+                                                                            :insufficient-stake :invalid-blob-cid}
+                                                                          err-kw)
+                                                             403
+                                                             503)]
+                                                (send-json! res status {:ok false
+                                                                        :error (name err-kw)}))
+                                              (send-json! res 200 {:ok true
+                                                                   :cid (:blob/cid blob)
+                                                                   :size_bytes blob-len}))))))
+                               (.catch (fn [e]
+                                         (send-json! res 503 {:ok false
+                                                              :error "blob-persist-failed"
+                                                              :detail (or (.-message e) (str e))})))))))))))))))
 
       (str/starts-with? clean-path "/artifact/v1/blob/")
       (if-not (contains? #{"GET" "HEAD"} method)

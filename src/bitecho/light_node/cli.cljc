@@ -208,20 +208,28 @@
    "web-release-rollback" {:canonical "put" :domain-cmd "web-release-rollback"}
    "web-release-verify"   {:canonical "get" :domain-cmd "web-release-verify"}})
 
+(def backup-identity-verb-desugar-table
+  "BIP-022 Stage C encrypted state backup/restore and keystore migration verbs (Rule 6)."
+  {"backup-put"       {:canonical "put" :domain-cmd "backup-put"}
+   "backup-restore"   {:canonical "get" :domain-cmd "backup-restore"}
+   "backup-status"    {:canonical "get" :domain-cmd "backup-status"}
+   "identity-migrate" {:canonical "ctl" :domain-cmd "identity-migrate"}})
+
 (def all-recognized-cli-verbs-set
   "Union of all 68 legacy verbs, 12 canonical verbs, shell/runner aliases, BIP-016 Rolodex/Memento verbs,
-   BIP-017a chunked-artifact verbs, and BIP-017b web-release verbs."
+   BIP-017a chunked-artifact verbs, BIP-017b web-release verbs, and BIP-022 Stage C backup/identity verbs."
   (-> supported-cli-verbs-set
       (into canonical-cli-verbs-set)
       (into (keys runner-alias-desugar-table))
       (into (keys memento-verb-desugar-table))
       (into (keys chunked-artifact-verb-desugar-table))
-      (into (keys web-release-verb-desugar-table))))
+      (into (keys web-release-verb-desugar-table))
+      (into (keys backup-identity-verb-desugar-table))))
 
 (def known-command-flags
   "Inventory of all supported CLI flags across Bitecho shells (Rule 6)."
   ["--state-dir" "--control-port" "--bootstrap" "--relay-url" "--relay-urls" "--quorum" "--subnet-id" "--subnet"
-   "--reset-network-state"
+   "--reset-network-state" "--keystore-passphrase-file" "--slot"
    "--subscribe-subnets" "--subnets" "--transport" "--proxy" "--timeout-ms" "--max-epoch-skew"
    "--cmd-file" "--events-out" "--session-id" "--session" "--min-seq" "--min-broadcast-seq"
    "--cursor" "--after-ts" "--min-balance" "--non-destructive"
@@ -1757,7 +1765,8 @@
         runner-entry (get runner-alias-desugar-table raw-verb)
         memento-entry (get memento-verb-desugar-table raw-verb)
         chunked-entry (get chunked-artifact-verb-desugar-table raw-verb)
-        web-release-entry (get web-release-verb-desugar-table raw-verb)]
+        web-release-entry (get web-release-verb-desugar-table raw-verb)
+        backup-id-entry (get backup-identity-verb-desugar-table raw-verb)]
     (cond
       (some? (get m "canonical_cmd"))
       m
@@ -1771,6 +1780,11 @@
       (assoc m
              "cmd" (:domain-cmd runner-entry)
              "canonical_cmd" (:canonical runner-entry))
+
+      backup-id-entry
+      (assoc m
+             "cmd" (:domain-cmd backup-id-entry)
+             "canonical_cmd" (:canonical backup-id-entry))
 
       memento-entry
       (assoc m

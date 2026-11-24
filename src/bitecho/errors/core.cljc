@@ -12,7 +12,7 @@
   "Canonical map of error keyword -> {:category :recoverable? :diagnose-reason}."
   {:session-not-open          {:category :session    :recoverable? true  :diagnose-reason :session-not-open}
    :session-not-found         {:category :session    :recoverable? false :diagnose-reason :session-not-found}
-   :session-quarantined       {:category :session    :recoverable? false :diagnose-reason :session-quarantined}
+   :session-quarantined       {:category :session    :recoverable? true  :diagnose-reason :session-quarantined}
    :replay-rejected           {:category :session    :recoverable? false :diagnose-reason :replay-rejected}
    :subnet-mismatch           {:category :validation :recoverable? false :diagnose-reason :subnet-mismatch}
    :insufficient-balance      {:category :validation :recoverable? false :diagnose-reason :insufficient-balance}
@@ -24,6 +24,7 @@
    :p2p-no-candidates         {:category :transport  :recoverable? true  :diagnose-reason :p2p-no-candidates}
    :send-failed               {:category :transport  :recoverable? true  :diagnose-reason :send-failed}
    :hardware-unlock-required  {:category :auth       :recoverable? true  :diagnose-reason :hardware-unlock-required}
+   :keystore-unlock-failed    {:category :auth       :recoverable? true  :diagnose-reason :keystore-unlock-failed}
    :storage-publish-failed    {:category :storage    :recoverable? true  :diagnose-reason :storage-publish-failed}
    :artifact-out-write-failed {:category :storage    :recoverable? true  :diagnose-reason :artifact-out-write-failed}
    :duplicate-instance        {:category :lifecycle  :recoverable? false :diagnose-reason :duplicate-instance}
@@ -80,6 +81,8 @@
             (str/includes? s "transport-disconnected")) :transport-disconnected
         (or (= s "hardware-unlock-required")
             (str/includes? s "hardware-unlock")) :hardware-unlock-required
+        (or (= s "keystore-unlock-failed")
+            (str/includes? s "keystore-unlock")) :keystore-unlock-failed
         (or (= s "session-not-open")
             (str/includes? s "session-not-open")) :session-not-open
         (or (= s "session-not-found")
