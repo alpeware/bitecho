@@ -5007,6 +5007,11 @@
                               (if (and (not (js/isNaN parsed)) (> (long parsed) 0))
                                 (long parsed)
                                 5000))
+                hang-ms (let [raw (aget (.-env js/process) "BITECHO_TEST_HANG_SHUTDOWN_MS")
+                              parsed (if raw (js/parseInt raw 10) 0)]
+                          (if (and (not (js/isNaN parsed)) (> (long parsed) 0))
+                            (long parsed)
+                            0))
                 shutting-down? (atom false)
                 shutdown! (fn []
                             (when (compare-and-set! shutting-down? false true)
@@ -5021,13 +5026,17 @@
                                                          "\n"))
                                             (catch :default _ nil))
                                           (.exit js/process 124))
-                                        watchdog-ms)]
-                                (when (.-unref wd) (.unref wd))
-                                (doseq [f @stop-fns]
-                                  (try (f) (catch :default _ nil)))
-                                (release-full-node-lock! state-dir my-lock-pid my-lock-token)
-                                (js/clearTimeout wd)
-                                (.exit js/process 0))))]
+                                        watchdog-ms)
+                                    pre-flush-p (if (pos? hang-ms)
+                                                  (js/Promise. (fn [resolve _] (js/setTimeout #(resolve true) hang-ms)))
+                                                  (js/Promise.resolve true))]
+                                (-> pre-flush-p
+                                    (.then (fn [_]
+                                             (doseq [f @stop-fns]
+                                               (try (f) (catch :default _ nil)))
+                                             (release-full-node-lock! state-dir my-lock-pid my-lock-token)
+                                             (js/clearTimeout wd)
+                                             (.exit js/process 0)))))))]
             (.on js/process "exit" (fn [_] (release-full-node-lock! state-dir my-lock-pid my-lock-token)))
             (.on js/process "SIGTERM" shutdown!)
             (.on js/process "SIGINT" shutdown!)))))))
@@ -5162,6 +5171,11 @@
                       (if (and (not (js/isNaN parsed)) (> (long parsed) 0))
                         (long parsed)
                         5000))
+        hang-ms (let [raw (aget (.-env js/process) "BITECHO_TEST_HANG_SHUTDOWN_MS")
+                      parsed (if raw (js/parseInt raw 10) 0)]
+                  (if (and (not (js/isNaN parsed)) (> (long parsed) 0))
+                    (long parsed)
+                    0))
         shutting-down? (atom false)
         shutdown! (fn []
                     (when (compare-and-set! shutting-down? false true)
@@ -5176,12 +5190,16 @@
                                                  "\n"))
                                     (catch :default _ nil))
                                   (.exit js/process 124))
-                                watchdog-ms)]
-                        (when (.-unref wd) (.unref wd))
-                        (println "Shutting down Bitecho node...")
-                        (try ((:stop! node)) (catch :default _ nil))
-                        (js/clearTimeout wd)
-                        (.exit js/process 0))))]
+                                watchdog-ms)
+                            pre-flush-p (if (pos? hang-ms)
+                                          (js/Promise. (fn [resolve _] (js/setTimeout #(resolve true) hang-ms)))
+                                          (js/Promise.resolve true))]
+                        (-> pre-flush-p
+                            (.then (fn [_]
+                                     (println "Shutting down Bitecho node...")
+                                     (try ((:stop! node)) (catch :default _ nil))
+                                     (js/clearTimeout wd)
+                                     (.exit js/process 0)))))))]
     (.on js/process "SIGTERM" shutdown!)
     (.on js/process "SIGINT" shutdown!)))
 

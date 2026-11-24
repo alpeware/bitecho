@@ -182,6 +182,41 @@
                               :last-access (long (or now-ms next-seq))))))
        idx))))
 
+(defn record-hit
+  "BIP-025 F1: Pure alias for `record-access`, incrementing GDSF hit count on cache hydration."
+  ([cache-index cid] (record-access cache-index cid nil))
+  ([cache-index cid now-ms] (record-access cache-index cid now-ms)))
+
+(defn record-evict
+  "Purely removes `cid` from `index` and decrements `:total-bytes`."
+  [index cid]
+  (let [norm-cid (some-> cid str str/lower-case)
+        existing (get-in index [:entries norm-cid])]
+    (if-not existing
+      index
+      (-> index
+          (update :entries dissoc norm-cid)
+          (update :total-bytes #(max 0 (- (long (or % 0)) (long (or (:size-bytes existing) 0)))))))))
+
+(defn prune-inline-hot-blobs
+  "BIP-025 F1: Purely bounds live in-memory `:blobs` in `state` to at most `max-hot-blobs`
+   (default 0 when spilled to Tier-2 disk/IDB cache) and removes duplicate `:artifact-blobs`,
+   `:storage-blobs`, `:capability-blobs` maps so process RSS stays flat under continuous replication."
+  ([state] (prune-inline-hot-blobs state 0))
+  ([state max-hot-blobs]
+   (if-not (map? state)
+     state
+     (let [cap (max 0 (long (or max-hot-blobs 0)))
+           blobs (or (:blobs state) {})
+           trimmed-blobs (if (<= (count blobs) cap)
+                           blobs
+                           (if (zero? cap)
+                             {}
+                             (into {} (take-last cap (sort-by key blobs)))))]
+       (-> state
+           (dissoc :artifact-blobs :storage-blobs :capability-blobs)
+           (assoc :blobs trimmed-blobs))))))
+
 (defn reclassify-tiers
   "Purely reclassifies all entries in `cache-index` against current Core State
    `:pinned-cids` and `:active-pointer-cids`."

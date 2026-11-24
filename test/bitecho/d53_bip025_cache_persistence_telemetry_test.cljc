@@ -14,20 +14,23 @@
             [bitecho.cache.core :as cache]
             [bitecho.core.data :as data]
             [bitecho.core.infra :as core-infra]
+            [bitecho.fressian :as fressian]
             [bitecho.light-node.cli :as cli]
             [bitecho.light-node.core :as light-core]
+            [bitecho.shell.browser :as browser]
             [bitecho.snapshot.core :as snap]
             [bitecho.state-machine :as sm]
             [bitecho.status.core :as status-core]
+            [clojure.set]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
-            #?(:clj [bitecho.fressian :as fressian])
             #?(:clj [bitecho.shell.light-node :as shell-light])
             #?(:clj [clojure.edn :as edn])
-            #?(:clj [clojure.java.io :as io]))
+            #?(:clj [clojure.java.io :as io])
+            #?(:cljs [bitecho.node-main :as node-main]))
   #?(:clj (:import [java.nio.file Files]
                    [java.nio.file.attribute FileAttribute])))
 
@@ -716,3 +719,429 @@
          (let [pm (edn/read-string (slurp edn-file))]
            (is (= :bitecho/incident-postmortem-v1 (:schema pm)))
            (is (= "INC-2026-11-24-ns1-event-loop-wedge" (:incident-id pm))))))))
+
+;; =============================================================================
+;; 10. BIP-025 Seq 2 (F1): End-to-End Runtime :cache-effects, Bounded :blobs,
+;;     GDSF Eviction Unlink, & :cache-hydrate Read-Through (JVM + Node + Browser)
+;; =============================================================================
+
+(defn- mk-bytes
+  [n fill-byte]
+  #?(:clj (let [ba (byte-array n)]
+            (java.util.Arrays/fill ba (unchecked-byte fill-byte))
+            ba)
+     :cljs (let [u8 (js/Uint8Array. n)]
+             (.fill u8 (bit-and fill-byte 0xff))
+             u8)))
+
+(deftest test-f1-browser-runtime-cache-effects-eviction-and-hydrate
+  (testing "Browser shell drains :cache-put, bounds live :blobs, evicts via GDSF, and hydrates back"
+    (browser/clear-in-memory-blob-cache!)
+    (let [b1 (mk-bytes 2048 11)
+          b2 (mk-bytes 2048 22)
+          b3 (mk-bytes 2048 33)
+          c1 (data/compute-cid b1)
+          c2 (data/compute-cid b2)
+          c3 (data/compute-cid b3)
+          st0 {:blobs {c1 b1 c2 b2 c3 b3}
+               :pinned-cids #{}
+               :pointers {}
+               :diagnostics {}}
+          effs [{:effect :cache-put :cid c1 :bytes b1 :size-bytes 2048 :media-type "application/octet-stream"}
+                {:effect :cache-put :cid c2 :bytes b2 :size-bytes 2048 :media-type "application/octet-stream"}
+                {:effect :cache-put :cid c3 :bytes b3 :size-bytes 2048 :media-type "application/octet-stream"}]
+          node-atom (atom st0)
+          _ (browser/execute-browser-cache-effects! effs node-atom {:max-cache-bytes 4500})
+          st1 @node-atom
+          idx @browser/*browser-cache-index*
+          retained-cids (set (keys (:entries idx)))
+          evicted-cids (clojure.set/difference #{c1 c2 c3} retained-cids)]
+      (is (empty? (:blobs st1)) "Live :blobs map must be pruned/bounded in memory")
+      (is (<= (:total-bytes idx) 4500) "GDSF eviction enforces cache budget")
+      (is (= 1 (count evicted-cids)) "Exactly 1 of 3 x 2 KiB blobs evicted under 4.5 KiB budget")
+      (is (pos? (get-in st1 [:diagnostics :cache-blob-evicted] 0)) "Eviction emits counted diagnostic")
+      (let [ret-cid (first retained-cids)
+            ev-cid (first evicted-cids)
+            hit-box (atom nil)
+            miss-box (atom nil)
+            _ (browser/hydrate-browser-cache-blob! ret-cid node-atom #(reset! hit-box %))
+            _ (browser/hydrate-browser-cache-blob! ev-cid node-atom #(reset! miss-box %))
+            hyd-hit @hit-box
+            hyd-miss @miss-box]
+        (is (true? (:ok? hyd-hit)) "Retained blob hydrates back after memory drop")
+        (is (true? (:hydrated? hyd-hit)))
+        (is (= ret-cid (data/compute-cid (if (map? (:blob hyd-hit)) (:blob/bytes (:blob hyd-hit)) (:blob hyd-hit)))))
+        (is (= 2 (get-in @browser/*browser-cache-index* [:entries ret-cid :freq]))
+            "Hydration increments GDSF hit count via cache/record-hit")
+        (is (false? (:ok? hyd-miss)) "Evicted blob misses on hydrate")
+        (is (= :cache-miss (:error hyd-miss)))
+        (is (pos? (get-in @node-atom [:diagnostics :cache-miss] 0))
+            "Cache miss emits counted :cache-miss diagnostic")))))
+
+#?(:clj
+   (deftest test-f1-jvm-runtime-cache-effects-eviction-and-hydrate
+     (testing "JVM light-node shell drains :cache-put to disk, bounds :blobs, unlinks evicted files, and hydrates"
+       (let [tmp-dir (.toFile (Files/createTempDirectory "bip025-f1-jvm-" (into-array FileAttribute [])))
+             b1 (mk-bytes 2048 41)
+             b2 (mk-bytes 2048 42)
+             b3 (mk-bytes 2048 43)
+             c1 (data/compute-cid b1)
+             c2 (data/compute-cid b2)
+             c3 (data/compute-cid b3)]
+         (try
+           (swap! shell-light/jvm-light-telemetry-atom assoc :cache-index (cache/init-cache-index) :diagnostics {})
+           (let [st-atom (atom {:blobs {c1 b1 c2 b2 c3 b3}
+                                :pinned-cids #{}
+                                :pointers {}
+                                :diagnostics {}})
+                 effs [{:effect :cache-put :cid c1 :bytes b1 :size-bytes 2048 :media-type "application/octet-stream"}
+                       {:effect :cache-put :cid c2 :bytes b2 :size-bytes 2048 :media-type "application/octet-stream"}
+                       {:effect :cache-put :cid c3 :bytes b3 :size-bytes 2048 :media-type "application/octet-stream"}]
+                 _ (shell-light/execute-cache-effects! (.getAbsolutePath tmp-dir) effs st-atom {:max-cache-bytes 4500})
+                 st1 @st-atom
+                 idx (:cache-index @shell-light/jvm-light-telemetry-atom)
+                 retained-cids (set (keys (:entries idx)))
+                 evicted-cids (clojure.set/difference #{c1 c2 c3} retained-cids)
+                 idx-file (io/file tmp-dir "cache" "index.fressian")]
+             (is (.exists idx-file) "cache/index.fressian written to disk")
+             (is (empty? (:blobs st1)) "Live :blobs pruned to stay bounded in memory")
+             (is (= 2 (count retained-cids)))
+             (is (= 1 (count evicted-cids)))
+             (is (pos? (get-in st1 [:diagnostics :cache-blob-evicted] 0)))
+             (doseq [cid retained-cids]
+               (let [[sh nc] (cache/cid-shard-relpath cid)]
+                 (is (.exists (io/file tmp-dir "cache" "blobs" sh nc)) "Retained blob file exists on disk")))
+             (doseq [cid evicted-cids]
+               (let [[sh nc] (cache/cid-shard-relpath cid)]
+                 (is (not (.exists (io/file tmp-dir "cache" "blobs" sh nc)))
+                     "Evicted blob file unlinked from disk")))
+             (let [ret-cid (first retained-cids)
+                   ev-cid (first evicted-cids)
+                   hyd-hit (shell-light/hydrate-cache-blob! (.getAbsolutePath tmp-dir) ret-cid st-atom)
+                   hyd-miss (shell-light/hydrate-cache-blob! (.getAbsolutePath tmp-dir) ev-cid st-atom)]
+               (is (true? (:ok? hyd-hit)))
+               (is (true? (:hydrated? hyd-hit)))
+               (is (= ret-cid (data/compute-cid (if (map? (:blob hyd-hit)) (:blob/bytes (:blob hyd-hit)) (:blob hyd-hit)))))
+               (is (= 2 (get-in @shell-light/jvm-light-telemetry-atom [:cache-index :entries ret-cid :freq])))
+               (is (false? (:ok? hyd-miss)))
+               (is (= :cache-miss (:error hyd-miss)))
+               (is (pos? (get-in @st-atom [:diagnostics :cache-miss] 0)))))
+           (finally
+             (doseq [f (reverse (file-seq tmp-dir))]
+               (.delete f))))))))
+
+#?(:cljs
+   (deftest test-f1-node-runtime-cache-effects-eviction-and-hydrate
+     (testing "Node.js light-node shell drains :cache-put to disk, bounds :blobs, unlinks evicted files, and hydrates"
+       (let [fs (js/require "node:fs")
+             os (js/require "node:os")
+             path (js/require "node:path")
+             tmp-dir (.mkdtempSync fs (.join path (.tmpdir os) "bip025-f1-node-"))
+             state-file (.join path tmp-dir "state.fressian")
+             b1 (mk-bytes 2048 51)
+             b2 (mk-bytes 2048 52)
+             b3 (mk-bytes 2048 53)
+             c1 (data/compute-cid b1)
+             c2 (data/compute-cid b2)
+             c3 (data/compute-cid b3)]
+         (try
+           (swap! node-main/light-runtime-telemetry-atom assoc :cache-index (cache/init-cache-index) :diagnostics {})
+           (let [st0 {:blobs {c1 b1 c2 b2 c3 b3}
+                      :pinned-cids #{}
+                      :pointers {}
+                      :diagnostics {}}
+                 effs [{:effect :cache-put :cid c1 :bytes b1 :size-bytes 2048 :media-type "application/octet-stream"}
+                       {:effect :cache-put :cid c2 :bytes b2 :size-bytes 2048 :media-type "application/octet-stream"}
+                       {:effect :cache-put :cid c3 :bytes b3 :size-bytes 2048 :media-type "application/octet-stream"}]
+                 st1 (node-main/execute-cache-effects! state-file st0 effs {:sync? true :max-cache-bytes 4500})
+                 idx (:cache-index @node-main/light-runtime-telemetry-atom)
+                 retained-cids (set (keys (:entries idx)))
+                 evicted-cids (clojure.set/difference #{c1 c2 c3} retained-cids)
+                 idx-file (.join path tmp-dir "cache" "index.fressian")]
+             (is (.existsSync fs idx-file) "cache/index.fressian written to disk")
+             (is (empty? (:blobs st1)) "Live :blobs pruned to stay bounded in memory")
+             (is (= 2 (count retained-cids)))
+             (is (= 1 (count evicted-cids)))
+             (is (pos? (get-in st1 [:diagnostics :cache-blob-evicted] 0)))
+             (doseq [cid retained-cids]
+               (let [[sh nc] (cache/cid-shard-relpath cid)]
+                 (is (.existsSync fs (.join path tmp-dir "cache" "blobs" sh nc)))))
+             (doseq [cid evicted-cids]
+               (let [[sh nc] (cache/cid-shard-relpath cid)]
+                 (is (not (.existsSync fs (.join path tmp-dir "cache" "blobs" sh nc)))
+                     "Evicted blob file unlinked on Node.js disk")))
+             (let [ret-cid (first retained-cids)
+                   ev-cid (first evicted-cids)
+                   hyd-hit (node-main/hydrate-cache-blob! state-file st1 ret-cid {:sync? true})
+                   hyd-miss (node-main/hydrate-cache-blob! state-file (:state hyd-hit) ev-cid {:sync? true})]
+               (is (true? (:hit? hyd-hit)))
+               (is (= :disk (:source hyd-hit)))
+               (is (= ret-cid (data/compute-cid (:bytes hyd-hit))))
+               (is (= 2 (get-in @node-main/light-runtime-telemetry-atom [:cache-index :entries ret-cid :freq])))
+               (is (false? (:hit? hyd-miss)))
+               (is (= :cache-miss (:reason hyd-miss)))
+               (is (pos? (get-in (:state hyd-miss) [:diagnostics :cache-miss] 0)))))
+           (finally
+             (.rmSync fs tmp-dir #js {:recursive true :force true})))))))
+
+;; =============================================================================
+;; 11. BIP-025 Seq 2 (F2): Load Wrappers Preserve Original Blobs & Retry Path
+;;     on Migration Failure (BOTH JVM and Node.js)
+;; =============================================================================
+
+#?(:clj
+   (deftest test-f2-jvm-load-wrapper-preserves-blobs-on-migration-failure
+     (testing "JVM load-light-state! preserves original inline blobs and blocks clobbering saves on ENOSPC"
+       (let [tmp-dir (.toFile (Files/createTempDirectory "bip025-f2-jvm-" (into-array FileAttribute [])))
+             state-file (io/file tmp-dir "state.fressian")
+             b1 (mk-bytes 2048 61)
+             c1 (data/compute-cid b1)
+             legacy-state {:schema-version 2
+                           :node-id "f2-jvm"
+                           :epoch 3
+                           :pinned-cids #{c1}
+                           :pointers {}
+                           :blobs {c1 b1}
+                           :diagnostics {}}
+             legacy-bytes (fressian/encode-wire legacy-state)]
+         (try
+           (with-open [fos (java.io.FileOutputStream. state-file)]
+             (.write fos legacy-bytes))
+           (let [loaded-fail (shell-light/load-light-state! (.getAbsolutePath state-file) {:host-free-bytes 100})]
+             (is (some? loaded-fail))
+             (is (true? (:migration-deferred? loaded-fail)))
+             (is (contains? (:blobs loaded-fail) c1)
+                 "Original inline blobs MUST be preserved on migration failure")
+             (is (pos? (get-in loaded-fail [:diagnostics :migration-insufficient-disk-space] 0)))
+             ;; Next save MUST NOT overwrite/strip legacy state.fressian
+             (is (false? (shell-light/save-light-state! (.getAbsolutePath state-file) loaded-fail)))
+             (is (= (count legacy-bytes) (.length state-file))
+                 "Legacy state.fressian must remain untouched for retry")
+             ;; Retry succeeds once disk space is available
+             (let [loaded-ok (shell-light/load-light-state! (.getAbsolutePath state-file) {:host-free-bytes (* 10 1024 1024 1024)})
+                   [sh nc] (cache/cid-shard-relpath c1)]
+               (is (not (:migration-deferred? loaded-ok)))
+               (is (.exists (io/file tmp-dir "cache" "blobs" sh nc))
+                   "Retry migrates preserved blob to Tier-2 cache")))
+           (finally
+             (doseq [f (reverse (file-seq tmp-dir))]
+               (.delete f))))))))
+
+#?(:cljs
+   (deftest test-f2-node-load-wrapper-preserves-blobs-on-migration-failure
+     (testing "Node.js load-light-state! preserves original inline blobs and blocks clobbering saves on ENOSPC"
+       (let [fs (js/require "node:fs")
+             os (js/require "node:os")
+             path (js/require "node:path")
+             tmp-dir (.mkdtempSync fs (.join path (.tmpdir os) "bip025-f2-node-"))
+             state-file (.join path tmp-dir "state.fressian")
+             b1 (mk-bytes 2048 62)
+             c1 (data/compute-cid b1)
+             legacy-state {:schema-version 2
+                           :node-id "f2-node"
+                           :epoch 3
+                           :pinned-cids #{c1}
+                           :pointers {}
+                           :blobs {c1 b1}
+                           :diagnostics {}}
+             legacy-bytes (fressian/encode-wire legacy-state)]
+         (try
+           (.writeFileSync fs state-file legacy-bytes)
+           (let [loaded-fail (node-main/load-light-state! state-file {:host-free-bytes 100})]
+             (is (some? loaded-fail))
+             (is (true? (:migration-deferred? loaded-fail)))
+             (is (contains? (:blobs loaded-fail) c1)
+                 "Original inline blobs MUST be preserved on migration failure")
+             (is (pos? (get-in loaded-fail [:diagnostics :migration-insufficient-disk-space] 0)))
+             ;; Next sync or async save MUST NOT overwrite/strip legacy state.fressian
+             (is (false? (node-main/save-light-state! state-file loaded-fail)))
+             (is (false? (node-main/save-light-state-async! state-file loaded-fail)))
+             (is (= (.-byteLength legacy-bytes) (.-size (.statSync fs state-file)))
+                 "Legacy state.fressian must remain untouched for retry")
+             ;; Retry succeeds once disk space is available
+             (let [loaded-ok (node-main/load-light-state! state-file {:host-free-bytes (* 10 1024 1024 1024)})
+                   [sh nc] (cache/cid-shard-relpath c1)]
+               (is (not (:migration-deferred? loaded-ok)))
+               (is (.existsSync fs (.join path tmp-dir "cache" "blobs" sh nc))
+                   "Retry migrates preserved blob to Tier-2 cache")))
+           (finally
+             (.rmSync fs tmp-dir #js {:recursive true :force true})))))))
+
+;; =============================================================================
+;; 12. BIP-025 Seq 2 (F3): :ctl-ms Latency Recording, :ctl-latency-high,
+;;     and Live Telemetry in Light-Node `status` (`bitecho.status/v1`)
+;; =============================================================================
+
+(deftest test-f3-ctl-latency-recording-and-live-status-telemetry
+  (testing "record-ctl-latency! records :ctl-ms, fires :ctl-latency-high, and render-status surfaces live metrics"
+    (let [st-atom (atom (light-core/init-light-state {:pubkey-hex "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"} {}))
+          effs-ok #?(:clj (shell-light/record-ctl-latency! 15 st-atom)
+                     :cljs (node-main/record-ctl-latency! 15 st-atom))
+          effs-hi #?(:clj (shell-light/record-ctl-latency! 850 st-atom)
+                     :cljs (node-main/record-ctl-latency! 850 st-atom))
+          rctx #?(:clj (shell-light/build-light-runtime-ctx)
+                  :cljs (node-main/build-light-runtime-ctx))
+          status-res (light-core/handle-command (assoc @st-atom :runtime-ctx rctx) {"cmd" "status"} nil)
+          resp (:response status-res)
+          lat (get resp "latency")
+          ctl-lat (get lat "ctl_latency_ms")]
+      (is (empty? effs-ok) "15ms is below 500ms :ctl-ms warn threshold")
+      (is (= :ctl-latency-high (:reason (first effs-hi)))
+          "850ms exceeds 500ms threshold and emits :ctl-latency-high")
+      (is (pos? (get-in @st-atom [:diagnostics :ctl-latency-high] 0)))
+      (is (map? lat) "bitecho.status/v1 surfaces live latency map")
+      (is (>= (long (or (get ctl-lat "p95") 0)) 850))
+      (is (>= (long (or (get ctl-lat "max") 0)) 850))
+      (is (map? (get resp "storage")) "bitecho.status/v1 surfaces live storage map"))))
+
+;; =============================================================================
+;; 13. BIP-025 Seq 2 (F4): Real Hot-Path Zero-Sync-IO Static Guard (S6.1 #7)
+;; =============================================================================
+
+#?(:clj
+   (defn- extract-top-level-defns
+     "Parses a Clojure/ClojureScript source file into a map of `{fn-name-str form-text}`
+      for all top-level `(defn ...)` and `(defn- ...)` definitions."
+     [src-str]
+     (let [n (count src-str)]
+       (loop [i 0
+              acc {}]
+         (if (>= i n)
+           acc
+           (let [idx (str/index-of src-str "\n(defn" i)]
+             (if-not idx
+               acc
+               (let [start (inc idx)
+                     end (loop [j start
+                                depth 0
+                                in-str? false
+                                esc? false
+                                in-comment? false]
+                           (if (>= j n)
+                             n
+                             (let [ch (.charAt src-str j)]
+                               (cond
+                                 in-comment?
+                                 (recur (inc j) depth false false (not= ch \newline))
+
+                                 in-str?
+                                 (if esc?
+                                   (recur (inc j) depth true false false)
+                                   (cond
+                                     (= ch \\) (recur (inc j) depth true true false)
+                                     (= ch \") (recur (inc j) depth false false false)
+                                     :else (recur (inc j) depth true false false)))
+
+                                 (= ch \;)
+                                 (recur (inc j) depth false false true)
+
+                                 (= ch \")
+                                 (recur (inc j) depth true false false)
+
+                                 (= ch \()
+                                 (recur (inc j) (inc depth) false false false)
+
+                                 (= ch \))
+                                 (let [d' (dec depth)]
+                                   (if (zero? d')
+                                     (inc j)
+                                     (recur (inc j) d' false false false)))
+
+                                 :else
+                                 (recur (inc j) depth false false false)))))
+                     form-str (subs src-str start end)
+                     [_ fn-name] (re-find #"^\(defn-?\s+(?:\^[^\s]+\s+)?([^\s\(\[]+)" form-str)]
+                 (recur end (if fn-name (assoc acc fn-name form-str) acc))))))))))
+
+#?(:clj
+   (defn- strip-strings-and-comments
+     "Removes Clojure string literals and `;` line comments from `s` so static regex guards
+      only inspect executable code tokens (never docstrings or comments)."
+     [s]
+     (let [sb (StringBuilder.)
+           n (count s)]
+       (loop [i 0
+              in-str? false
+              esc? false
+              in-comment? false]
+         (if (>= i n)
+           (.toString sb)
+           (let [ch (.charAt s i)]
+             (cond
+               in-comment?
+               (do (when (= ch \newline) (.append sb \newline))
+                   (recur (inc i) false false (not= ch \newline)))
+
+               in-str?
+               (if esc?
+                 (recur (inc i) true false false)
+                 (cond
+                   (= ch \\) (recur (inc i) true true false)
+                   (= ch \") (recur (inc i) false false false)
+                   :else (recur (inc i) true false false)))
+
+               (= ch \;)
+               (recur (inc i) false false true)
+
+               (= ch \")
+               (recur (inc i) true false false)
+
+               :else
+               (do (.append sb ch)
+                   (recur (inc i) false false false)))))))))
+
+#?(:clj
+   (deftest test-f4-hot-path-zero-sync-io-static-guard
+     (testing "Hot-path handlers in node_main.cljs and full_node_main.cljs contain ZERO synchronous fs/*Sync or save-light-state! calls"
+       (let [sync-io-re #"\.(writeFileSync|renameSync|fsyncSync|readFileSync|unlinkSync|mkdirSync|statSync)\b|\b(save-light-state!|write-bytes-atomic!)\b"
+             node-defns (extract-top-level-defns (slurp "src/bitecho/node_main.cljs"))
+             full-defns (extract-top-level-defns (slurp "src/bitecho/full_node_main.cljs"))
+             node-hot-paths ["handle-serve-line!"
+                             "dispatch-light-writer-effects!"
+                             "save-light-state-async!"
+                             "save-light-state-barrier!"
+                             "write-cache-blob-async!"
+                             "save-cache-index-async!"
+                             "delete-cache-blob-async!"]
+             full-hot-paths ["dispatch-snapshot-writer-effects!"
+                             "persist-full-node-state-async!"]]
+         (is (pos? (count node-defns)) "Parsed top-level defns from node_main.cljs")
+         (is (pos? (count full-defns)) "Parsed top-level defns from full_node_main.cljs")
+         (doseq [fn-name node-hot-paths]
+           (let [body (get node-defns fn-name)
+                 code-only (when body (strip-strings-and-comments body))]
+             (is (some? body) (str "Expected hot-path defn " fn-name " in node_main.cljs"))
+             (is (nil? (re-find sync-io-re (or code-only "")))
+                 (str "Hot-path function " fn-name " in node_main.cljs MUST NOT perform synchronous disk I/O"))))
+         (doseq [fn-name full-hot-paths]
+           (when-let [body (get full-defns fn-name)]
+             (is (nil? (re-find sync-io-re (strip-strings-and-comments body)))
+                 (str "Hot-path function " fn-name " in full_node_main.cljs MUST NOT perform synchronous disk I/O"))))))))
+
+;; =============================================================================
+;; 14. BIP-025 Seq 2 (F5 + F6): Browser Error Callback Diagnostic & ?v= Bump
+;; =============================================================================
+
+(deftest test-f5-browser-cache-persist-error-callback-never-silent
+  (testing "Browser load-persisted-state / cache persist errors emit counted :browser-cache-persist-failed diagnostic"
+    (browser/clear-in-memory-blob-cache!)
+    (browser/record-browser-cache-diagnostic! :browser-cache-persist-failed "simulated-idb-quota-error")
+    (is (= 1 (get @browser/*browser-cache-diagnostics* :browser-cache-persist-failed)))
+    #?(:clj
+       (let [browser-src (slurp "src/bitecho/shell/browser.cljc")
+             browser-main-src (slurp "src/bitecho/browser_main.cljs")
+             node-main-src (slurp "src/bitecho/node_main.cljs")
+             full-main-src (slurp "src/bitecho/full_node_main.cljs")
+             build-script (slurp "scripts/build-browser-bundle.sh")]
+         (is (str/includes? browser-src ":browser-cache-persist-failed")
+             "F5: Browser load migration must attach error callback emitting :browser-cache-persist-failed")
+         (is (str/includes? build-script "?v=0.23.22-bip025")
+             "F6: build-browser-bundle.sh bumps ?v= query param alongside new SRI")
+         (is (str/includes? node-main-src "migrated_count")
+             "V-RT1: stderr migration diagnostic includes migrated_count / deduplicated_count / reclaimed_bytes")
+         (is (str/includes? node-main-src "BITECHO_TEST_HANG_SHUTDOWN_MS")
+             "V-RT4: Node light-node SIGTERM watchdog is async with testable hang hook")
+         (is (str/includes? full-main-src "BITECHO_TEST_HANG_SHUTDOWN_MS")
+             "V-RT4: Node full-node SIGTERM watchdog is async with testable hang hook")
+         (is (str/includes? browser-main-src "V-RT5")
+             "V-RT5: Browser init-node triggers v1->v2 IDB migration before any persist-state overwrite")))))

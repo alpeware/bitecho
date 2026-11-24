@@ -6,6 +6,7 @@
             [bitecho.basalt.core :as basalt]
             [bitecho.bech32m :as bech32m]
             [bitecho.browser-cli :as browser-cli]
+            [bitecho.cache.core :as cache]
             [bitecho.config :as config]
             [bitecho.config.flags :as flags]
             [bitecho.core.protocol.relay :as relay]
@@ -704,6 +705,15 @@
                           :burned-ech 0
                           :autonomous? false})]
      (reset! active-node-atom node-atom)
+     ;; BIP-025 (V-RT5): Trigger v1->v2 IDB blob migration before any persist-state overwrite can occur.
+     (when-not (false? (:restore-persisted? opts-map))
+       (try
+         (browser/load-persisted-state
+          (fn [err _loaded]
+            (when err
+              (browser/record-browser-cache-diagnostic! :browser-cache-persist-failed (str err)))))
+         (catch :default e
+           (browser/record-browser-cache-diagnostic! :browser-cache-persist-failed (str e)))))
      (start-browser-tab-lock! node-atom)
      (when-not (false? (:auto-sync? opts-map))
        (start-browser-auto-sync! node-atom))
@@ -1140,7 +1150,9 @@
                                        :degraded? degraded?}
                         :sync-state (:auto-sync node)
                         :lock-state (:instance-lock node)
-                        :security-flags sec-flags-echo}
+                        :security-flags sec-flags-echo
+                        :storage (merge (cache/cache-storage-summary @browser/*browser-cache-index*)
+                                        {:cache-budget-bytes cache/default-browser-max-cache-bytes})}
            canonical (status-core/render-status st-for-render runtime-ctx)
            canon-diags (get canonical "diagnostics")
            merged-diags (merge
@@ -1454,6 +1466,8 @@
             prev-inbox (vec (get-in st [:inbox] []))
             prev-bcasts (vec (get-in st [:broadcast-inbox] []))
             res (light-core/handle-wire-payload st env privkey)
+            _ (when (seq (:cache-effects res))
+                (browser/execute-browser-cache-effects! (:cache-effects res) node-atom))
             new-st (:state res)
             curr-inbox (vec (get-in new-st [:inbox] []))
             curr-bcasts (vec (get-in new-st [:broadcast-inbox] []))
@@ -3197,6 +3211,8 @@
                 out-envs (:net-envelopes cmd-res)
                 resp (:response cmd-res)]
             (swap! na assoc :light-state new-st)
+            (when (seq (:cache-effects cmd-res))
+              (browser/execute-browser-cache-effects! (:cache-effects cmd-res) na))
             (doseq [env out-envs]
               (route-browser-envelope! na env))
             (browser/persist-state! (browser/sanitize-state-for-persistence @na))

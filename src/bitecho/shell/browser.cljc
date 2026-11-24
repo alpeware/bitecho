@@ -1076,6 +1076,39 @@
   *in-memory-idb-blob-cache*
   (atom {}))
 
+(defonce ^{:doc "Pure Sans-IO local cache index for browser blob cache eviction & telemetry (BIP-025 F1)."
+           :dynamic true}
+  *browser-cache-index*
+  (atom (cache/init-cache-index)))
+
+(defonce ^{:doc "Counted Rule 5 diagnostics for browser blob cache operations (BIP-025 F1 & F5)."
+           :dynamic true}
+  *browser-cache-diagnostics*
+  (atom {}))
+
+(defn clear-in-memory-blob-cache!
+  "Resets in-memory browser blob cache fallback, cache index, and cache diagnostics (for tests)."
+  []
+  (reset! *in-memory-idb-blob-cache* {})
+  (reset! *browser-cache-index* (cache/init-cache-index))
+  (reset! *browser-cache-diagnostics* {})
+  nil)
+
+(defn record-browser-cache-diagnostic!
+  "BIP-025 F5 (Rule 5): Increments counted diagnostic `reason` in `*browser-cache-diagnostics*`
+   and optionally in `state-atom` `[:light-state :diagnostics reason]` or `[:diagnostics reason]`."
+  ([reason] (record-browser-cache-diagnostic! reason nil nil))
+  ([reason detail] (record-browser-cache-diagnostic! reason nil detail))
+  ([reason state-atom _detail]
+   (when (keyword? reason)
+     (swap! *browser-cache-diagnostics* update reason (fnil inc 0))
+     (when state-atom
+       (swap! state-atom
+              (fn [st]
+                (if (contains? st :light-state)
+                  (update-in st [:light-state :diagnostics reason] (fnil inc 0))
+                  (update-in st [:diagnostics reason] (fnil inc 0)))))))))
+
 (def idb-schema-version
   "BIP-025 §2.5 (V3): Atomic IndexedDB schema version (v1 -> v2) adding lossy `\"bitecho-blob-cache\"`."
   2)
@@ -1211,6 +1244,138 @@
          :clj
          (when cb (cb nil (get @*in-memory-idb-blob-cache* norm-cid)))))))
 
+(defn delete-blob-cache-entry!
+  "BIP-025 F1: Deletes an evicted CID from IndexedDB `\"bitecho-blob-cache\"` and in-memory fallback.
+   Never swallows errors silently (Rule 5: emits `:browser-cache-delete-failed`)."
+  ([cid] (delete-blob-cache-entry! cid nil))
+  ([cid cb]
+   (let [norm-cid (cache/normalize-cid cid)]
+     (if-not norm-cid
+       (do (when cb (cb {:ok? false :error :invalid-cid} nil))
+           {:ok? false :error :invalid-cid})
+       (do
+         (swap! *in-memory-idb-blob-cache* dissoc norm-cid)
+         #?(:cljs
+            (if (and (exists? js/indexedDB) (some? js/indexedDB))
+              (try
+                (let [req (.open js/indexedDB "bitecho-db" 2)]
+                  (gobj/set req "onupgradeneeded" upgrade-bitecho-idb-v2!)
+                  (gobj/set req "onsuccess"
+                            (fn [e]
+                              (let [db (gobj/get (gobj/get e "target") "result")
+                                    tx-fn (gobj/get db "transaction")
+                                    tx (.call tx-fn db #js ["bitecho-blob-cache"] "readwrite")
+                                    os-fn (gobj/get tx "objectStore")
+                                    store (.call os-fn tx "bitecho-blob-cache")
+                                    del-fn (gobj/get store "delete")
+                                    del-req (.call del-fn store norm-cid)]
+                                (gobj/set del-req "onsuccess" (fn [_] (when cb (cb nil {:ok? true :cid norm-cid}))))
+                                (gobj/set del-req "onerror"
+                                          (fn [err]
+                                            (record-browser-cache-diagnostic! :browser-cache-delete-failed nil err)
+                                            (when cb (cb err nil)))))))
+                  (gobj/set req "onerror"
+                            (fn [err]
+                              (record-browser-cache-diagnostic! :browser-cache-delete-failed nil err)
+                              (when cb (cb err nil)))))
+                (catch :default err
+                  (record-browser-cache-diagnostic! :browser-cache-delete-failed nil err)
+                  (when cb (cb err nil))))
+              (when cb (cb nil {:ok? true :cid norm-cid :in-memory? true})))
+            :clj
+            (do
+              (when cb (cb nil {:ok? true :cid norm-cid :in-memory? true}))
+              {:ok? true :cid norm-cid :in-memory? true})))))))
+
+(defn execute-browser-cache-effects!
+  "BIP-025 F1: Drains pure `:cache-effects` (`:cache-put`) emitted by `light_node/core` reducers:
+   1. Persists each blob into IndexedDB `\"bitecho-blob-cache\"` (with Rule 5 error callback).
+   2. Updates `*browser-cache-index*` via `cache/record-put`.
+   3. Runs `cache/plan-evictions` against `max-cache-bytes` and deletes evicted CIDs from IDB + emits counted `:diagnose`.
+   4. Bounds/drops live `:blobs` in `node-atom` (`cache/prune-inline-hot-blobs`) so Browser RAM stays flat."
+  ([cache-effects node-atom] (execute-browser-cache-effects! cache-effects node-atom nil))
+  ([cache-effects node-atom opts]
+   (when (seq cache-effects)
+     (let [max-budget (long (or (:max-cache-bytes opts) cache/default-browser-max-cache-bytes))
+           max-hot (long (or (:max-hot-blobs opts) 0))
+           st-snap (when node-atom
+                     (let [v @node-atom]
+                       (or (:light-state v) v)))
+           pinned (set (or (:pinned-cids opts) (:pinned-cids st-snap) #{}))
+           active (into #{} (keep :pointer/target) (vals (or (:pointers st-snap) {})))]
+       (doseq [eff cache-effects]
+         (when (= :cache-put (:effect eff))
+           (let [cid (cache/normalize-cid (:cid eff))
+                 blob (:blob eff)
+                 bs (or (:blob/bytes blob) (:bytes eff))
+                 sz (long (or (:size-bytes eff) (when bs (fressian/count-bytes bs)) 0))
+                 mt (or (:media-type eff) (:blob/media-type blob) "application/octet-stream")
+                 tier (or (:tier eff) (cache/classify-tier cid pinned active))]
+             (when (and cid bs)
+               (persist-blob-cache-entry!
+                cid bs {:media-type mt :size-bytes sz}
+                (fn [err _]
+                  (when err
+                    (record-browser-cache-diagnostic! :browser-cache-persist-failed node-atom err))))
+               (swap! *browser-cache-index* cache/record-put
+                      {:cid cid :size-bytes sz :media-type mt :tier tier})))))
+       ;; Plan and execute GDSF evictions
+       (let [ev-res (cache/plan-evictions @*browser-cache-index*
+                                          {:max-cache-bytes max-budget
+                                           :pinned-cids pinned
+                                           :active-pointer-cids active})]
+         (reset! *browser-cache-index* (:cache-index ev-res))
+         (doseq [eff (:effects ev-res)]
+           (case (:effect eff)
+             :cache-delete (delete-blob-cache-entry! (:cid eff))
+             :diagnose (record-browser-cache-diagnostic! (:reason eff) node-atom eff)
+             nil)))
+       ;; Bound live in-memory :blobs so RAM stays flat
+       (when node-atom
+         (swap! node-atom
+                (fn [cur]
+                  (if (contains? cur :light-state)
+                    (update cur :light-state cache/prune-inline-hot-blobs max-hot)
+                    (cache/prune-inline-hot-blobs cur max-hot)))))
+       {:ok? true
+        :cache-summary (cache/cache-storage-summary @*browser-cache-index*)}))))
+
+(defn hydrate-browser-cache-blob!
+  "BIP-025 F1: Read-through hydration for Browser blob cache.
+   Checks hot `:blobs` in `node-atom` first; on miss, loads from IndexedDB `\"bitecho-blob-cache\"`,
+   increments GDSF hit count (`cache/record-hit`) on hit, or emits counted `:cache-miss` diagnostic on miss.
+   Invokes `(cb {:ok? bool :blob blob :hydrated? bool :error kw})`."
+  [cid node-atom cb]
+  (let [norm-cid (cache/normalize-cid cid)
+        st-snap (when node-atom
+                  (let [v @node-atom]
+                    (or (:light-state v) v)))
+        hot-blob (when norm-cid (get-in st-snap [:blobs norm-cid]))]
+    (cond
+      (nil? norm-cid)
+      (do
+        (record-browser-cache-diagnostic! :cache-miss node-atom {:cid cid})
+        (when cb (cb {:ok? false :error :cache-miss :cid cid})))
+
+      (some? hot-blob)
+      (do
+        (swap! *browser-cache-index* cache/record-hit norm-cid)
+        (when cb (cb {:ok? true :blob hot-blob :hydrated? false :cid norm-cid})))
+
+      :else
+      (load-blob-cache-entry
+       norm-cid
+       (fn [err entry]
+         (if (and (nil? err) (some? (:bytes entry)))
+           (let [blob {:blob/cid norm-cid
+                       :blob/bytes (:bytes entry)
+                       :blob/media-type (or (get-in entry [:meta :media-type]) "application/octet-stream")}]
+             (swap! *browser-cache-index* cache/record-hit norm-cid)
+             (when cb (cb {:ok? true :blob blob :hydrated? true :cid norm-cid})))
+           (do
+             (record-browser-cache-diagnostic! :cache-miss node-atom {:cid norm-cid :error err})
+             (when cb (cb {:ok? false :error :cache-miss :cid norm-cid})))))))))
+
 (defn persist-state!
   "Persists sanitized Core State into IndexedDB (`\"bitecho-db\"` v2, store `\"bitecho-state\"`,
    key `\"light-node-state\"`) or fallback atom, stripping inline blob maps per BIP-025 §2.2/2.5."
@@ -1285,7 +1450,11 @@
                                                extracted (light-node/extract-legacy-inline-blobs raw-decoded)
                                                _ (when (:had-inline-blobs? extracted)
                                                    (doseq [[cid info] (:unique-blobs extracted)]
-                                                     (persist-blob-cache-entry! cid (:bytes info) {:media-type (:media-type info) :size-bytes (:size-bytes info)})))
+                                                     (persist-blob-cache-entry!
+                                                      cid (:bytes info) {:media-type (:media-type info) :size-bytes (:size-bytes info)}
+                                                      (fn [err _]
+                                                        (when err
+                                                          (record-browser-cache-diagnostic! :browser-cache-persist-failed nil err))))))
                                                decoded (sanitize-state-for-persistence (:compacted-state extracted))]
                                            (cb nil decoded))
                                          (cb nil nil)))))
