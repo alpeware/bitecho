@@ -298,6 +298,13 @@
                          (dissoc :privkey-bytes))))
             (reset! anchor-state-atom
                     (light-core/init-anchor-state {:pubkey saved-pub} {})))
+          (let [cur-node @node-atom
+                cur-lock-id (get-in cur-node [:instance-lock :lock-id])
+                target-sub (or (get-in cur-node [:light-state :subnet-id]) (:subnet-id cur-node) "global")
+                target-pub (or (get-in cur-node [:light-state :pubkey]) saved-pub "anon")
+                target-lock-id (str "bitecho-node-" target-sub "-" target-pub)]
+            (when (not= cur-lock-id target-lock-id)
+              (start-browser-tab-lock! node-atom)))
           (notify-ui-listeners!)
           (let [hw-locked? (nil? (get-in @node-atom [:keypair :private-key]))]
             (-> clean-loaded
@@ -637,12 +644,20 @@
                            (let [params (js/URLSearchParams. (.-search (.-location js/window)))]
                              (or (.get params "relay-url") (.get params "relayUrl")))
                            (catch :default _ nil))))
+         sync-interval-ms (or (:sync-interval-ms opts-map) (:syncIntervalMs opts-map))
+         stall-threshold-ms (or (:stall-threshold-ms opts-map) (:stallThresholdMs opts-map))
+         custom-bootstrap (let [b (:bootstrap opts-map)
+                                vals-opt (:validators opts-map)]
+                            (cond
+                              (map? b) (if vals-opt (assoc b :validators vals-opt) b)
+                              (some? vals-opt) (assoc default-bootstrap-descriptor :validators vals-opt)
+                              :else default-bootstrap-descriptor))
          keypair (crypto/generate-keypair)
          x25519 (sealed/generate-x25519-keypair)
          pubkey-hex (fressian/bytes->hex (:public-key keypair))
          init-light (light-core/init-light-state {:pubkey-hex pubkey-hex}
                                                  {:subnet-id subnet-id
-                                                  :bootstrap default-bootstrap-descriptor
+                                                  :bootstrap custom-bootstrap
                                                   :economy-enabled? true
                                                   :burn-floor 100
                                                   :autonomous? false})
@@ -656,11 +671,16 @@
                           :default-subnet-id default-subnet-id
                           :reset-network-state? reset-network-state?
                           :relay-url relay-url
+                          :sync-interval-ms sync-interval-ms
+                          :stall-threshold-ms stall-threshold-ms
                           :keypair keypair
                           :x25519 x25519
                           :conn conn-state
                           :mesh-conns mesh-conns
-                          :auto-sync (sync-core/init-sync-state {:generation 1})
+                          :auto-sync (sync-core/init-sync-state
+                                      (cond-> {:generation 1}
+                                        sync-interval-ms (assoc :interval-ms sync-interval-ms)
+                                        stall-threshold-ms (assoc :stall-threshold-ms stall-threshold-ms)))
                           :instance-lock (lock-core/init-lock-state
                                           {:mode :web-lock
                                            :lock-id (str "bitecho-node-"
@@ -1766,16 +1786,28 @@
 
 (defonce ^:private auto-sync-runtime-atom (atom {:timer nil :abort-ctrl nil :online-fn nil :vis-fn nil}))
 
+(defn- current-doc-visibility
+  []
+  (if (and (exists? js/document) (= (aget js/document "visibilityState") "hidden"))
+    :hidden
+    :visible))
+
 (defn- stop-browser-auto-sync!
   "Tears down browser background auto-sync timers, listeners, and in-flight AbortController (BIP-022 Stage B Row 5)."
   [node-atom]
   (let [{:keys [timer abort-ctrl online-fn vis-fn]} @auto-sync-runtime-atom]
     (when timer (try (js/clearInterval timer) (catch :default _ nil)))
-    (when abort-ctrl (try (.abort abort-ctrl) (catch :default _ nil)))
-    (when (and online-fn (exists? js/window) (fn? (.-removeEventListener js/window)))
-      (try (.removeEventListener js/window "online" online-fn) (catch :default _ nil)))
-    (when (and vis-fn (exists? js/document) (fn? (.-removeEventListener js/document)))
-      (try (.removeEventListener js/document "visibilitychange" vis-fn) (catch :default _ nil)))
+    (when abort-ctrl
+      (try
+        (when-let [abort-fn (aget abort-ctrl "abort")]
+          (.call abort-fn abort-ctrl))
+        (catch :default _ nil)))
+    (when (and online-fn (exists? js/window))
+      (when-let [rem-fn (aget js/window "removeEventListener")]
+        (try (.call rem-fn js/window "online" online-fn) (catch :default _ nil))))
+    (when (and vis-fn (exists? js/document))
+      (when-let [rem-fn (aget js/document "removeEventListener")]
+        (try (.call rem-fn js/document "visibilitychange" vis-fn) (catch :default _ nil))))
     (reset! auto-sync-runtime-atom {:timer nil :abort-ctrl nil :online-fn nil :vis-fn nil})
     (when (and node-atom @node-atom)
       (let [[st' _] (sync-core/step-auto-sync (:auto-sync @node-atom) {:type :stop})]
@@ -1832,7 +1864,7 @@
                          (fn []
                            (when (and node-atom @node-atom)
                              (let [node @node-atom
-                                   vis (if (and (exists? js/document) (= (.-visibilityState js/document) "hidden")) :hidden :visible)
+                                   vis (current-doc-visibility)
                                    active? (boolean (or (seq (:active-channels node))
                                                         (:relay-url node)
                                                         (:relay-fallback-active? node)))
@@ -1846,8 +1878,8 @@
                                (swap! node-atom assoc :auto-sync st')
                                (execute-browser-auto-sync-effects! node-atom effs))))
                          interval-ms)]
-          (when (and new-timer (fn? (.-unref new-timer)))
-            (.unref new-timer))
+          (when (and new-timer (fn? (aget new-timer "unref")))
+            (.call (aget new-timer "unref") new-timer))
           (swap! auto-sync-runtime-atom assoc :timer new-timer)))
 
       :fetch-quorum-sync
@@ -1855,17 +1887,23 @@
         (let [gen (:generation eff)
               timeout-ms (or (:timeout-ms eff) sync-core/default-fetch-timeout-ms)
               node @node-atom
-              relay-urls (vec (distinct (keep identity (concat [(:relay-url node)]
-                                                               ["https://ns1.bitecho.org"
-                                                                "https://ns2.bitecho.org"
-                                                                "https://ns3.bitecho.org"]))))
+              explicit-relay (:relay-url node)
+              relay-urls (if (and (string? explicit-relay) (not (str/blank? explicit-relay)))
+                           [explicit-relay]
+                           ["https://ns1.bitecho.org"
+                            "https://ns2.bitecho.org"
+                            "https://ns3.bitecho.org"])
               ctrl (when (exists? js/AbortController) (js/AbortController.))
               _ (swap! auto-sync-runtime-atom assoc :abort-ctrl ctrl)
               timed-out? (atom false)
               to-id (js/setTimeout
                      (fn []
                        (reset! timed-out? true)
-                       (when ctrl (try (.abort ctrl) (catch :default _ nil)))
+                       (when ctrl
+                         (try
+                           (when-let [abort-fn (aget ctrl "abort")]
+                             (.call abort-fn ctrl))
+                           (catch :default _ nil)))
                        (when (and node-atom @node-atom)
                          (let [[st' effs] (sync-core/step-auto-sync
                                            (:auto-sync @node-atom)
@@ -1927,17 +1965,23 @@
   [node-atom]
   (stop-browser-auto-sync! node-atom)
   (when (and node-atom @node-atom)
-    (let [vis (if (and (exists? js/document) (= (.-visibilityState js/document) "hidden")) :hidden :visible)
-          gen (inc (long (get-in @node-atom [:auto-sync :generation] 0)))
-          lock-role (or (get-in @node-atom [:instance-lock :role]) :single)
+    (let [node @node-atom
+          vis (current-doc-visibility)
+          gen (inc (long (get-in node [:auto-sync :generation] 0)))
+          lock-role (or (get-in node [:instance-lock :role]) :single)
           sync-role (if (= :secondary lock-role) :secondary :leader)
-          st0 (sync-core/init-sync-state {:generation gen
-                                          :visibility vis
-                                          :role sync-role})
+          sync-interval-ms (:sync-interval-ms node)
+          stall-threshold-ms (:stall-threshold-ms node)
+          st0 (sync-core/init-sync-state
+               (cond-> {:generation gen
+                        :visibility vis
+                        :role sync-role}
+                 sync-interval-ms (assoc :interval-ms sync-interval-ms)
+                 stall-threshold-ms (assoc :stall-threshold-ms stall-threshold-ms)))
           _ (swap! node-atom assoc :auto-sync st0)
           vis-fn (fn []
                    (when (and node-atom @node-atom (exists? js/document))
-                     (let [next-vis (if (= (.-visibilityState js/document) "hidden") :hidden :visible)
+                     (let [next-vis (current-doc-visibility)
                            [st' effs] (sync-core/step-auto-sync
                                        (:auto-sync @node-atom)
                                        {:type :visibility-change
@@ -1955,10 +1999,12 @@
                                            :now-ms (.now js/Date)})]
                           (swap! node-atom assoc :auto-sync st')
                           (execute-browser-auto-sync-effects! node-atom effs))))]
-      (when (and (exists? js/document) (fn? (.-addEventListener js/document)))
-        (.addEventListener js/document "visibilitychange" vis-fn))
-      (when (and (exists? js/window) (fn? (.-addEventListener js/window)))
-        (.addEventListener js/window "online" online-fn))
+      (when (exists? js/document)
+        (when-let [add-fn (aget js/document "addEventListener")]
+          (.call add-fn js/document "visibilitychange" vis-fn)))
+      (when (exists? js/window)
+        (when-let [add-fn (aget js/window "addEventListener")]
+          (.call add-fn js/window "online" online-fn)))
       (swap! auto-sync-runtime-atom assoc :vis-fn vis-fn :online-fn online-fn)
       (execute-browser-auto-sync-effects! node-atom [{:effect :reschedule-timer
                                                       :interval-ms (sync-core/effective-interval-ms st0)
@@ -1976,8 +2022,9 @@
         (swap! node-atom update-in [:light-state :diagnostics (or (:reason eff) :tab-lock-diagnostic)] (fnil inc 0)))
 
       :broadcast-channel
-      (when-let [^js ch (:channel @tab-lock-runtime-atom)]
-        (try (.postMessage ch (clj->js (:message eff))) (catch :default _ nil)))
+      (when-let [ch (:channel @tab-lock-runtime-atom)]
+        (when-let [post-fn (aget ch "postMessage")]
+          (try (.call post-fn ch (clj->js (:message eff))) (catch :default _ nil))))
 
       :activate-leader
       (when (and node-atom @node-atom)
@@ -2013,12 +2060,14 @@
     (when (fn? release-fn)
       (try (release-fn) (catch :default _ nil)))
     (when channel
-      (try (.close ^js channel) (catch :default _ nil)))
+      (when-let [close-fn (aget channel "close")]
+        (try (.call close-fn channel) (catch :default _ nil))))
     (reset! tab-lock-runtime-atom {:release-fn nil :channel nil :tab-id nil})))
 
 (defn- start-browser-tab-lock!
   "Two-phase `navigator.locks` + `BroadcastChannel` multi-tab leader election & automatic handoff
-   driven by `bitecho.lifecycle.lock-core/transition-lock` (BIP-022 Stage B Row 10)."
+   driven by `bitecho.lifecycle.lock-core/transition-lock` (BIP-022 Stage B Row 10).
+   Uses unmangled `aget`/`aset`/`.call` + string-keyed `#js` options for Closure `:advanced` safety."
   [node-atom]
   (release-browser-tab-lock! node-atom)
   (when (and node-atom @node-atom)
@@ -2035,73 +2084,78 @@
                                               :generation 1})
           [st0 _] (lock-core/transition-lock init-st {:type :acquire-requested :now-ms (.now js/Date)})
           _ (swap! node-atom assoc :instance-lock st0)
-          bc (when (exists? js/BroadcastChannel)
-               (try
-                 (let [ch (js/BroadcastChannel. lock-name)]
-                   (set! (.-onmessage ch)
-                         (fn [^js ev]
-                           (when (and node-atom @node-atom ev (.-data ev))
-                             (let [msg (js->clj (.-data ev) :keywordize-keys true)]
-                               (when (and (= "leader-elected" (:type msg))
-                                          (not= tab-id (:tab-id msg)))
-                                 (let [[l-st' l-effs] (lock-core/transition-lock
-                                                       (:instance-lock @node-atom)
-                                                       {:type :broadcast-leader-heartbeat
-                                                        :generation (get-in @node-atom [:instance-lock :generation] 1)
-                                                        :leader-tab-id (:tab-id msg)
-                                                        :now-ms (.now js/Date)})]
-                                   (swap! node-atom assoc :instance-lock l-st')
-                                   (execute-browser-tab-lock-effects! node-atom l-effs)))))))
-                   ch)
-                 (catch :default _ nil)))
+          bc (when-let [bc-ctor (when (exists? js/globalThis) (aget js/globalThis "BroadcastChannel"))]
+               (when (fn? bc-ctor)
+                 (try
+                   (let [ch (js/Reflect.construct bc-ctor #js [lock-name])]
+                     (aset ch "onmessage"
+                           (fn [ev]
+                             (when (and node-atom @node-atom ev)
+                               (when-let [raw-data (aget ev "data")]
+                                 (let [msg (js->clj raw-data :keywordize-keys true)]
+                                   (when (and (= "leader-elected" (:type msg))
+                                              (not= tab-id (:tab-id msg)))
+                                     (let [[l-st' l-effs] (lock-core/transition-lock
+                                                           (:instance-lock @node-atom)
+                                                           {:type :broadcast-leader-heartbeat
+                                                            :generation (get-in @node-atom [:instance-lock :generation] 1)
+                                                            :leader-tab-id (:tab-id msg)
+                                                            :now-ms (.now js/Date)})]
+                                       (swap! node-atom assoc :instance-lock l-st')
+                                       (execute-browser-tab-lock-effects! node-atom l-effs))))))))
+                     ch)
+                   (catch :default _ nil))))
           _ (swap! tab-lock-runtime-atom assoc :channel bc :tab-id tab-id)
-          locks-api (when (exists? js/navigator) (.-locks js/navigator))]
-      (if (and locks-api (fn? (.-request ^js locks-api)))
-        (.request ^js locks-api
-                  lock-name
-                  #js {:mode "exclusive" :ifAvailable true}
-                  (fn [lock]
-                    (if lock
-                      (js/Promise.
-                       (fn [resolve-hold _]
-                         (swap! tab-lock-runtime-atom assoc :release-fn resolve-hold)
-                         (when (and node-atom @node-atom)
-                           (let [[l-st' l-effs] (lock-core/transition-lock
-                                                 (:instance-lock @node-atom)
-                                                 {:type :web-lock-probe
-                                                  :generation (get-in @node-atom [:instance-lock :generation] 1)
-                                                  :available? true
-                                                  :now-ms (.now js/Date)})]
-                             (swap! node-atom assoc :instance-lock l-st')
-                             (execute-browser-tab-lock-effects! node-atom l-effs)))))
-                      ;; Lock already held by primary tab -> enter :secondary & queue handoff wait
-                      (do
-                        (when (and node-atom @node-atom)
-                          (let [[l-st' l-effs] (lock-core/transition-lock
-                                                (:instance-lock @node-atom)
-                                                {:type :web-lock-probe
-                                                 :generation (get-in @node-atom [:instance-lock :generation] 1)
-                                                 :available? false
-                                                 :holder-tab-id nil
-                                                 :now-ms (.now js/Date)})]
-                            (swap! node-atom assoc :instance-lock l-st')
-                            (execute-browser-tab-lock-effects! node-atom l-effs)))
-                        (.request ^js locks-api
-                                  lock-name
-                                  #js {:mode "exclusive"}
-                                  (fn [_handoff-lock]
-                                    (js/Promise.
-                                     (fn [resolve-hold _]
-                                       (swap! tab-lock-runtime-atom assoc :release-fn resolve-hold)
-                                       (when (and node-atom @node-atom)
-                                         (let [[l-st' l-effs] (lock-core/transition-lock
-                                                               (:instance-lock @node-atom)
-                                                               {:type :web-lock-acquired
-                                                                :generation (get-in @node-atom [:instance-lock :generation] 1)
-                                                                :handoff? true
-                                                                :now-ms (.now js/Date)})]
-                                           (swap! node-atom assoc :instance-lock l-st')
-                                           (execute-browser-tab-lock-effects! node-atom l-effs)))))))))))
+          locks-api (when (exists? js/navigator) (aget js/navigator "locks"))
+          req-fn (when locks-api (aget locks-api "request"))]
+      (if (fn? req-fn)
+        (.call req-fn
+               locks-api
+               lock-name
+               #js {"mode" "exclusive" "ifAvailable" true}
+               (fn [lock]
+                 (if lock
+                   (js/Promise.
+                    (fn [resolve-hold _]
+                      (swap! tab-lock-runtime-atom assoc :release-fn resolve-hold)
+                      (when (and node-atom @node-atom)
+                        (let [[l-st' l-effs] (lock-core/transition-lock
+                                              (:instance-lock @node-atom)
+                                              {:type :web-lock-probe
+                                               :generation (get-in @node-atom [:instance-lock :generation] 1)
+                                               :available? true
+                                               :now-ms (.now js/Date)})]
+                          (swap! node-atom assoc :instance-lock l-st')
+                          (execute-browser-tab-lock-effects! node-atom l-effs)))))
+                   ;; Lock already held by primary tab -> enter :secondary & queue handoff wait
+                   (do
+                     (when (and node-atom @node-atom)
+                       (let [[l-st' l-effs] (lock-core/transition-lock
+                                             (:instance-lock @node-atom)
+                                             {:type :web-lock-probe
+                                              :generation (get-in @node-atom [:instance-lock :generation] 1)
+                                              :available? false
+                                              :holder-tab-id nil
+                                              :now-ms (.now js/Date)})]
+                         (swap! node-atom assoc :instance-lock l-st')
+                         (execute-browser-tab-lock-effects! node-atom l-effs)))
+                     (.call req-fn
+                            locks-api
+                            lock-name
+                            #js {"mode" "exclusive"}
+                            (fn [_handoff-lock]
+                              (js/Promise.
+                               (fn [resolve-hold _]
+                                 (swap! tab-lock-runtime-atom assoc :release-fn resolve-hold)
+                                 (when (and node-atom @node-atom)
+                                   (let [[l-st' l-effs] (lock-core/transition-lock
+                                                         (:instance-lock @node-atom)
+                                                         {:type :web-lock-acquired
+                                                          :generation (get-in @node-atom [:instance-lock :generation] 1)
+                                                          :handoff? true
+                                                          :now-ms (.now js/Date)})]
+                                     (swap! node-atom assoc :instance-lock l-st')
+                                     (execute-browser-tab-lock-effects! node-atom l-effs)))))))))))
         ;; navigator.locks unavailable -> :single with counted :web-locks-unavailable diagnostic
         (let [[l-st' l-effs] (lock-core/transition-lock
                               (:instance-lock @node-atom)
@@ -2896,18 +2950,25 @@
                            (sequential? cmd-or-args) (vec cmd-or-args)
                            (map? cmd-or-args) cmd-or-args
                            :else (js->clj cmd-or-args))
-               exec-res (browser/exec-browser-cli @node-atom input-clj priv)
-               resp (:response exec-res)]
-           (when (:state exec-res)
-             (reset! node-atom (:state exec-res))
-             (when (seq (:net-envelopes exec-res))
-               (doseq [env (:net-envelopes exec-res)]
-                 (route-browser-envelope! node-atom env)))
-             (when-let [dial-info (:p2p-dial exec-res)]
-               (dial-browser-p2p-peer! node-atom dial-info))
-             (browser/persist-state! (browser/sanitize-state-for-persistence @node-atom))
-             (notify-ui-listeners!))
-           (resolve (clj->js resp))))))))
+               status-cmd? (or (= input-clj "status")
+                               (= (get input-clj "cmd") "status")
+                               (= (:cmd input-clj) "status")
+                               (let [p (cli/parse-cli-command input-clj)]
+                                 (and (:ok? p) (= "status" (:verb p)))))]
+           (if status-cmd?
+             (resolve (get-status node-atom))
+             (let [exec-res (browser/exec-browser-cli @node-atom input-clj priv)
+                   resp (:response exec-res)]
+               (when (:state exec-res)
+                 (reset! node-atom (:state exec-res))
+                 (when (seq (:net-envelopes exec-res))
+                   (doseq [env (:net-envelopes exec-res)]
+                     (route-browser-envelope! node-atom env)))
+                 (when-let [dial-info (:p2p-dial exec-res)]
+                   (dial-browser-p2p-peer! node-atom dial-info))
+                 (browser/persist-state! (browser/sanitize-state-for-persistence @node-atom))
+                 (notify-ui-listeners!))
+               (resolve (clj->js resp))))))))))
 
 (defn- run-browser-governance-cmd!
   [cmd-map]
@@ -3305,6 +3366,9 @@
 
           (not (and node-atom @node-atom))
           (resolve #js {:ok false :error "node-not-initialized" :verb norm-verb})
+
+          (= norm-verb "status")
+          (resolve (get-status node-atom))
 
           :else
           (let [priv (or (get-in @node-atom [:keypair :private-key])
