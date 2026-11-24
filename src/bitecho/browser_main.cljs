@@ -3183,18 +3183,42 @@
                                  (and (:ok? p) (= "status" (:verb p)))))]
            (if status-cmd?
              (resolve (get-status node-atom))
-             (let [exec-res (browser/exec-browser-cli @node-atom input-clj priv)
-                   resp (:response exec-res)]
-               (when (:state exec-res)
-                 (reset! node-atom (:state exec-res))
-                 (when (seq (:net-envelopes exec-res))
-                   (doseq [env (:net-envelopes exec-res)]
-                     (route-browser-envelope! node-atom env)))
-                 (when-let [dial-info (:p2p-dial exec-res)]
-                   (dial-browser-p2p-peer! node-atom dial-info))
-                 (browser/persist-state! (browser/sanitize-state-for-persistence @node-atom))
-                 (notify-ui-listeners!))
-               (resolve (clj->js resp))))))))))
+             (let [parsed-cli (cli/parse-cli-command input-clj)
+                   eff-verb (when (:ok? parsed-cli) (:verb parsed-cli))
+                   cmd-map (when (:ok? parsed-cli) (:cmd-map parsed-cli))
+                   read-blob-cmd? (contains? #{"storage-get" "artifact-get"} eff-verb)
+                   finish-exec!
+                   (fn [node-snap hydrated-from-cache?]
+                     (let [exec-res (browser/exec-browser-cli node-snap input-clj priv)
+                           resp (:response exec-res)]
+                       (when (:state exec-res)
+                         (let [next-node (if hydrated-from-cache?
+                                           (update (:state exec-res) :light-state #(cache/prune-inline-hot-blobs % 0))
+                                           (:state exec-res))]
+                           (reset! node-atom next-node)
+                           (when (seq (:cache-effects exec-res))
+                             (browser/execute-browser-cache-effects! (:cache-effects exec-res) node-atom))
+                           (when (seq (:net-envelopes exec-res))
+                             (doseq [env (:net-envelopes exec-res)]
+                               (route-browser-envelope! node-atom env)))
+                           (when-let [dial-info (:p2p-dial exec-res)]
+                             (dial-browser-p2p-peer! node-atom dial-info))
+                           (browser/persist-state! (browser/sanitize-state-for-persistence @node-atom))
+                           (notify-ui-listeners!)))
+                       (resolve (clj->js resp))))]
+               ;; BIP-025 F7: Read-through hydration from IDB "bitecho-blob-cache" on storage-get / artifact-get hot miss.
+               (if-let [target-cid (and read-blob-cmd?
+                                        (cache/resolve-read-target-cid (:light-state @node-atom) eff-verb cmd-map))]
+                 (browser/hydrate-browser-cache-blob!
+                  target-cid
+                  node-atom
+                  (fn [hyd]
+                    (let [base-snap @node-atom
+                          snap-for-read (if (:ok? hyd)
+                                          (update base-snap :light-state #(cache/inject-hydrated-blob % target-cid (:blob hyd)))
+                                          base-snap)]
+                      (finish-exec! snap-for-read (true? (:ok? hyd))))))
+                 (finish-exec! @node-atom false))))))))))
 
 (defn- run-browser-governance-cmd!
   [cmd-map]

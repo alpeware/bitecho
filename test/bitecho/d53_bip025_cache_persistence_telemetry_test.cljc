@@ -14,6 +14,7 @@
             [bitecho.cache.core :as cache]
             [bitecho.core.data :as data]
             [bitecho.core.infra :as core-infra]
+            [bitecho.crypto :as crypto]
             [bitecho.fressian :as fressian]
             [bitecho.light-node.cli :as cli]
             [bitecho.light-node.core :as light-core]
@@ -853,7 +854,7 @@
                  effs [{:effect :cache-put :cid c1 :bytes b1 :size-bytes 2048 :media-type "application/octet-stream"}
                        {:effect :cache-put :cid c2 :bytes b2 :size-bytes 2048 :media-type "application/octet-stream"}
                        {:effect :cache-put :cid c3 :bytes b3 :size-bytes 2048 :media-type "application/octet-stream"}]
-                 st1 (node-main/execute-cache-effects! state-file st0 effs {:sync? true :max-cache-bytes 4500})
+                 st1 (node-main/execute-cache-effects-sync! state-file st0 effs {:max-cache-bytes 4500})
                  idx (:cache-index @node-main/light-runtime-telemetry-atom)
                  retained-cids (set (keys (:entries idx)))
                  evicted-cids (clojure.set/difference #{c1 c2 c3} retained-cids)
@@ -985,9 +986,9 @@
           resp (:response status-res)
           lat (get resp "latency")
           ctl-lat (get lat "ctl_latency_ms")]
-      (is (empty? effs-ok) "15ms is below 500ms :ctl-ms warn threshold")
+      (is (empty? effs-ok) "15ms is below 200ms :ctl-ms warn threshold")
       (is (= :ctl-latency-high (:reason (first effs-hi)))
-          "850ms exceeds 500ms threshold and emits :ctl-latency-high")
+          "850ms exceeds 200ms threshold and emits :ctl-latency-high")
       (is (pos? (get-in @st-atom [:diagnostics :ctl-latency-high] 0)))
       (is (map? lat) "bitecho.status/v1 surfaces live latency map")
       (is (>= (long (or (get ctl-lat "p95") 0)) 850))
@@ -1092,11 +1093,14 @@
 
 #?(:clj
    (deftest test-f4-hot-path-zero-sync-io-static-guard
-     (testing "Hot-path handlers in node_main.cljs and full_node_main.cljs contain ZERO synchronous fs/*Sync or save-light-state! calls"
-       (let [sync-io-re #"\.(writeFileSync|renameSync|fsyncSync|readFileSync|unlinkSync|mkdirSync|statSync)\b|\b(save-light-state!|write-bytes-atomic!)\b"
+     (testing "Hot-path handlers in node_main.cljs and full_node_main.cljs contain ZERO synchronous fs/*Sync or save/cache-sync calls (F4 + F9)"
+       (let [sync-io-re #"\.(writeFileSync|renameSync|fsyncSync|readFileSync|unlinkSync|mkdirSync|statSync)\b|\b(save-light-state!|write-bytes-atomic!|write-cache-blob!|delete-cache-blob!|save-cache-index!|execute-cache-effects-sync!)\b"
              node-defns (extract-top-level-defns (slurp "src/bitecho/node_main.cljs"))
              full-defns (extract-top-level-defns (slurp "src/bitecho/full_node_main.cljs"))
+             ;; Note: `hydrate-cache-blob!` is an explicit `ctl get` / one-shot read-through helper,
+             ;; whereas `execute-cache-effects!` is on the hot replication/command path and MUST be 100% async.
              node-hot-paths ["handle-serve-line!"
+                             "execute-cache-effects!"
                              "dispatch-light-writer-effects!"
                              "save-light-state-async!"
                              "save-light-state-barrier!"
@@ -1145,3 +1149,100 @@
              "V-RT4: Node full-node SIGTERM watchdog is async with testable hang hook")
          (is (str/includes? browser-main-src "V-RT5")
              "V-RT5: Browser init-node triggers v1->v2 IDB migration before any persist-state overwrite")))))
+
+;; =============================================================================
+;; 15. BIP-025 Seq 3 (F7 + F8): End-to-End Production Read-Through Hydration
+;;     After Pruning Live `:blobs` Across ALL THREE Shells (JVM, Node, Browser)
+;; =============================================================================
+
+(deftest test-f7-browser-production-artifact-get-hydrates-spilled-blob
+  (testing "Browser exec-browser-cli artifact-put -> prune live :blobs -> hydrate-browser-cache-blob! -> artifact-get restores exact payload & bumps GDSF freq"
+    (browser/clear-in-memory-blob-cache!)
+    (let [kp (crypto/generate-keypair)
+          pk-hex (fressian/bytes->hex (:public-key kp))
+          priv (:private-key kp)
+          init-st {:light-state (light-core/init-light-state {:pubkey-hex pk-hex} {})}
+          put-res (browser/exec-browser-cli init-st {"cmd" "artifact-put" "path" "docs/hello.txt" "text" "hello-bip025-f7-browser"} priv)
+          cid (get-in put-res [:response "cid"])
+          node-atom (atom (:state put-res))]
+      (is (true? (get-in put-res [:response "ok"])))
+      (is (string? cid))
+      (is (seq (:cache-effects put-res)) "exec-browser-cli forwards :cache-effects")
+      (browser/execute-browser-cache-effects! (:cache-effects put-res) node-atom)
+      (is (nil? (get-in @node-atom [:light-state :blobs cid])) "Live :blobs pruned after spill")
+      (is (nil? (get-in @node-atom [:light-state :artifact-blobs cid])) "Live :artifact-blobs pruned after spill")
+      (let [get-cmd {"cmd" "artifact-get" "cid" cid}
+            target-cid (cache/resolve-read-target-cid (:light-state @node-atom) "artifact-get" get-cmd)
+            hyd-box (atom nil)]
+        (is (= cid target-cid))
+        (browser/hydrate-browser-cache-blob! target-cid node-atom #(reset! hyd-box %))
+        (is (true? (:ok? @hyd-box)))
+        (let [snap-for-read (update @node-atom :light-state #(cache/inject-hydrated-blob % target-cid (:blob @hyd-box)))
+              get-res (browser/exec-browser-cli snap-for-read get-cmd priv)]
+          (is (true? (get-in get-res [:response "ok"])))
+          (is (= "hello-bip025-f7-browser" (get-in get-res [:response "text"])))
+          (is (= 2 (get-in @browser/*browser-cache-index* [:entries cid :freq]))
+              "Production artifact-get read-through bumps GDSF :freq"))))))
+
+#?(:clj
+   (deftest test-f7-jvm-production-artifact-get-hydrates-spilled-blob
+     (testing "JVM artifact-put -> execute-cache-effects! (prunes :blobs) -> maybe-hydrate-state-for-read! -> artifact-get restores exact payload & bumps GDSF freq"
+       (let [tmp-dir (.toFile (Files/createTempDirectory "bip025-f7-jvm-" (into-array FileAttribute [])))
+             kp (crypto/generate-keypair)
+             pk-hex (fressian/bytes->hex (:public-key kp))
+             priv (:private-key kp)]
+         (try
+           (swap! shell-light/jvm-light-telemetry-atom assoc :cache-index (cache/init-cache-index) :diagnostics {})
+           (let [st0 (light-core/init-light-state {:pubkey-hex pk-hex} {})
+                 put-res (light-core/handle-command st0 {"cmd" "artifact-put" "path" "docs/hello.txt" "text" "hello-bip025-f7-jvm"} priv)
+                 cid (get-in put-res [:response "cid"])
+                 st-atom (atom (:state put-res))]
+             (is (true? (get-in put-res [:response "ok"])))
+             (is (string? cid))
+             (shell-light/execute-cache-effects! (.getAbsolutePath tmp-dir) (:cache-effects put-res) st-atom)
+             (is (nil? (get-in @st-atom [:blobs cid])) "Live :blobs pruned after spill")
+             (is (nil? (get-in @st-atom [:artifact-blobs cid])) "Live :artifact-blobs pruned after spill")
+             (let [get-cmd {"cmd" "artifact-get" "cid" cid}
+                   st-for-read (shell-light/maybe-hydrate-state-for-read! (.getAbsolutePath tmp-dir) st-atom "artifact-get" get-cmd)
+                   get-res (light-core/handle-command st-for-read get-cmd priv)]
+               (is (true? (get-in get-res [:response "ok"])))
+               (is (= "hello-bip025-f7-jvm" (get-in get-res [:response "text"])))
+               (is (= 2 (get-in @shell-light/jvm-light-telemetry-atom [:cache-index :entries cid :freq]))
+                   "Production JVM artifact-get read-through bumps GDSF :freq")
+               (is (nil? (get-in @st-atom [:blobs cid])) "state-atom remains pruned after read-through")))
+           (finally
+             (doseq [f (reverse (file-seq tmp-dir))]
+               (.delete f))))))))
+
+#?(:cljs
+   (deftest test-f7-node-production-artifact-get-hydrates-spilled-blob
+     (testing "Node.js artifact-put -> execute-cache-effects-sync! (prunes :blobs) -> maybe-hydrate-state-for-read! -> artifact-get restores exact payload & bumps GDSF freq"
+       (let [fs (js/require "node:fs")
+             os (js/require "node:os")
+             path (js/require "node:path")
+             tmp-dir (.mkdtempSync fs (.join path (.tmpdir os) "bip025-f7-node-"))
+             state-file (.join path tmp-dir "state.fressian")
+             kp (crypto/generate-keypair)
+             pk-hex (fressian/bytes->hex (:public-key kp))
+             priv (:private-key kp)]
+         (try
+           (swap! node-main/light-runtime-telemetry-atom assoc :cache-index (cache/init-cache-index) :diagnostics {})
+           (let [st0 (light-core/init-light-state {:pubkey-hex pk-hex} {})
+                 put-res (light-core/handle-command st0 {"cmd" "artifact-put" "path" "docs/hello.txt" "text" "hello-bip025-f7-node"} priv)
+                 cid (get-in put-res [:response "cid"])
+                 st-spilled (node-main/execute-cache-effects-sync! state-file (:state put-res) (:cache-effects put-res))
+                 st-atom (atom st-spilled)]
+             (is (true? (get-in put-res [:response "ok"])))
+             (is (string? cid))
+             (is (nil? (get-in @st-atom [:blobs cid])) "Live :blobs pruned after spill")
+             (is (nil? (get-in @st-atom [:artifact-blobs cid])) "Live :artifact-blobs pruned after spill")
+             (let [get-cmd {"cmd" "artifact-get" "cid" cid}
+                   st-for-read (node-main/maybe-hydrate-state-for-read! state-file @st-atom "artifact-get" get-cmd {:sync? true :state-atom st-atom})
+                   get-res (light-core/handle-command st-for-read get-cmd priv)]
+               (is (true? (get-in get-res [:response "ok"])))
+               (is (= "hello-bip025-f7-node" (get-in get-res [:response "text"])))
+               (is (= 2 (get-in @node-main/light-runtime-telemetry-atom [:cache-index :entries cid :freq]))
+                   "Production Node.js artifact-get read-through bumps GDSF :freq")
+               (is (nil? (get-in @st-atom [:blobs cid])) "state-atom remains pruned after read-through")))
+           (finally
+             (.rmSync fs tmp-dir #js {:recursive true :force true})))))))

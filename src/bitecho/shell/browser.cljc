@@ -2101,7 +2101,8 @@
          :verb (:verb parse-res)
          :response (:response res)
          :net-envelopes (or (:net-envelopes res) [])
-         :stdout-events (or (:stdout-events res) [])}))))
+         :stdout-events (or (:stdout-events res) [])
+         :cache-effects (or (:cache-effects res) [])}))))
 
 (defn- parse-semver-tuple
   [v]

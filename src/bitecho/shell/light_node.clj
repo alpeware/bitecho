@@ -763,6 +763,20 @@
             (when state-atom (swap! state-atom update-in [:diagnostics :cache-miss] (fnil inc 0)))
             {:ok? false :error :cache-miss :cid norm-cid}))))))
 
+(defn maybe-hydrate-state-for-read!
+  "BIP-025 F7: Production read-through hydration for JVM `storage-get` / `artifact-get`.
+   If the target CID is absent from hot `:blobs`/`:storage-blobs`/`:artifact-blobs`, hydrates
+   it from `<state-dir>/cache/blobs/<2>/<cid>`, updates GDSF hit count (`cache/record-hit`),
+   and ephemerally injects it into the returned transient state map (leaving `state-atom` pruned)."
+  [state-dir state-atom eff-verb cmd-map]
+  (let [st @state-atom]
+    (if-let [target-cid (and state-dir (cache/resolve-read-target-cid st eff-verb cmd-map))]
+      (let [hyd (hydrate-cache-blob! state-dir target-cid state-atom)]
+        (if (:ok? hyd)
+          (cache/inject-hydrated-blob @state-atom target-cid (:blob hyd))
+          @state-atom))
+      st)))
+
 (defn load-or-rebuild-cache-index!
   "BIP-025 §2.2 (Axiom A2): Loads `<state-dir>/cache/index.fressian` or, if missing/corrupt,
    scans `<state-dir>/cache/blobs/<2>/<cid>`, invokes pure `cache/rebuild-index-from-disk`,
@@ -3531,10 +3545,23 @@
                                    :net-envelopes (if (:ok? committed) (:net-envelopes prep) [])))))
 
                       :else
-                      (let [st-for-cmd (if (= eff-domain-verb "status")
+                      (let [read-blob-cmd? (contains? #{"storage-get" "artifact-get"} eff-domain-verb)
+                            hydrated-from-cache? (and read-blob-cmd?
+                                                      state-file
+                                                      (some? (cache/resolve-read-target-cid @state-atom eff-domain-verb effective-map-with-now)))
+                            st-for-cmd (cond
+                                         (= eff-domain-verb "status")
                                          (assoc @state-atom :runtime-ctx (merge (:runtime-ctx @state-atom) (build-light-runtime-ctx)))
-                                         @state-atom)]
-                        (light-core/handle-command st-for-cmd effective-map-with-now (:privkey-bytes identity))))
+
+                                         hydrated-from-cache?
+                                         (maybe-hydrate-state-for-read! (or (.getParent (io/file state-file)) ".") state-atom eff-domain-verb effective-map-with-now)
+
+                                         :else
+                                         @state-atom)
+                            cmd-res (light-core/handle-command st-for-cmd effective-map-with-now (:privkey-bytes identity))]
+                        (if hydrated-from-cache?
+                          (assoc cmd-res :state (cache/prune-inline-hot-blobs (:state cmd-res) 0))
+                          cmd-res)))
                 _ (when (:state res)
                     (reset! state-atom (:state res)))
                 _ (when (and state-file (seq (:cache-effects res)))
@@ -5139,8 +5166,21 @@
                                      :net-envelopes (if (:ok? committed) (:net-envelopes prep) [])))))
 
                         :else
-                        (light-core/handle-command @state-atom cmd-map (:privkey-bytes identity)))
+                        (let [read-blob-cmd? (contains? #{"storage-get" "artifact-get"} eff-domain-verb)
+                              hydrated-from-cache? (and read-blob-cmd?
+                                                        state-file
+                                                        (some? (cache/resolve-read-target-cid @state-atom eff-domain-verb cmd-map)))
+                              st-for-cmd (if hydrated-from-cache?
+                                           (maybe-hydrate-state-for-read! (or (.getParent (io/file state-file)) ".") state-atom eff-domain-verb cmd-map)
+                                           @state-atom)
+                              cmd-res (light-core/handle-command st-for-cmd cmd-map (:privkey-bytes identity))]
+                          (if hydrated-from-cache?
+                            (assoc cmd-res :state (cache/prune-inline-hot-blobs (:state cmd-res) 0))
+                            cmd-res)))
                   _ (when (:state res) (reset! state-atom (:state res)))
+                  _ (when (and state-file (seq (:cache-effects res)))
+                      (let [sd (or (.getParent (io/file state-file)) ".")]
+                        (execute-cache-effects! sd (:cache-effects res) state-atom)))
                   out-write-res (maybe-write-artifact-out-file! eff-domain-verb cmd-map (:response res) state-atom)
                   res (if (:applied? out-write-res)
                         (assoc res :response (:response out-write-res) :state @state-atom)

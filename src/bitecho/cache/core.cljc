@@ -217,6 +217,64 @@
            (dissoc :artifact-blobs :storage-blobs :capability-blobs)
            (assoc :blobs trimmed-blobs))))))
 
+(defn resolve-read-target-cid
+  "BIP-025 F7 (Pure Sans-IO): Given `state`, normalized domain verb (`\"storage-get\"` or
+   `\"artifact-get\"`), and `cmd-map`, resolves the target CID that needs Tier-2 cache hydration.
+   Returns normalized lowercase 64-hex CID if missing from in-memory `:blobs`/`:storage-blobs`/
+   `:artifact-blobs`, or `nil` if already hot in memory or not a blob read."
+  [state eff-verb cmd-map]
+  (when (and (map? state) (map? cmd-map))
+    (let [v (str (or eff-verb (get cmd-map "cmd") (:cmd cmd-map) ""))
+          subnet (str (or (get cmd-map "subnet_id") (get cmd-map "subnet-id")
+                          (:subnet-id cmd-map) (:subnet-id state) "global"))]
+      (case v
+        "storage-get"
+        (let [slot (str (or (get cmd-map "slot_id") (get cmd-map "slot-id")
+                            (:slot_id cmd-map) (:slot-id cmd-map)
+                            (get cmd-map "slot") (:slot cmd-map) "default"))
+              path (str (or (get cmd-map "path") (:path cmd-map)
+                            (str "storage/" (:pubkey state) "/" slot)))
+              ptr (or (get cmd-map "pointer") (:pointer cmd-map)
+                      (get-in state [:storage-pointers [subnet path]]))
+              target-cid (normalize-cid (:pointer/target ptr))]
+          (when (and target-cid
+                     (nil? (get-in state [:storage-blobs target-cid]))
+                     (nil? (get-in state [:blobs target-cid])))
+            target-cid))
+
+        "artifact-get"
+        (let [raw-path (str (or (get cmd-map "path") (:path cmd-map) ""))
+              path (str/replace (str/trim raw-path) #"^/+" "")
+              explicit-cid (normalize-cid (or (get cmd-map "cid") (:cid cmd-map)))
+              ptr (when-not (str/blank? path)
+                    (or (get-in state [:artifact-pointers [subnet path]])
+                        (get-in state [:pointers [subnet path]])))
+              target-cid (or explicit-cid (normalize-cid (:pointer/target ptr)))]
+          (when (and target-cid
+                     (nil? (get-in state [:artifact-blobs target-cid]))
+                     (nil? (get-in state [:blobs target-cid])))
+            target-cid))
+
+        nil))))
+
+(defn inject-hydrated-blob
+  "BIP-025 F7 (Pure Sans-IO): Ephemerally injects a hydrated blob (either a structured blob map
+   or raw bytes) under `cid` into `:blobs`, `:storage-blobs`, and `:artifact-blobs` on a transient
+   state snapshot passed to a single read command (never persisted back to `state-atom`)."
+  [state cid blob-or-bytes]
+  (let [norm-cid (normalize-cid cid)]
+    (if-not (and (map? state) norm-cid (some? blob-or-bytes))
+      state
+      (let [blob-map (if (and (map? blob-or-bytes) (contains? blob-or-bytes :blob/bytes))
+                       blob-or-bytes
+                       {:blob/cid norm-cid
+                        :blob/bytes blob-or-bytes
+                        :blob/media-type "application/octet-stream"})]
+        (-> state
+            (assoc-in [:blobs norm-cid] blob-map)
+            (assoc-in [:storage-blobs norm-cid] blob-map)
+            (assoc-in [:artifact-blobs norm-cid] blob-map))))))
+
 (defn reclassify-tiers
   "Purely reclassifies all entries in `cache-index` against current Core State
    `:pinned-cids` and `:active-pointer-cids`."
