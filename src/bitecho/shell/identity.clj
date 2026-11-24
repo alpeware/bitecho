@@ -385,7 +385,18 @@
                    provider (kp/make-memory-key-provider seed :encrypted-keystore-0600)
                    kp-map (crypto/pure-ed25519-keypair seed)
                    spki-hex (basalt/bytes->hex (:public kp-map))
-                   pkcs8-hex (basalt/bytes->hex (:private kp-map))]
+                   pkcs8-hex (basalt/bytes->hex (:private kp-map))
+                   meta-m (:metadata opened)
+                   restored-cert (when (and (string? (:cert-pem meta-m)) (string? (:key-pem meta-m)))
+                                   (let [c (parse-cert-pem (:cert-pem meta-m))
+                                         k (parse-private-key-pem (:key-pem meta-m))]
+                                     (when (and c k)
+                                       {:cert c
+                                        :key k
+                                        :fingerprint (normalize-fingerprint (:fingerprint meta-m))})))
+                   cert-data (or restored-cert (dtls/generate-cert))
+                   fp (or (:fingerprint meta-m) (normalize-fingerprint (:fingerprint cert-data)))
+                   ice-creds (or (:ice-creds meta-m) (generate-random-ice-creds node-id fp))]
                {:ok? true
                 :node-id node-id
                 :key-provider provider
@@ -394,6 +405,9 @@
                 :pubkey-hex spki-hex
                 :privkey-hex pkcs8-hex
                 :keypair kp-map
+                :fingerprint fp
+                :ice-creds ice-creds
+                :cert-data cert-data
                 :diagnostics (vec diagnostics)}))))
 
        ;; Case 2: Legacy node-identity.edn exists -> migrate if passphrase supplied, else loud advisory
@@ -401,11 +415,18 @@
        (let [legacy (load-or-create-node-identity! state-dir node-id)
              seed (kp/extract-ed25519-seed (get-in legacy [:keypair :private]))]
          (if-not (str/blank? (str passphrase))
-           (let [sealed-ks (kp/seal-keystore-edn {:pubkey (:pubkey-hex legacy)
+           (let [cert-data (:cert-data legacy)
+                 meta-m (cond-> {:fingerprint (:fingerprint legacy)
+                                 :ice-creds (:ice-creds legacy)}
+                          (and (:cert cert-data) (:key cert-data))
+                          (assoc :cert-pem (encode-cert-pem (:cert cert-data))
+                                 :key-pem (encode-private-key-pem (:key cert-data))))
+                 sealed-ks (kp/seal-keystore-edn {:pubkey (:pubkey-hex legacy)
                                                   :seed-bytes seed
                                                   :passphrase passphrase
                                                   :iterations kdf-iters
-                                                  :created-ms (System/currentTimeMillis)})
+                                                  :created-ms (System/currentTimeMillis)
+                                                  :metadata meta-m})
                  _ (write-atomic-0600-edn! identity-dir enc-file sealed-ks)
                  verify-open (kp/open-keystore-edn (edn/read-string (slurp enc-file)) passphrase)]
              (if-not (:ok? verify-open)
@@ -442,11 +463,19 @@
          (let [seed (crypto/random-bytes 32)
                provider (kp/make-memory-key-provider seed :encrypted-keystore-0600)
                kp-map (crypto/pure-ed25519-keypair seed)
+               cert-data (dtls/generate-cert)
+               fp (normalize-fingerprint (:fingerprint cert-data))
+               ice-creds (generate-random-ice-creds node-id fp)
+               meta-m {:cert-pem (encode-cert-pem (:cert cert-data))
+                       :key-pem (encode-private-key-pem (:key cert-data))
+                       :fingerprint fp
+                       :ice-creds ice-creds}
                sealed-ks (kp/seal-keystore-edn {:pubkey (kp/public-key provider)
                                                 :seed-bytes seed
                                                 :passphrase passphrase
                                                 :iterations kdf-iters
-                                                :created-ms (System/currentTimeMillis)})
+                                                :created-ms (System/currentTimeMillis)
+                                                :metadata meta-m})
                _ (write-atomic-0600-edn! identity-dir enc-file sealed-ks)]
            {:ok? true
             :node-id node-id
@@ -456,6 +485,9 @@
             :pubkey-hex (basalt/bytes->hex (:public kp-map))
             :privkey-hex (basalt/bytes->hex (:private kp-map))
             :keypair kp-map
+            :fingerprint fp
+            :ice-creds ice-creds
+            :cert-data cert-data
             :diagnostics (vec diagnostics)})
          (let [legacy (load-or-create-node-identity! state-dir node-id)
                seed (kp/extract-ed25519-seed (get-in legacy [:keypair :private]))

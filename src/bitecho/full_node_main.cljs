@@ -24,6 +24,7 @@
             [bitecho.core.storage :as storage]
             [bitecho.core.subnet :as subnet]
             [bitecho.crypto :as crypto]
+            [bitecho.crypto.key-provider :as kp]
             [bitecho.defense.core :as defense]
             [bitecho.deploy.core :as deploy]
             [bitecho.economy.account :as account]
@@ -547,44 +548,156 @@
   {:ufrag (.toString (.randomBytes node-crypto 4) "hex")
    :pwd (.toString (.randomBytes node-crypto 12) "hex")})
 
+(defn- resolve-full-node-passphrase-file-from-argv
+  []
+  (let [argv (vec (drop 2 (array-seq (.-argv js/process))))]
+    (loop [xs argv]
+      (when (seq xs)
+        (let [a (first xs)]
+          (cond
+            (and (= a "--keystore-passphrase-file") (second xs)) (second xs)
+            (str/starts-with? (str a) "--keystore-passphrase-file=")
+            (subs (str a) (count "--keystore-passphrase-file="))
+            :else (recur (rest xs))))))))
+
+(defn- resolve-full-node-keystore-passphrase!
+  [shell-atom]
+  (let [pw-file (resolve-full-node-passphrase-file-from-argv)
+        emit-diag! (fn [d]
+                     (when shell-atom (apply-shell-event! shell-atom (assoc d :type :diagnose)))
+                     (.write (.-stderr js/process)
+                             (str (js/JSON.stringify (clj->js (assoc d :event "diagnose" :reason (name (:reason d))))) "\n")))]
+    (cond
+      (and (string? pw-file) (not (str/blank? pw-file)))
+      (if-not (.existsSync node-fs pw-file)
+        (do
+          (emit-diag! {:effect :diagnose :reason :keystore-passphrase-file-not-found :path pw-file})
+          {:passphrase nil})
+        (let [st (.statSync node-fs pw-file)
+              mode (bit-and (.-mode st) 0777)
+              insecure? (pos? (bit-and mode 0077))
+              pw (str/trim (.readFileSync node-fs pw-file "utf8"))]
+          (when insecure?
+            (emit-diag! {:effect :diagnose :reason :keystore-passphrase-file-insecure-perms :path pw-file}))
+          {:passphrase (when-not (str/blank? pw) pw)}))
+
+      :else
+      (let [env-pw (aget (.-env js/process) "BITECHO_KEYSTORE_PASSPHRASE")]
+        {:passphrase (when (and (string? env-pw) (not (str/blank? env-pw))) env-pw)}))))
+
 (defn- load-or-create-node-identity!
   ([state-dir node-id]
    (load-or-create-node-identity! state-dir node-id nil))
   ([state-dir node-id shell-atom]
-   (let [id-file (.join node-path state-dir "identity" "node-identity.edn")
+   (let [id-dir (.join node-path state-dir "identity")
+         enc-file (.join node-path id-dir "keystore.enc.edn")
+         id-file (.join node-path id-dir "node-identity.edn")
          legacy-file (.join node-path state-dir "cluster" "node-identity.edn")
+         emit-diag! (fn [d]
+                      (when shell-atom (apply-shell-event! shell-atom (assoc d :type :diagnose)))
+                      (.write (.-stderr js/process)
+                              (str (js/JSON.stringify (clj->js (assoc d :event "diagnose" :reason (name (:reason d))))) "\n")))
          read-ed-map (fn [f]
                        (when (.existsSync node-fs f)
                          (try
                            (let [m (edn/read-string (.readFileSync node-fs f "utf8"))]
                              (when (map? m) m))
                            (catch :default e
-                             (when shell-atom
-                               (apply-shell-event! shell-atom {:type :diagnose :reason :identity-read-failed :file f :detail (.-message e)}))
+                             (emit-diag! {:effect :diagnose :reason :identity-read-failed :file f :detail (.-message e)})
                              nil))))
+         {:keys [passphrase]} (resolve-full-node-keystore-passphrase! shell-atom)
          id-map (read-ed-map id-file)
          legacy-map (read-ed-map legacy-file)
          combined (merge id-map legacy-map)
-         has-ed? (and (string? (:pubkey-hex combined)) (string? (:privkey-hex combined)))
-         kp (when-not has-ed? (crypto/generate-keypair))
-         pk-hex (if has-ed?
-                  (str/lower-case (str/trim (:pubkey-hex combined)))
-                  (str/lower-case (kp->pk-hex kp)))
-         sk-hex (if has-ed?
-                  (str/lower-case (str/trim (:privkey-hex combined)))
-                  (str/lower-case (basalt/bytes->hex (kp->sk kp))))
+         has-enc? (.existsSync node-fs enc-file)
+         ;; Step 1: Resolve Ed25519 keypair + security tier (Row 11 Phase 1)
+         ed-res
+         (cond
+           has-enc?
+           (if (str/blank? (str passphrase))
+             (do
+               (emit-diag! {:effect :diagnose :reason :keystore-unlock-failed :detail "missing-passphrase"})
+               (throw (ex-info "Keystore unlock failed: missing passphrase" {:error :keystore-unlock-failed})))
+             (let [ks-map (read-ed-map enc-file)
+                   opened (kp/open-keystore-edn ks-map passphrase)]
+               (when-not (:ok? opened)
+                 (emit-diag! {:effect :diagnose :reason :keystore-unlock-failed :detail (name (or (:error opened) :invalid-passphrase-or-corrupt))})
+                 (throw (ex-info "Keystore unlock failed" {:error :keystore-unlock-failed :detail (:error opened)})))
+               (let [seed (:seed-bytes opened)
+                     provider (kp/make-memory-key-provider seed :encrypted-keystore-0600)
+                     kp-map (crypto/pure-ed25519-keypair seed)]
+                 {:pk-hex (str/lower-case (kp->pk-hex kp-map))
+                  :sk-hex (str/lower-case (basalt/bytes->hex (kp->sk kp-map)))
+                  :key-provider provider
+                  :tier :encrypted-keystore-0600
+                  :metadata (:metadata opened)
+                  :write-plaintext? false})))
+
+           (and (string? (:pubkey-hex combined)) (string? (:privkey-hex combined)))
+           (let [pk-hex (str/lower-case (str/trim (:pubkey-hex combined)))
+                 sk-hex (str/lower-case (str/trim (:privkey-hex combined)))
+                 seed (kp/extract-ed25519-seed (basalt/hex->bytes sk-hex))]
+             (if-not (str/blank? (str passphrase))
+               (let [sealed-ks (kp/seal-keystore-edn {:pubkey pk-hex
+                                                      :seed-bytes seed
+                                                      :passphrase passphrase
+                                                      :created-ms (.now js/Date)})
+                     _ (atomic-write-file! enc-file (pr-str sealed-ks) 0600)
+                     verify-open (kp/open-keystore-edn (read-ed-map enc-file) passphrase)]
+                 (when-not (:ok? verify-open)
+                   (throw (ex-info "Keystore migration verification failed" {:error :keystore-unlock-failed})))
+                 (emit-diag! {:effect :diagnose :reason :keystore-migrated-to-encrypted :path enc-file})
+                 {:pk-hex pk-hex
+                  :sk-hex sk-hex
+                  :key-provider (kp/make-memory-key-provider seed :encrypted-keystore-0600)
+                  :tier :encrypted-keystore-0600
+                  :write-plaintext? false})
+               (do
+                 (emit-diag! {:effect :diagnose :reason :legacy-plaintext-keystore-in-use :path id-file})
+                 {:pk-hex pk-hex
+                  :sk-hex sk-hex
+                  :key-provider (kp/make-memory-key-provider seed :legacy-file-0600)
+                  :tier :legacy-file-0600
+                  :write-plaintext? false})))
+
+           :else
+           (let [kp-map (crypto/generate-keypair)
+                 pk-hex (str/lower-case (kp->pk-hex kp-map))
+                 sk-hex (str/lower-case (basalt/bytes->hex (kp->sk kp-map)))
+                 seed (kp/extract-ed25519-seed (kp->sk kp-map))]
+             (if-not (str/blank? (str passphrase))
+               (let [sealed-ks (kp/seal-keystore-edn {:pubkey pk-hex
+                                                      :seed-bytes seed
+                                                      :passphrase passphrase
+                                                      :created-ms (.now js/Date)})
+                     _ (atomic-write-file! enc-file (pr-str sealed-ks) 0600)]
+                 {:pk-hex pk-hex
+                  :sk-hex sk-hex
+                  :key-provider (kp/make-memory-key-provider seed :encrypted-keystore-0600)
+                  :tier :encrypted-keystore-0600
+                  :write-plaintext? false})
+               (do
+                 (emit-diag! {:effect :diagnose :reason :legacy-plaintext-keystore-in-use :path id-file})
+                 {:pk-hex pk-hex
+                  :sk-hex sk-hex
+                  :key-provider (kp/make-memory-key-provider seed :legacy-file-0600)
+                  :tier :legacy-file-0600
+                  :write-plaintext? true}))))
+         pk-hex (:pk-hex ed-res)
+         sk-hex (:sk-hex ed-res)
          pk-bytes (basalt/hex->bytes pk-hex)
          sk-bytes (basalt/hex->bytes sk-hex)
-         has-dtls? (and (string? (:cert-pem combined))
-                        (string? (:key-pem combined))
-                        (string? (:fingerprint combined)))
+         eff-combined (merge combined (:metadata ed-res))
+         has-dtls? (and (string? (:cert-pem eff-combined))
+                        (string? (:key-pem eff-combined))
+                        (string? (:fingerprint eff-combined)))
          gen-cert (when-not has-dtls? (dtls/generate-cert))
-         cert-pem (if has-dtls? (:cert-pem combined) (:cert-pem gen-cert))
-         key-pem (if has-dtls? (:key-pem combined) (:key-pem gen-cert))
-         fp (core-mesh/normalize-fingerprint (if has-dtls? (:fingerprint combined) (:fingerprint gen-cert)))
-         persisted-ice (or (:ice-creds combined)
-                           (when (and (:ice-ufrag combined) (:ice-pwd combined))
-                             {:ufrag (:ice-ufrag combined) :pwd (:ice-pwd combined)}))
+         cert-pem (if has-dtls? (:cert-pem eff-combined) (:cert-pem gen-cert))
+         key-pem (if has-dtls? (:key-pem eff-combined) (:key-pem gen-cert))
+         fp (core-mesh/normalize-fingerprint (if has-dtls? (:fingerprint eff-combined) (:fingerprint gen-cert)))
+         persisted-ice (or (:ice-creds eff-combined)
+                           (when (and (:ice-ufrag eff-combined) (:ice-pwd eff-combined))
+                             {:ufrag (:ice-ufrag eff-combined) :pwd (:ice-pwd eff-combined)}))
          ice-creds (if (and (map? persisted-ice)
                             (string? (:ufrag persisted-ice))
                             (string? (:pwd persisted-ice))
@@ -592,14 +705,28 @@
                             (not (str/blank? (:pwd persisted-ice))))
                      persisted-ice
                      (generate-random-ice-creds))
-         needs-write? (or (not (and (map? id-map)
-                                    (:pubkey-hex id-map)
-                                    (:privkey-hex id-map)
-                                    (:cert-pem id-map)
-                                    (:key-pem id-map)
-                                    (:fingerprint id-map)
-                                    (:ice-creds id-map)))
-                          (not= ice-creds (:ice-creds id-map)))]
+         _ (when (and (= :encrypted-keystore-0600 (:tier ed-res))
+                      (not has-enc?)
+                      (not (str/blank? (str passphrase))))
+             (let [seed (kp/extract-ed25519-seed sk-bytes)
+                   sealed-ks (kp/seal-keystore-edn {:pubkey pk-hex
+                                                    :seed-bytes seed
+                                                    :passphrase passphrase
+                                                    :created-ms (.now js/Date)
+                                                    :metadata {:cert-pem cert-pem
+                                                               :key-pem key-pem
+                                                               :fingerprint fp
+                                                               :ice-creds ice-creds}})]
+               (atomic-write-file! enc-file (pr-str sealed-ks) 0600)))
+         needs-write? (and (:write-plaintext? ed-res)
+                           (or (not (and (map? id-map)
+                                         (:pubkey-hex id-map)
+                                         (:privkey-hex id-map)
+                                         (:cert-pem id-map)
+                                         (:key-pem id-map)
+                                         (:fingerprint id-map)
+                                         (:ice-creds id-map)))
+                               (not= ice-creds (:ice-creds id-map))))]
      (when needs-write?
        (try
          (atomic-write-file! id-file
@@ -614,6 +741,9 @@
            (when shell-atom
              (apply-shell-event! shell-atom {:type :diagnose :reason :identity-write-failed :detail (.-message e)})))))
      {:node-id node-id
+      :key-provider (:key-provider ed-res)
+      :keystore-security-tier (:tier ed-res)
+      :raw-pubkey-hex (kp/public-key (:key-provider ed-res))
       :pubkey-hex pk-hex
       :privkey-hex sk-hex
       :pubkey-bytes pk-bytes
@@ -1117,7 +1247,7 @@
                                  :trusted-deploy-authorities (:trusted-deploy-authorities rt)
                                  :pin-version (:pin-version rt)
                                  :auto-update-pointer (:auto-update-pointer rt)
-                                 :keystore-security-tier :legacy-file-0600}))
+                                 :keystore-security-tier (or (:keystore-security-tier rt) :legacy-file-0600)}))
               :diagnostics {:runtime (core-infra/shell-status-summary @(:shell-atom rt))
                             :http (when http-shell-atom (core-infra/shell-status-summary @http-shell-atom))
                             :dns (when dns-shell-atom (core-infra/shell-status-summary @dns-shell-atom))
@@ -1485,6 +1615,7 @@
                            (let [err-kw (or (:error adm) :not-in-allowlist)
                                  status (cond
                                           (= :payload-too-large err-kw) 413
+                                          (= :self-path-owner-blob-rate-limited err-kw) 429
                                           (= :chunk-store-quota-exceeded err-kw) 507
                                           :else 403)]
                              (when (:shell-atom rt)
@@ -1612,8 +1743,10 @@
                                              (or (str/blank? subnet-filter) (= psub subnet-filter))
                                              (or (str/blank? prefix) (str/starts-with? p prefix)))
                                     {"path" p
+                                     "subnet" (or (:pointer/subnet ptr) psub)
                                      "cid" (:pointer/target ptr)
                                      "seq" (:pointer/seq ptr)
+                                     "leader_term" (:pointer/leader-term ptr)
                                      "authority" (:pointer/authority ptr)
                                      "sig" (:pointer/sig ptr)
                                      "timestamp" (:pointer/timestamp ptr)}))))
@@ -4570,6 +4703,8 @@
                 :epoch-atom (atom 1)
                 :default-sender pk
                 :node-privkey sk
+                :key-provider (:key-provider ident)
+                :keystore-security-tier (:keystore-security-tier ident)
                 :tls-secret tls-secret
                 :tls-ctx-atom tls-ctx-atom
                 :tls-pem-atom tls-pem-atom}
@@ -4959,6 +5094,7 @@
     (println (str "Node: " (name node-id)))
     (println (str "State directory: " state-dir))
     (println (str "Ed25519 Pubkey: " (:pubkey-hex id-data)))
+    (println (str "Keystore tier: " (name (or (:keystore-security-tier id-data) :legacy-file-0600))))
     (println (str "SHA-256 Fingerprint: " (:fingerprint id-data)))
     (println (str "ICE ufrag: " (get-in id-data [:ice-creds :ufrag])))
     (println (str "ICE pwd: " (get-in id-data [:ice-creds :pwd])))))

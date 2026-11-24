@@ -2190,6 +2190,7 @@
                                                       :insufficient-stake :invalid-blob-cid}
                                                     err-kw) 403
                                          (= :payload-too-large err-kw) 413
+                                         (= :self-path-owner-blob-rate-limited err-kw) 429
                                          (= :chunk-store-quota-exceeded err-kw) 507
                                          :else 503)]
                             (when-let [da (:diagnostics-atom target-rt)]
@@ -2324,12 +2325,15 @@
                 raw-ptrs (merge (get-in st [:data :pointers] {}) (:pointers st {}))
                 ptrs (->> raw-ptrs
                           (keep (fn [[k ptr]]
-                                  (let [p (if (vector? k) (str (second k)) (str k))]
+                                  (let [psub (when (vector? k) (str (first k)))
+                                        p (if (vector? k) (str (second k)) (str k))]
                                     (when (and (some? (:pointer/target ptr))
                                                (or (str/blank? prefix) (str/starts-with? p prefix)))
                                       {"path" p
+                                       "subnet" (or (:pointer/subnet ptr) psub)
                                        "cid" (:pointer/target ptr)
                                        "seq" (:pointer/seq ptr)
+                                       "leader_term" (:pointer/leader-term ptr)
                                        "authority" (:pointer/authority ptr)
                                        "sig" (:pointer/sig ptr)
                                        "timestamp" (:pointer/timestamp ptr)}))))

@@ -1188,7 +1188,8 @@
          relay-cli (extract-flag-value clean-args "--relay-url" nil)
          relay-url (resolve-relay-url relay-cli getenv-fn)
          subnet-id (extract-flag-value clean-args "--subnet-id" nil)
-         keystore-passphrase-file (extract-flag-value clean-args "--keystore-passphrase-file" nil)
+         keystore-passphrase-file (or (extract-flag-value clean-args "--keystore-passphrase-file" nil)
+                                      (extract-flag-value clean-args "--passphrase-file" nil))
          backup-slot (extract-flag-value clean-args "--slot" nil)
          reset-network-state? (boolean (some #(= % "--reset-network-state") clean-args))
          trusted-dac-anchors-spec (flags/parse-trusted-dac-anchors-arg clean-args)
@@ -1441,8 +1442,39 @@
       (swap! light-state-barrier-chains-atom assoc path-key next-p)
       next-p)))
 
+(def ^:private last-load-diagnostics-atom (atom []))
+
+(defn- emit-stderr-diagnose!
+  [d]
+  (let [reason-str (if (keyword? (:reason d)) (name (:reason d)) (str (or (:reason d) "unknown")))
+        payload (merge {"event" "diagnose" "reason" reason-str}
+                       (when (:path d) {"path" (str (:path d))})
+                       (when (:state-file d) {"state_file" (str (:state-file d))})
+                       (when (:detail d) {"detail" (if (keyword? (:detail d)) (name (:detail d)) (str (:detail d)))})
+                       (when (:hint d) {"hint" (str (:hint d))}))]
+    (.write (.-stderr js/process) (str (.stringify js/JSON (clj->js payload)) "\n"))))
+
+(defn- apply-startup-identity-and-load-diagnostics!
+  "Propagates live identity `:keystore-security-tier`, merges identity + corrupt-state-load
+   diagnostics into `[:diagnostics]`, and emits structured JSON `:diagnose` lines on stderr."
+  [state identity]
+  (let [load-diags @last-load-diagnostics-atom
+        _ (reset! last-load-diagnostics-atom [])
+        all-diags (into (vec (or (:diagnostics identity) [])) load-diags)
+        tier (or (:keystore-security-tier identity) (:keystore-security-tier state) :legacy-file-0600)]
+    (doseq [d all-diags]
+      (emit-stderr-diagnose! d))
+    (reduce (fn [st d]
+              (if-let [r (:reason d)]
+                (update-in st [:diagnostics r] (fnil inc 0))
+                st))
+            (assoc state :keystore-security-tier tier)
+            all-diags)))
+
 (defn load-light-state!
-  "Loads persisted light-node state from `state.fressian`, returning nil if absent."
+  "Loads persisted light-node state from `state.fressian`, returning nil if absent or corrupt.
+   Guards `(map? decoded)` so corrupt bytes never crash downstream state reducers, emitting
+   a counted `:local-state-corrupt-fallback` diagnostic."
   [state-file]
   (when (and (some? state-file)
              (not (str/blank? (str state-file)))
@@ -1450,12 +1482,23 @@
     (let [buf (.readFileSync node-fs (str state-file))
           u8 (crypto/compact-u8 buf)]
       (when (pos? (.-byteLength u8))
-        (let [decoded (light-core/decode-light-state u8)]
-          (when (light-core/legacy-v0238-state? decoded)
-            (let [bak-path (str state-file ".v0238.bak")]
-              (when-not (.existsSync node-fs bak-path)
-                (try (write-bytes-atomic! bak-path buf) (catch :default _ nil)))))
-          (light-core/migrate-light-state decoded))))))
+        (let [decoded (try
+                        (light-core/decode-light-state u8)
+                        (catch :default e
+                          {:__corrupt_error__ (or (.-message e) (str e))}))]
+          (if (or (not (map? decoded)) (contains? decoded :__corrupt_error__))
+            (let [diag {:effect :diagnose
+                        :reason :local-state-corrupt-fallback
+                        :state-file (str state-file)
+                        :detail (if (map? decoded) (:__corrupt_error__ decoded) "non-map-fressian-root")}]
+              (swap! last-load-diagnostics-atom conj diag)
+              nil)
+            (do
+              (when (light-core/legacy-v0238-state? decoded)
+                (let [bak-path (str state-file ".v0238.bak")]
+                  (when-not (.existsSync node-fs bak-path)
+                    (try (write-bytes-atomic! bak-path buf) (catch :default _ nil)))))
+              (light-core/migrate-light-state decoded))))))))
 
 (defn- resolve-node-keystore-passphrase!
   [{:keys [passphrase passphrase-file keystore-passphrase-file]}]
@@ -1519,9 +1562,13 @@
                  kp-map (crypto/pure-ed25519-keypair seed)
                  pub-hex (basalt/bytes->hex (:public kp-map))
                  priv-hex (basalt/bytes->hex (:private kp-map))
-                 cert-data (dtls/generate-cert)
-                 fp (normalize-fingerprint (:fingerprint cert-data))
-                 ice-creds (generate-random-ice-creds :light-node fp)]
+                 meta-m (:metadata opened)
+                 gen-cert (when-not (and (string? (:cert-pem meta-m)) (string? (:key-pem meta-m)))
+                            (dtls/generate-cert))
+                 cert-pem (or (:cert-pem meta-m) (:cert-pem gen-cert))
+                 key-pem (or (:key-pem meta-m) (:key-pem gen-cert))
+                 fp (normalize-fingerprint (or (:fingerprint meta-m) (:fingerprint gen-cert)))
+                 ice-creds (or (:ice-creds meta-m) (generate-random-ice-creds :light-node fp))]
              {:node-id :light-node
               :key-provider provider
               :keystore-security-tier :encrypted-keystore-0600
@@ -1532,8 +1579,8 @@
               :keypair kp-map
               :fingerprint fp
               :ice-creds ice-creds
-              :cert-data {:cert (:cert-pem cert-data)
-                          :key (:key-pem cert-data)
+              :cert-data {:cert cert-pem
+                          :key key-pem
                           :fingerprint fp}
               :diagnostics (vec diagnostics)})))
 
@@ -1568,7 +1615,11 @@
                                                     :seed-bytes seed
                                                     :passphrase passphrase
                                                     :iterations kdf-iters
-                                                    :created-ms (.now js/Date)})
+                                                    :created-ms (.now js/Date)
+                                                    :metadata {:cert-pem (:cert-pem edn-data)
+                                                               :key-pem (:key-pem edn-data)
+                                                               :fingerprint fp
+                                                               :ice-creds (:ice-creds edn-data)}})
                    _ (write-bytes-atomic! enc-file (js/Buffer.from (pr-str sealed-ks) "utf8"))
                    verify-open (kp/open-keystore-edn (edn/read-string (.readFileSync node-fs enc-file "utf8")) passphrase)]
                (when-not (:ok? verify-open)
@@ -1607,7 +1658,11 @@
                                                   :seed-bytes seed
                                                   :passphrase passphrase
                                                   :iterations kdf-iters
-                                                  :created-ms (.now js/Date)})
+                                                  :created-ms (.now js/Date)
+                                                  :metadata {:cert-pem cert-pem
+                                                             :key-pem key-pem
+                                                             :fingerprint fp
+                                                             :ice-creds ice-creds}})
                  _ (write-bytes-atomic! enc-file (js/Buffer.from (pr-str sealed-ks) "utf8"))
                  provider (kp/make-memory-key-provider seed :encrypted-keystore-0600)]
              {:node-id :light-node
@@ -1645,6 +1700,247 @@
                                  {:effect :diagnose
                                   :reason :legacy-plaintext-keystore-in-use
                                   :hint "Provide --keystore-passphrase-file or BITECHO_KEYSTORE_PASSPHRASE to use encrypted keystore.enc.edn (0600)."})})))))))
+
+(declare pack-node-encrypted-backup restore-node-encrypted-backup)
+
+(defn- node-artifact-base-url
+  [relay-url]
+  (-> (str (or relay-url "https://ns1.bitecho.org"))
+      (str/replace #"/relay/v1/?$" "")
+      (str/replace #"/+$" "")))
+
+(defn- node-http-request!
+  "Low-level Node.js HTTP/HTTPS request helper returning `{:ok? :status :body-buf :error}` via `cb`."
+  [url-str method headers body-buf timeout-ms cb]
+  (try
+    (let [u (js/URL. url-str)
+          is-https? (= (.-protocol u) "https:")
+          mod (if is-https? node-https node-http)
+          done (atom false)
+          finish! (fn [res]
+                    (when (compare-and-set! done false true)
+                      (cb res)))
+          req-opts #js {:hostname (.-hostname u)
+                        :port (when (not (str/blank? (.-port u))) (js/parseInt (.-port u) 10))
+                        :path (str (.-pathname u) (.-search u))
+                        :method method
+                        :headers (clj->js headers)
+                        :timeout (or timeout-ms 10000)}
+          req (.request mod req-opts
+                        (fn [res]
+                          (let [chunks #js []
+                                code (.-statusCode res)]
+                            (.on res "data" (fn [c] (.push chunks c)))
+                            (.on res "end" (fn []
+                                             (let [buf (.concat js/Buffer chunks)]
+                                               (finish! {:ok? (and (>= code 200) (<= code 299))
+                                                         :status code
+                                                         :body-buf buf}))))
+                            (.on res "error" (fn [e]
+                                               (finish! {:ok? false :status 0 :error (or (.-message e) (str e))}))))))]
+      (.on req "timeout" (fn []
+                           (.destroy req)
+                           (finish! {:ok? false :status 0 :error "timeout"})))
+      (.on req "error" (fn [e]
+                         (finish! {:ok? false :status 0 :error (or (.-message e) (str e))})))
+      (when body-buf
+        (.write req body-buf))
+      (.end req))
+    (catch :default e
+      (cb {:ok? false :status 0 :error (or (.-message e) (str e))}))))
+
+(defn- handle-node-stage-c-verb!
+  "Handles Row 6 & Row 11 Phase 1 shell verbs (`backup-put`, `backup-restore`, `identity-migrate`)
+   uniformly across Node.js Light one-shot CLI and `ctl` daemon control server."
+  [verb cmd-map state-atom identity state-dir state-file relay-url opts cb]
+  (case verb
+    "backup-put"
+    (let [st @state-atom
+          provider (:key-provider identity)
+          sub-id (str (or (get cmd-map "subnet_id") (get cmd-map "subnet-id") (:subnet-id cmd-map) "bitecho.org/infra"))
+          slot (or (get cmd-map "slot") (:slot cmd-map) (:slot opts) backup/default-backup-slot)
+          next-seq (inc (long (or (:backup-seq st) 0)))
+          packed (pack-node-encrypted-backup {:key-provider provider
+                                              :state st
+                                              :subnet-id sub-id
+                                              :slot slot
+                                              :seq next-seq
+                                              :now-ms (.now js/Date)})]
+      (if-not (:ok? packed)
+        (let [err (errors/canonical-error (:error packed) {:stage "backup-pack"})
+              st' (errors/record-error-diagnostic st err)]
+          (reset! state-atom st')
+          (cb {:ok? false :state st' :response (errors/canonical-error->wire err)}))
+        (let [base-url (node-artifact-base-url (or (get cmd-map "relay_url") (get cmd-map "relay-url")
+                                                   (:relay-url cmd-map) relay-url (:relay-url opts)))
+              own-pk (kp/public-key provider)
+              blob (:blob packed)
+              ptr (:pointer packed)
+              blob-buf (.from js/Buffer (:blob/bytes blob))]
+          (node-http-request!
+           (str base-url "/artifact/v1/blob")
+           "POST"
+           {"Content-Type" (or (:blob/media-type blob) "application/x-bitecho-e2ee-fressian")
+            "X-Bitecho-Blob-Cid" (:blob/cid blob)
+            "X-Bitecho-Pubkey" own-pk
+            "Content-Length" (.-length blob-buf)}
+           blob-buf
+           10000
+           (fn [b-res]
+             (if-not (:ok? b-res)
+               (let [err (errors/canonical-error :storage-publish-failed {:stage "blob" :status (:status b-res)})
+                     st' (-> (errors/record-error-diagnostic @state-atom err)
+                             (update-in [:diagnostics :backup-publish-failed] (fnil inc 0)))]
+                 (emit-stderr-diagnose! {:reason :backup-publish-failed :detail (str "blob-http-" (:status b-res))})
+                 (reset! state-atom st')
+                 (when state-file (try (save-light-state! state-file st') (catch :default _ nil)))
+                 (cb {:ok? false :state st' :response (errors/canonical-error->wire err)}))
+               (let [ptr-json (.stringify js/JSON
+                                          (clj->js {"subnet" (:pointer/subnet ptr)
+                                                    "path" (:pointer/path ptr)
+                                                    "authority" (:pointer/authority ptr)
+                                                    "seq" (:pointer/seq ptr)
+                                                    "leader_term" (:pointer/leader-term ptr)
+                                                    "target" (:pointer/target ptr)
+                                                    "proof" {"type" "self"}
+                                                    "sig" (:pointer/sig ptr)}))
+                     ptr-buf (.from js/Buffer ptr-json "utf8")]
+                 (node-http-request!
+                  (str base-url "/artifact/v1/pointer")
+                  "POST"
+                  {"Content-Type" "application/json; charset=utf-8"
+                   "X-Bitecho-Pubkey" own-pk
+                   "Content-Length" (.-length ptr-buf)}
+                  ptr-buf
+                  10000
+                  (fn [p-res]
+                    (if-not (:ok? p-res)
+                      (let [err (errors/canonical-error :storage-publish-failed {:stage "pointer" :status (:status p-res)})
+                            st' (-> (errors/record-error-diagnostic @state-atom err)
+                                    (update-in [:diagnostics :backup-publish-failed] (fnil inc 0)))]
+                        (emit-stderr-diagnose! {:reason :backup-publish-failed :detail (str "pointer-http-" (:status p-res))})
+                        (reset! state-atom st')
+                        (when state-file (try (save-light-state! state-file st') (catch :default _ nil)))
+                        (cb {:ok? false :state st' :response (errors/canonical-error->wire err)}))
+                      (let [st' (assoc @state-atom
+                                       :backup-seq next-seq
+                                       :backup-last-cid (:cid packed)
+                                       :backup-path (:path packed))]
+                        (reset! state-atom st')
+                        (when state-file (try (save-light-state! state-file st') (catch :default _ nil)))
+                        (cb {:ok? true
+                             :state st'
+                             :response {"ok" true
+                                        "seq" next-seq
+                                        "cid" (:cid packed)
+                                        "path" (:path packed)
+                                        "subnet_id" sub-id}}))))))))))))
+
+    "backup-restore"
+    (let [st @state-atom
+          provider (:key-provider identity)
+          own-pk (kp/public-key provider)
+          slot (or (get cmd-map "slot") (:slot cmd-map) (:slot opts) backup/default-backup-slot)
+          sub-id (str (or (get cmd-map "subnet_id") (get cmd-map "subnet-id") (:subnet-id cmd-map) "bitecho.org/infra"))
+          path (backup/backup-pointer-path own-pk slot)
+          base-url (node-artifact-base-url (or (get cmd-map "relay_url") (get cmd-map "relay-url")
+                                               (:relay-url cmd-map) relay-url (:relay-url opts)))
+          list-url (str base-url "/artifact/v1/list?prefix=" (js/encodeURIComponent path))]
+      (node-http-request!
+       list-url "GET" {} nil 10000
+       (fn [l-res]
+         (if-not (:ok? l-res)
+           (cb {:ok? false :state st :response {"ok" false "error" "backup-pointer-fetch-failed" "status" (:status l-res)}})
+           (let [parsed (try (parse-json-safe (.toString (:body-buf l-res) "utf8")) (catch :default _ nil))
+                 ptrs (or (get parsed "pointers") [])
+                 matched (first (filter #(= (get % "path") path) ptrs))]
+             (if-not matched
+               (cb {:ok? false :state st :response {"ok" false "error" "backup-not-found" "path" path}})
+               (let [cid (get matched "cid")
+                     ptr-map {:pointer/subnet (or (get matched "subnet") sub-id)
+                              :pointer/path (get matched "path")
+                              :pointer/authority (get matched "authority")
+                              :pointer/seq (long (or (get matched "seq") 1))
+                              :pointer/leader-term (long (or (get matched "leader_term") 1))
+                              :pointer/target cid
+                              :pointer/proof {:proof/type :self}
+                              :pointer/sig (get matched "sig")}]
+                 (node-http-request!
+                  (str base-url "/artifact/v1/blob/" cid) "GET" {} nil 10000
+                  (fn [b-res]
+                    (if-not (:ok? b-res)
+                      (cb {:ok? false :state st :response {"ok" false "error" "backup-blob-fetch-failed" "status" (:status b-res)}})
+                      (let [blob-map {:blob/cid cid
+                                      :blob/media-type "application/x-bitecho-e2ee-fressian"
+                                      :blob/bytes (crypto/compact-u8 (:body-buf b-res))}
+                            res (restore-node-encrypted-backup {:key-provider provider
+                                                                :local-state @state-atom
+                                                                :blob blob-map
+                                                                :pointer ptr-map
+                                                                :slot slot
+                                                                :min-expected-seq (or (get cmd-map "min_expected_seq") (:min-expected-seq cmd-map))
+                                                                :observed-hwm (or (get cmd-map "observed_hwm") (:observed-hwm cmd-map))})]
+                        (if-not (:ok? res)
+                          (cb {:ok? false :state @state-atom :response {"ok" false "error" (name (or (:error res) :backup-restore-failed))}})
+                          (let [st' (assoc (:state res) :keystore-security-tier (:keystore-security-tier identity))]
+                            (doseq [e (:effects res)]
+                              (when (= :diagnose (:effect e))
+                                (emit-stderr-diagnose! e)))
+                            (reset! state-atom st')
+                            (when state-file (try (save-light-state! state-file st') (catch :default _ nil)))
+                            (cb {:ok? true
+                                 :state st'
+                                 :response {"ok" true
+                                            "restored" true
+                                            "seq" (:seq res)
+                                            "cid" (:cid res)
+                                            "path" (:path res)
+                                            "summary" (:summary res)}}))))))))))))))
+
+    "identity-migrate"
+    (let [pw-file (or (get cmd-map "keystore_passphrase_file")
+                      (get cmd-map "keystore-passphrase-file")
+                      (get cmd-map "passphrase_file")
+                      (get cmd-map "passphrase-file")
+                      (:keystore-passphrase-file opts))
+          {:keys [passphrase diagnostics]} (resolve-node-keystore-passphrase!
+                                            {:passphrase (or (get cmd-map "passphrase") (:passphrase cmd-map))
+                                             :passphrase-file pw-file})]
+      (doseq [d diagnostics] (emit-stderr-diagnose! d))
+      (if (str/blank? (str passphrase))
+        (cb {:ok? false
+             :state @state-atom
+             :response (errors/canonical-error->wire (errors/canonical-error :keystore-unlock-failed {:detail "missing-passphrase"}))})
+        (let [identity-dir (.join node-path (str state-dir) "identity")
+              _ (.mkdirSync node-fs identity-dir #js {:recursive true})
+              enc-file (.join node-path identity-dir "keystore.enc.edn")
+              seed (kp/extract-ed25519-seed (:privkey-bytes identity))
+              sealed-ks (kp/seal-keystore-edn {:pubkey (:pubkey-hex identity)
+                                               :seed-bytes seed
+                                               :passphrase passphrase
+                                               :created-ms (.now js/Date)
+                                               :metadata {:cert-pem (get-in identity [:cert-data :cert])
+                                                          :key-pem (get-in identity [:cert-data :key])
+                                                          :fingerprint (:fingerprint identity)
+                                                          :ice-creds (:ice-creds identity)}})
+              _ (write-bytes-atomic! enc-file (js/Buffer.from (pr-str sealed-ks) "utf8"))
+              verify-open (kp/open-keystore-edn (edn/read-string (.readFileSync node-fs enc-file "utf8")) passphrase)]
+          (if-not (:ok? verify-open)
+            (cb {:ok? false
+                 :state @state-atom
+                 :response (errors/canonical-error->wire (errors/canonical-error :keystore-unlock-failed {:detail "migration-verify-failed"}))})
+            (let [st' (-> @state-atom
+                          (assoc :keystore-security-tier :encrypted-keystore-0600)
+                          (update-in [:diagnostics :keystore-migrated-to-encrypted] (fnil inc 0)))]
+              (emit-stderr-diagnose! {:reason :keystore-migrated-to-encrypted :path enc-file})
+              (reset! state-atom st')
+              (when state-file (try (save-light-state! state-file st') (catch :default _ nil)))
+              (cb {:ok? true
+                   :state st'
+                   :response {"ok" true
+                              "migrated" true
+                              "keystore_security_tier" "encrypted-keystore-0600"
+                              "path" enc-file}}))))))))
 
 (defn pack-node-encrypted-backup
   "Node.js Light encrypted backup packer backed by `bitecho.backup.core` (Row 6)."
@@ -3739,11 +4035,21 @@
         execute-cmd!
         (fn [effective-line]
           (let [eff-domain-verb (effective-artifact-domain-verb verb cmd-map)
+                stage-c-verb? (contains? #{"backup-put" "backup-restore" "identity-migrate"} (str verb))
                 storage-put-net? (and (= eff-domain-verb "storage-put")
                                       (not (boolean (or (get cmd-map "local_only")
                                                         (get cmd-map "local-only")
                                                         (:local-only cmd-map)))))]
-            (if storage-put-net?
+            (cond
+              stage-c-verb?
+              (handle-node-stage-c-verb!
+               (str verb) cmd-map state-atom identity
+               (when state-file (.dirname node-path (str state-file)))
+               state-file relay-url conn-opts
+               (fn [res]
+                 (finish-resp! (dissoc res :ok?))))
+
+              storage-put-net?
               (let [sub-str (str (or (get cmd-map "subnet_id") (:subnet-id @state-atom) "global"))
                     prep (light-core/prepare-storage-put @state-atom cmd-map (:privkey-bytes identity) sub-str)]
                 (if-not (:ok? prep)
@@ -3763,6 +4069,8 @@
                          (reset! state-atom (:state committed))
                          (when state-file (try (save-light-state! state-file @state-atom) (catch :default _ nil)))
                          (finish-resp! (dissoc committed :ok?))))))))
+
+              :else
               (let [line-with-now (if (contains? #{"send" "broadcast"} verb)
                                     (let [m (parse-json-safe effective-line)]
                                       (if (and (map? m) (not (contains? m "now_ms")))
@@ -4843,7 +5151,7 @@
                    dac-rec (flags/reconcile-trusted-dac-anchors initial-state-raw
                                                                 (:trusted-dac-anchors-spec opts)
                                                                 (:trusted-dac-anchors bootstrap))
-                   initial-state (:state dac-rec)
+                   initial-state (apply-startup-identity-and-load-diagnostics! (:state dac-rec) identity)
                    _ (doseq [ev (:stdout-events dac-rec)]
                        (emit-json-line! ev events-out))
                    _ (let [sec-echo (flags/security-flags->wire
@@ -4854,7 +5162,8 @@
                                        :trusted-dac-anchors-provenance (:trusted-dac-anchors-provenance initial-state)
                                        :trusted-deploy-authorities (:trusted-deploy-authorities initial-state)
                                        :pin-version (:pin-version initial-state)
-                                       :auto-update-pointer (:auto-update-pointer initial-state)}))]
+                                       :auto-update-pointer (:auto-update-pointer initial-state)
+                                       :keystore-security-tier (:keystore-security-tier initial-state)}))]
                        (.write (.-stderr js/process)
                                (str (write-json-str {"event" "startup-security-flags" "security_flags" sec-echo}) "\n")))
                    _ (when (or (and reconciled-res (:reconciled? reconciled-res))
@@ -5351,7 +5660,7 @@
                       dac-rec (flags/reconcile-trusted-dac-anchors initial-state-raw
                                                                    (:trusted-dac-anchors-spec opts)
                                                                    (:trusted-dac-anchors bootstrap))
-                      initial-state (:state dac-rec)
+                      initial-state (apply-startup-identity-and-load-diagnostics! (:state dac-rec) identity)
                       _ (let [sec-echo (flags/security-flags->wire
                                         (flags/build-security-flags-echo
                                          {:subnet-id (:subnet-id initial-state)
@@ -5360,7 +5669,8 @@
                                           :trusted-dac-anchors-provenance (:trusted-dac-anchors-provenance initial-state)
                                           :trusted-deploy-authorities (:trusted-deploy-authorities initial-state)
                                           :pin-version (:pin-version initial-state)
-                                          :auto-update-pointer (:auto-update-pointer initial-state)}))]
+                                          :auto-update-pointer (:auto-update-pointer initial-state)
+                                          :keystore-security-tier (:keystore-security-tier initial-state)}))]
                           (.write (.-stderr js/process)
                                   (str (write-json-str {"event" "startup-security-flags" "security_flags" sec-echo}) "\n")))
                       _ (when (or (and reconciled-res (:reconciled? reconciled-res))
@@ -5403,11 +5713,20 @@
                                       after-poll!
                                       (fn [poll-auto-envs]
                                         (let [eff-domain-verb (effective-artifact-domain-verb verb cmd-map)
+                                              stage-c-verb? (contains? #{"backup-put" "backup-restore" "identity-migrate"} (str verb))
                                               storage-put-net? (and (= eff-domain-verb "storage-put")
                                                                     (not (boolean (or (get cmd-map "local_only")
                                                                                       (get cmd-map "local-only")
                                                                                       (:local-only cmd-map)))))]
-                                          (if storage-put-net?
+                                          (cond
+                                            stage-c-verb?
+                                            (handle-node-stage-c-verb!
+                                             (str verb) cmd-map state-atom identity state-dir state-file effective-relay-url opts
+                                             (fn [res]
+                                               (emit-json-line! (:response res))
+                                               (.exit js/process (if (:ok? res) 0 1))))
+
+                                            storage-put-net?
                                             (let [sub-str (str (or (get cmd-map "subnet_id") (:subnet-id @state-atom) "global"))
                                                   prep (light-core/prepare-storage-put @state-atom cmd-map (:privkey-bytes identity) sub-str)]
                                               (if-not (:ok? prep)
@@ -5427,6 +5746,8 @@
                                                        (save-light-state! state-file @state-atom)
                                                        (emit-json-line! (:response committed))
                                                        (.exit js/process (if (:ok? committed) 0 1))))))))
+
+                                            :else
                                             (let [raw-res (light-core/handle-command @state-atom cmd-map (:privkey-bytes identity))
                                                   out-write-res (maybe-write-artifact-out-file! eff-domain-verb cmd-map (:response raw-res) state-atom)
                                                   res (if (:applied? out-write-res)
@@ -5719,9 +6040,11 @@
         state-file (.join node-path state-dir "state.fressian")
         identity (load-or-create-light-identity! state-dir opts)
         loaded-state (load-light-state! state-file)
-        base-state (or loaded-state
-                       (light-core/init-light-state identity (cond-> {}
-                                                               (:subnet-id opts) (assoc :subnet-id (:subnet-id opts)))))
+        base-state (apply-startup-identity-and-load-diagnostics!
+                    (or loaded-state
+                        (light-core/init-light-state identity (cond-> {}
+                                                                (:subnet-id opts) (assoc :subnet-id (:subnet-id opts)))))
+                    identity)
         state-atom (atom base-state)
         effective-relay-url (or (:relay-url opts) "https://ns1.bitecho.org")
         exec-local! (fn [cmd-map]

@@ -552,12 +552,35 @@
                                       opts)
                    (execute-conn-effects! [eff] opts))
                  nil)
-               (let [decoded (light-core/decode-light-state b)]
-                 (when (light-core/legacy-v0238-state? decoded)
-                   (let [bak-f (io/file (str (.getAbsolutePath f) ".v0238.bak"))]
-                     (when-not (.exists bak-f)
-                       (try (write-state-bytes-atomic! bak-f b) (catch Exception _ nil)))))
-                 (light-core/migrate-light-state decoded))))))))))
+               (let [decoded (try
+                               (light-core/decode-light-state b)
+                               (catch Exception e
+                                 {:__corrupt_error__ (.getMessage e)}))]
+                 (if (or (not (map? decoded)) (contains? decoded :__corrupt_error__))
+                   (let [eff {:effect :diagnose
+                              :reason :local-state-corrupt-fallback
+                              :error "local-state-corrupt-fallback"
+                              :state-file (str f)
+                              :detail (if (map? decoded) (:__corrupt_error__ decoded) "non-map-fressian-root")}]
+                     (swap! light-state-load-diagnostics-atom update :local-state-corrupt-fallback (fnil inc 0))
+                     (when-let [d-atom (:diagnostics-atom opts)]
+                       (when (instance? clojure.lang.IAtom d-atom)
+                         (swap! d-atom conj eff)))
+                     (when-let [st-atom (:state-atom opts)]
+                       (when (instance? clojure.lang.IAtom st-atom)
+                         (swap! st-atom update-in [:diagnostics :local-state-corrupt-fallback] (fnil inc 0))))
+                     (binding [*out* *err*]
+                       (println (json/write-str {"event" "diagnose"
+                                                 "reason" "local-state-corrupt-fallback"
+                                                 "state_file" (str f)
+                                                 "detail" (:detail eff)})))
+                     nil)
+                   (do
+                     (when (light-core/legacy-v0238-state? decoded)
+                       (let [bak-f (io/file (str (.getAbsolutePath f) ".v0238.bak"))]
+                         (when-not (.exists bak-f)
+                           (try (write-state-bytes-atomic! bak-f b) (catch Exception _ nil)))))
+                     (light-core/migrate-light-state decoded))))))))))))
 
 (defn load-or-create-light-identity!
   "Loads or creates persistent light-node identity in state-dir (supporting Row 11 Phase 1
@@ -586,11 +609,17 @@
 ;; Row 6: Fail-Closed Encrypted On-Network State Backup & Restore (`:bitecho.backup/v1`)
 ;; -----------------------------------------------------------------------------
 
+(defn- jvm-artifact-base-url
+  [relay-base-url]
+  (-> (str (or relay-base-url "https://ns1.bitecho.org"))
+      (str/replace #"/relay/v1/?$" "")
+      (str/replace #"/+$" "")))
+
 (defn- default-http-post-blob!
   [relay-base-url pubkey blob]
   (try
     (let [client (default-http-client)
-          url (str (str/replace (str relay-base-url) #"/+$" "") "/artifact/v1/blob")
+          url (str (jvm-artifact-base-url relay-base-url) "/artifact/v1/blob")
           req (-> (HttpRequest/newBuilder (URI/create url))
                   (.timeout (Duration/ofSeconds 10))
                   (.header "Content-Type" (or (:blob/media-type blob) "application/x-bitecho-e2ee-fressian"))
@@ -610,7 +639,7 @@
   [relay-base-url pubkey pointer]
   (try
     (let [client (default-http-client)
-          url (str (str/replace (str relay-base-url) #"/+$" "") "/artifact/v1/pointer")
+          url (str (jvm-artifact-base-url relay-base-url) "/artifact/v1/pointer")
           body-json (json/write-str
                      {"subnet" (:pointer/subnet pointer)
                       "path" (:pointer/path pointer)
@@ -730,6 +759,185 @@
          :summary (:summary merged)
          :state (:state merged)
          :effects (:effects merged)}))))
+
+(defn- default-http-fetch-backup-pointer-and-blob!
+  [relay-base-url backup-path]
+  (try
+    (let [client (default-http-client)
+          base (jvm-artifact-base-url relay-base-url)
+          list-url (str base "/artifact/v1/list?prefix="
+                        (java.net.URLEncoder/encode (str backup-path) "UTF-8"))
+          list-req (-> (HttpRequest/newBuilder (URI/create list-url))
+                       (.timeout (Duration/ofSeconds 10))
+                       (.GET)
+                       (.build))
+          list-resp (.send client list-req (HttpResponse$BodyHandlers/ofString))
+          list-code (.statusCode list-resp)]
+      (if-not (<= 200 list-code 299)
+        {:ok? false :error :backup-fetch-failed :stage :pointer :status list-code}
+        (let [parsed (json/read-str (.body list-resp))
+              items (or (get parsed "pointers") (get parsed "items") [])
+              item (first (filter #(= backup-path (get % "path")) items))]
+          (if-not (map? item)
+            {:ok? false :error :backup-not-found :stage :pointer}
+            (let [cid (or (get item "cid") (get item "target"))
+                  blob-url (str base "/artifact/v1/blob/"
+                                (java.net.URLEncoder/encode (str cid) "UTF-8"))
+                  blob-req (-> (HttpRequest/newBuilder (URI/create blob-url))
+                               (.timeout (Duration/ofSeconds 10))
+                               (.GET)
+                               (.build))
+                  blob-resp (.send client blob-req (HttpResponse$BodyHandlers/ofByteArray))
+                  blob-code (.statusCode blob-resp)]
+              (if-not (<= 200 blob-code 299)
+                {:ok? false :error :backup-fetch-failed :stage :blob :status blob-code}
+                {:ok? true
+                 :pointer {:pointer/subnet (or (get item "subnet") "bitecho.org/infra")
+                           :pointer/path (get item "path")
+                           :pointer/authority (get item "authority")
+                           :pointer/seq (long (or (get item "seq") 0))
+                           :pointer/leader-term (long (or (get item "leader_term") 0))
+                           :pointer/target cid
+                           :pointer/proof {:proof/type :self}
+                           :pointer/sig (get item "sig")}
+                 :blob {:blob/cid cid
+                        :blob/bytes (.body blob-resp)
+                        :blob/media-type "application/x-bitecho-e2ee-fressian"}}))))))
+    (catch Exception e
+      {:ok? false :error :backup-fetch-failed :detail (.getMessage e)})))
+
+(defn- handle-jvm-stage-c-verb!
+  "Handles Stage C verbs (`backup-put`, `backup-restore`, `identity-migrate`) on JVM."
+  [verb cmd-map state-atom identity relay-url opts]
+  (let [state @state-atom
+        kp (or (:key-provider identity)
+               (when (:privkey-bytes identity)
+                 (kp/make-memory-key-provider
+                  (:privkey-bytes identity)
+                  (or (:keystore-security-tier identity) :legacy-file-0600))))
+        art-relay (or (get cmd-map "relay_url")
+                      (get cmd-map "relay-url")
+                      (:relay-url cmd-map)
+                      (:relay-url opts)
+                      relay-url
+                      "https://ns1.bitecho.org")
+        sub-id (or (get cmd-map "subnet_id")
+                   (get cmd-map "subnet-id")
+                   (:subnet-id cmd-map)
+                   (:subnet-id opts)
+                   "bitecho.org/infra")
+        slot (or (get cmd-map "slot") (:slot cmd-map) (:slot opts) "state-backup-v1")]
+    (case verb
+      "backup-put"
+      (let [res (publish-encrypted-backup! {:key-provider kp
+                                            :state state
+                                            :subnet-id sub-id
+                                            :slot slot
+                                            :node-role :jvm
+                                            :relay-url art-relay})]
+        (if (:ok? res)
+          {:state (:state res)
+           :response {"ok" true
+                      "cmd" "backup-put"
+                      "seq" (:seq res)
+                      "cid" (:cid res)
+                      "path" (:path res)
+                      "relay_url" art-relay}
+           :effects (:effects res)}
+          {:state (:state res)
+           :response {"ok" false
+                      "cmd" "backup-put"
+                      "error" (name (or (:error res) :storage-publish-failed))
+                      "stage" (when (:stage res) (name (:stage res)))
+                      "status" (or (:status res) 0)}
+           :effects (:effects res)}))
+
+      "backup-restore"
+      (let [own-pk (kp/public-key kp)
+            backup-path (backup/backup-pointer-path own-pk slot)
+            fetched (default-http-fetch-backup-pointer-and-blob! art-relay backup-path)]
+        (if-not (:ok? fetched)
+          {:state state
+           :response {"ok" false
+                      "cmd" "backup-restore"
+                      "error" (name (or (:error fetched) :backup-fetch-failed))
+                      "path" backup-path}}
+          (let [res (restore-encrypted-backup! {:key-provider kp
+                                                :local-state state
+                                                :blob (:blob fetched)
+                                                :pointer (:pointer fetched)
+                                                :slot slot})]
+            (if (:ok? res)
+              {:state (:state res)
+               :response {"ok" true
+                          "cmd" "backup-restore"
+                          "seq" (:seq res)
+                          "cid" (:cid res)
+                          "path" (:path res)
+                          "summary" (:summary res)}
+               :effects (:effects res)}
+              {:state (:state res)
+               :response {"ok" false
+                          "cmd" "backup-restore"
+                          "error" (name (or (:error res) :backup-restore-failed))}
+               :effects (:effects res)}))))
+
+      "identity-migrate"
+      (let [state-dir (or (:state-dir opts) (str (io/file (System/getProperty "user.home") ".bitecho-light")))
+            passphrase (or (get cmd-map "passphrase")
+                           (:passphrase cmd-map)
+                           (:passphrase opts))
+            passphrase-file (or (get cmd-map "passphrase_file")
+                                (get cmd-map "passphrase-file")
+                                (get cmd-map "keystore_passphrase_file")
+                                (get cmd-map "keystore-passphrase-file")
+                                (:passphrase-file cmd-map)
+                                (:keystore-passphrase-file cmd-map)
+                                (:keystore-passphrase-file opts)
+                                (:passphrase-file opts))
+            mig (identity/load-key-provider-identity!
+                 state-dir :light-node
+                 (cond-> {}
+                   passphrase (assoc :passphrase passphrase)
+                   passphrase-file (assoc :passphrase-file passphrase-file)))
+            migrated? (boolean (some #(= :keystore-migrated-to-encrypted (:reason %)) (:diagnostics mig)))]
+        (if (and (not= false (:ok? mig))
+                 (= :encrypted-keystore-0600 (:keystore-security-tier mig)))
+          (let [st' (cond-> (assoc state :keystore-security-tier :encrypted-keystore-0600)
+                      migrated? (update-in [:diagnostics :keystore-migrated-to-encrypted] (fnil inc 0)))]
+            {:state st'
+             :response {"ok" true
+                        "cmd" "identity-migrate"
+                        "migrated" migrated?
+                        "pubkey" (or (:pubkey-hex mig) (kp/public-key (:key-provider mig)))
+                        "keystore_path" (str (io/file state-dir "identity" "keystore.enc.edn"))
+                        "keystore_security_tier" "encrypted-keystore-0600"}})
+          {:state state
+           :response {"ok" false
+                      "cmd" "identity-migrate"
+                      "error" (name (or (:error mig) :passphrase-required))}}))
+      nil)))
+
+(defn- apply-jvm-startup-diagnostics!
+  [initial-state identity load-diags]
+  (let [id-diags (vec (or (:diagnostics identity) []))
+        all-diags (into id-diags (or load-diags []))
+        st-with-diags (reduce (fn [acc d]
+                                (if-let [r (:reason d)]
+                                  (update-in acc [:diagnostics r] (fnil inc 0))
+                                  acc))
+                              initial-state
+                              all-diags)]
+    (doseq [d all-diags]
+      (binding [*out* *err*]
+        (println (json/write-str {"event" "diagnostic"
+                                  "reason" (name (or (:reason d) :unknown))
+                                  "detail" (or (:detail d) (:path d) "")}))))
+    (assoc st-with-diags
+           :keystore-security-tier
+           (or (:keystore-security-tier identity)
+               (:keystore-security-tier st-with-diags)
+               :legacy-file-0600))))
 
 ;; -----------------------------------------------------------------------------
 ;; Validator Connection Manager
@@ -2879,10 +3087,14 @@
                                                 (not (contains? effective-map "now_ms")))
                                          (assoc effective-map "now_ms" (System/currentTimeMillis))
                                          effective-map)
-                res (if (and (= eff-domain-verb "storage-put")
-                             (not (boolean (or (get effective-map-with-now "local_only")
-                                               (get effective-map-with-now "local-only")
-                                               (:local-only effective-map-with-now)))))
+                res (cond
+                      (contains? #{"backup-put" "backup-restore" "identity-migrate"} verb)
+                      (handle-jvm-stage-c-verb! verb effective-map-with-now state-atom identity relay-url conn-opts)
+
+                      (and (= eff-domain-verb "storage-put")
+                           (not (boolean (or (get effective-map-with-now "local_only")
+                                             (get effective-map-with-now "local-only")
+                                             (:local-only effective-map-with-now)))))
                       (let [sub-str (str (or (get effective-map-with-now "subnet_id") (:subnet-id @state-atom) "global"))
                             prep (light-core/prepare-storage-put @state-atom effective-map-with-now (:privkey-bytes identity) sub-str)]
                         (if-not (:ok? prep)
@@ -2895,6 +3107,8 @@
                                 committed (light-core/commit-storage-put-outcome @state-atom (:publish-intent prep) net-receipt)]
                             (assoc (dissoc committed :ok?)
                                    :net-envelopes (if (:ok? committed) (:net-envelopes prep) [])))))
+
+                      :else
                       (light-core/handle-command @state-atom effective-map-with-now (:privkey-bytes identity)))
                 _ (when (:state res)
                     (reset! state-atom (:state res)))
@@ -3808,9 +4022,10 @@
                                  events-out))
             state-file (str (io/file state-dir "state.fressian"))
             cmd-file (:cmd-file opts)
-            identity (load-or-create-light-identity! state-dir)
+            identity (load-or-create-light-identity! state-dir opts)
             bootstrap (discovery/load-bootstrap-descriptor! (:bootstrap opts))
-            loaded-state (load-light-state! state-file)
+            load-diags-atom (atom [])
+            loaded-state (load-light-state! state-file {:diagnostics-atom load-diags-atom})
             reconciled-res (when loaded-state
                              (light-core/reconcile-startup-subnet-id
                               loaded-state
@@ -3859,7 +4074,7 @@
             dac-rec (flags/reconcile-trusted-dac-anchors initial-state-raw
                                                          (:trusted-dac-anchors-spec opts)
                                                          (:trusted-dac-anchors bootstrap))
-            initial-state (:state dac-rec)
+            initial-state (apply-jvm-startup-diagnostics! (:state dac-rec) identity @load-diags-atom)
             _ (doseq [ev (:stdout-events dac-rec)]
                 (emit-json-line! out-writer ev (:events-out opts)))
             _ (let [sec-echo (flags/security-flags->wire
@@ -3870,7 +4085,8 @@
                                 :trusted-dac-anchors-provenance (:trusted-dac-anchors-provenance initial-state)
                                 :trusted-deploy-authorities (:trusted-deploy-authorities initial-state)
                                 :pin-version (:pin-version initial-state)
-                                :auto-update-pointer (:auto-update-pointer initial-state)}))]
+                                :auto-update-pointer (:auto-update-pointer initial-state)
+                                :keystore-security-tier (:keystore-security-tier initial-state)}))]
                 (binding [*out* *err*]
                   (println (json/write-str {"event" "startup-security-flags" "security_flags" sec-echo}))))
             _ (when (or (and reconciled-res (:reconciled? reconciled-res))
@@ -4332,9 +4548,10 @@
         (emit-json-line! out-writer delegated)
         delegated)
       (let [state-file (str (io/file state-dir "state.fressian"))
-            identity (load-or-create-light-identity! state-dir)
+            identity (load-or-create-light-identity! state-dir opts)
             bootstrap (discovery/load-bootstrap-descriptor! (:bootstrap opts))
-            loaded-state (load-light-state! state-file)
+            load-diags-atom (atom [])
+            loaded-state (load-light-state! state-file {:diagnostics-atom load-diags-atom})
             reconciled-res (when loaded-state
                              (light-core/reconcile-startup-subnet-id
                               loaded-state
@@ -4383,7 +4600,7 @@
             dac-rec (flags/reconcile-trusted-dac-anchors initial-state-raw
                                                          (:trusted-dac-anchors-spec opts)
                                                          (:trusted-dac-anchors bootstrap))
-            initial-state (:state dac-rec)
+            initial-state (apply-jvm-startup-diagnostics! (:state dac-rec) identity @load-diags-atom)
             _ (doseq [ev (:stdout-events dac-rec)]
                 (emit-json-line! out-writer ev (:events-out opts)))
             _ (let [sec-echo (flags/security-flags->wire
@@ -4394,7 +4611,8 @@
                                 :trusted-dac-anchors-provenance (:trusted-dac-anchors-provenance initial-state)
                                 :trusted-deploy-authorities (:trusted-deploy-authorities initial-state)
                                 :pin-version (:pin-version initial-state)
-                                :auto-update-pointer (:auto-update-pointer initial-state)}))]
+                                :auto-update-pointer (:auto-update-pointer initial-state)
+                                :keystore-security-tier (:keystore-security-tier initial-state)}))]
                 (binding [*out* *err*]
                   (println (json/write-str {"event" "startup-security-flags" "security_flags" sec-echo}))))
             _ (when (or (and reconciled-res (:reconciled? reconciled-res))
@@ -4450,10 +4668,14 @@
             err-resp)
           (binding [*out* *err*]
             (let [eff-domain-verb (effective-artifact-domain-verb verb cmd-map)
-                  res (if (and (= eff-domain-verb "storage-put")
-                               (not (boolean (or (get cmd-map "local_only")
-                                                 (get cmd-map "local-only")
-                                                 (:local-only cmd-map)))))
+                  res (cond
+                        (contains? #{"backup-put" "backup-restore" "identity-migrate"} verb)
+                        (handle-jvm-stage-c-verb! verb cmd-map state-atom identity effective-relay-url opts)
+
+                        (and (= eff-domain-verb "storage-put")
+                             (not (boolean (or (get cmd-map "local_only")
+                                               (get cmd-map "local-only")
+                                               (:local-only cmd-map)))))
                         (let [sub-str (str (or (get cmd-map "subnet_id") (:subnet-id @state-atom) "global"))
                               prep (light-core/prepare-storage-put @state-atom cmd-map (:privkey-bytes identity) sub-str)]
                           (if-not (:ok? prep)
@@ -4466,6 +4688,8 @@
                                   committed (light-core/commit-storage-put-outcome @state-atom (:publish-intent prep) net-receipt)]
                               (assoc (dissoc committed :ok?)
                                      :net-envelopes (if (:ok? committed) (:net-envelopes prep) [])))))
+
+                        :else
                         (light-core/handle-command @state-atom cmd-map (:privkey-bytes identity)))
                   _ (when (:state res) (reset! state-atom (:state res)))
                   out-write-res (maybe-write-artifact-out-file! eff-domain-verb cmd-map (:response res) state-atom)

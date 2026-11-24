@@ -849,7 +849,11 @@
     (boolean (and creds pkc))))
 
 (defn- detect-browser-keystore-tier
-  "Determines accurate Row 11 Phase 1 `keystore_security_tier` for Browser runtime."
+  "Determines accurate, truthful Row 11 Phase 1 `keystore_security_tier` for Browser runtime (F6):
+   - Only reports `:webauthn-prf-non-extractable` when an enrolled WebAuthn PRF credential is actively backing the key.
+   - Only reports `:webcrypto-non-extractable` when a non-extractable WebCrypto CryptoKey is actively backing the key.
+   - Reports `:webauthn-locked` when private key material is locked/absent.
+   - Reports `:ephemeral-memory` when an in-memory keypair is active."
   [node]
   (cond
     (:key-provider node)
@@ -861,11 +865,14 @@
     (nil? (get-in node [:keypair :private-key]))
     :webauthn-locked
 
-    (and (true? (get-in node [:webauthn :prf-supported?]))
+    (and (true? (get-in node [:webauthn :prf-active?]))
+         (some? (get-in node [:webauthn :credential-id]))
          (browser-webauthn-available?))
     :webauthn-prf-non-extractable
 
-    (browser-webcrypto-available?)
+    (and (or (true? (:webcrypto-non-extractable? node))
+             (some? (:webcrypto-key node)))
+         (browser-webcrypto-available?))
     :webcrypto-non-extractable
 
     :else
@@ -4326,6 +4333,12 @@
                "quarantined_session_ids" q-ids
                "keystore_security_tier" (name tier)}))))
 
+(defn- browser-artifact-base-url
+  [relay-url]
+  (-> (str (or relay-url "https://bitecho.org"))
+      (str/replace #"/relay/v1/?$" "")
+      (str/replace #"/+$" "")))
+
 (defn- browser-backup-put-v1
   [& [opts-js]]
   (let [na @active-node-atom
@@ -4336,10 +4349,10 @@
             provider (active-browser-key-provider node)
             st (or (:light-state node) {})
             next-seq (inc (long (or (:backup-seq st) 0)))
-            relay-base (str/replace (str (or (:relay-url opts) (:relay_url opts) (:relay-url node) "https://bitecho.org")) #"/+$" "")
+            relay-base (browser-artifact-base-url (or (:relay-url opts) (:relay_url opts) (:relayUrl opts) (:relay-url node)))
             packed (backup/pack-encrypted-backup {:key-provider provider
                                                   :state st
-                                                  :subnet-id (or (:subnet-id opts) (:subnet_id opts) "bitecho.org/infra")
+                                                  :subnet-id (or (:subnet-id opts) (:subnet_id opts) (:subnetId opts) "bitecho.org/infra")
                                                   :slot (or (:slot opts) backup/default-backup-slot)
                                                   :seq next-seq
                                                   :node-role :browser
@@ -4404,6 +4417,31 @@
                               (record-browser-backup-diag! na :backup-publish-failed {:stage :network :error msg})
                               (clj->js (errors/canonical-error->wire (errors/canonical-error :storage-publish-failed {:detail msg}))))))))))))))
 
+(defn- apply-browser-backup-restore!
+  [na provider st blob ptr opts]
+  (let [unpacked (backup/unpack-encrypted-backup {:key-provider provider
+                                                  :blob blob
+                                                  :pointer ptr
+                                                  :slot (:slot opts)
+                                                  :min-expected-seq (or (:min-expected-seq opts) (:min_expected_seq opts) (:minExpectedSeq opts))})]
+    (if-not (:ok? unpacked)
+      (do
+        (record-browser-backup-diag! na (:error unpacked) {:stage :backup-restore})
+        (clj->js {"ok" false "error" (name (:error unpacked))}))
+      (let [obs-hwm (or (:observed-hwm opts) (:observed_hwm opts) (:observedHwm opts))
+            merged (backup/merge-restored-state st (:payload unpacked) obs-hwm)]
+        (swap! na assoc :light-state (:state merged))
+        (when-let [effs (seq (:effects merged))]
+          (doseq [e effs]
+            (when (= :diagnose (:effect e))
+              (record-browser-backup-diag! na (:reason e) e))))
+        (clj->js {"ok" true
+                  "restored" true
+                  "seq" (:seq unpacked)
+                  "cid" (:cid unpacked)
+                  "path" (:path unpacked)
+                  "summary" (:summary merged)})))))
+
 (defn- browser-backup-restore-v1
   [& [opts-js]]
   (let [na @active-node-atom
@@ -4416,25 +4454,70 @@
             blob (:blob opts)
             ptr (:pointer opts)]
         (if (and (map? blob) (map? ptr))
-          (let [unpacked (backup/unpack-encrypted-backup {:key-provider provider
-                                                          :blob blob
-                                                          :pointer ptr
-                                                          :slot (:slot opts)
-                                                          :min-expected-seq (:min-expected-seq opts)})]
-            (if-not (:ok? unpacked)
+          (js/Promise.resolve (apply-browser-backup-restore! na provider st blob ptr opts))
+          (let [own-pk (kp/public-key provider)]
+            (if (str/blank? (str own-pk))
               (do
-                (record-browser-backup-diag! na (:error unpacked) {:stage :backup-restore})
-                (js/Promise.resolve (clj->js {"ok" false "error" (name (:error unpacked))})))
-              (let [merged (backup/merge-restored-state st (:payload unpacked) (:observed-hwm opts))]
-                (swap! na assoc :light-state (:state merged))
-                (js/Promise.resolve (clj->js {"ok" true
-                                              "restored" true
-                                              "seq" (:seq unpacked)
-                                              "cid" (:cid unpacked)
-                                              "summary" (:summary merged)})))))
-          (do
-            (record-browser-backup-diag! na :backup-restore-missing-input {:stage :backup-restore})
-            (js/Promise.resolve (clj->js {"ok" false "error" "missing-backup-blob-or-pointer"}))))))))
+                (record-browser-backup-diag! na :hardware-unlock-required {:stage :backup-restore})
+                (js/Promise.resolve (clj->js (errors/canonical-error->wire (errors/canonical-error :hardware-unlock-required {:stage "backup-restore"})))))
+              (let [fetch-fn (gobj/get js/globalThis "fetch")
+                    slot (or (:slot opts) backup/default-backup-slot)
+                    path (backup/backup-pointer-path own-pk slot)
+                    sub-id (or (:subnet-id opts) (:subnet_id opts) (:subnetId opts) "bitecho.org/infra")
+                    relay-base (browser-artifact-base-url (or (:relay-url opts) (:relay_url opts) (:relayUrl opts) (:relay-url node)))
+                    list-url (str relay-base "/artifact/v1/list?prefix=" (js/encodeURIComponent path))]
+                (if-not (fn? fetch-fn)
+                  (do
+                    (record-browser-backup-diag! na :backup-restore-fetch-unavailable {:stage :backup-restore})
+                    (js/Promise.resolve (clj->js {"ok" false "error" "fetch-unavailable"})))
+                  (-> (fetch-fn list-url)
+                      (.then (fn [resp]
+                               (if-not (boolean (gobj/get resp "ok"))
+                                 (let [status (gobj/get resp "status")]
+                                   (record-browser-backup-diag! na :backup-restore-failed {:stage :list :status status})
+                                   (clj->js {"ok" false "error" "backup-pointer-fetch-failed" "status" status}))
+                                 (let [json-fn (gobj/get resp "json")]
+                                   (.then (.call json-fn resp)
+                                          (fn [data-js]
+                                            (let [ptrs-js (gobj/get data-js "pointers")
+                                                  n (if ptrs-js (gobj/get ptrs-js "length") 0)
+                                                  matched (loop [i 0]
+                                                            (when (< i n)
+                                                              (let [item (aget ptrs-js i)
+                                                                    p (when item (gobj/get item "path"))]
+                                                                (if (= p path) item (recur (inc i))))))]
+                                              (if-not matched
+                                                (do
+                                                  (record-browser-backup-diag! na :backup-not-found {:path path})
+                                                  (clj->js {"ok" false "error" "backup-not-found" "path" path}))
+                                                (let [cid (gobj/get matched "cid")
+                                                      ptr-map {:pointer/subnet (or (gobj/get matched "subnet") sub-id)
+                                                               :pointer/path (gobj/get matched "path")
+                                                               :pointer/authority (gobj/get matched "authority")
+                                                               :pointer/seq (long (or (gobj/get matched "seq") 1))
+                                                               :pointer/leader-term (long (or (gobj/get matched "leader_term") 1))
+                                                               :pointer/target cid
+                                                               :pointer/proof {:proof/type :self}
+                                                               :pointer/sig (gobj/get matched "sig")}
+                                                      blob-url (str relay-base "/artifact/v1/blob/" cid)]
+                                                  (-> (fetch-fn blob-url)
+                                                      (.then (fn [b-resp]
+                                                               (if-not (boolean (gobj/get b-resp "ok"))
+                                                                 (let [st-code (gobj/get b-resp "status")]
+                                                                   (record-browser-backup-diag! na :backup-restore-failed {:stage :blob :status st-code})
+                                                                   (clj->js {"ok" false "error" "backup-blob-fetch-failed" "status" st-code}))
+                                                                 (let [ab-fn (gobj/get b-resp "arrayBuffer")]
+                                                                   (.then (.call ab-fn b-resp)
+                                                                          (fn [ab]
+                                                                            (let [u8 (js/Uint8Array. ab)
+                                                                                  blob-map {:blob/cid cid
+                                                                                            :blob/media-type "application/x-bitecho-e2ee-fressian"
+                                                                                            :blob/bytes u8}]
+                                                                              (apply-browser-backup-restore! na provider st blob-map ptr-map opts))))))))))))))))))
+                      (.catch (fn [e]
+                                (let [msg (or (when e (gobj/get e "message")) (str e))]
+                                  (record-browser-backup-diag! na :backup-restore-failed {:stage :network :error msg})
+                                  (clj->js {"ok" false "error" "backup-restore-failed" "detail" msg}))))))))))))))
 
 (defn build-light-node-api
   "Constructs the unified `BitechoLightNode` browser console CLI & v1.1.0 Headless API object

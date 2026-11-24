@@ -587,7 +587,21 @@
              (is (.exists (io/file state-dir "identity" "keystore.enc.edn")))
              (is (some #(= :keystore-migrated-to-encrypted (:reason %)) (:diagnostics migrated)))
              (is (= (kp/normalize-pubkey-hex (:pubkey-hex legacy-id))
-                    (kp/public-key (:key-provider migrated)))))
+                    (kp/public-key (:key-provider migrated))))
+             (is (= (:fingerprint legacy-id) (:fingerprint migrated)))
+             (is (= (:ice-creds legacy-id) (:ice-creds migrated)))
+             (is (= (:cert (:cert-data legacy-id)) (:cert (:cert-data migrated))))
+
+             ;; 2b. Second boot from migrated keystore.enc.edn preserves exact DTLS fingerprint, ICE creds, and cert-data (F7)
+             (let [second-boot (shell-identity/load-key-provider-identity! state-dir "node-test-1"
+                                                                           {:passphrase "correct-horse-battery-staple"})]
+               (is (= :encrypted-keystore-0600 (:keystore-security-tier second-boot)))
+               (is (= (kp/normalize-pubkey-hex (:pubkey-hex legacy-id))
+                      (kp/public-key (:key-provider second-boot))))
+               (is (= (:fingerprint legacy-id) (:fingerprint second-boot)))
+               (is (= (:ice-creds legacy-id) (:ice-creds second-boot)))
+               (is (= (:cert (:cert-data legacy-id)) (:cert (:cert-data second-boot))))
+               (is (= (:key (:cert-data legacy-id)) (:key (:cert-data second-boot))))))
 
            ;; 3. Wrong passphrase on existing keystore.enc.edn -> fails closed with :keystore-unlock-failed
            (let [failed (shell-identity/load-key-provider-identity! state-dir "node-test-1"
@@ -621,4 +635,63 @@
          (is (false? (:ok? res-503)))
          (is (= :storage-publish-failed (:error res-503)))
          (is (= 4 (get-in res-503 [:state :backup-seq])))
-         (is (some #(= :backup-publish-failed (:reason %)) (:effects res-503)))))))
+         (is (some #(= :backup-publish-failed (:reason %)) (:effects res-503))))
+       ;; F3: Garbage bytes in state.fressian must not crash and must emit :local-state-corrupt-fallback
+       (let [temp-dir (.toFile (Files/createTempDirectory "bitecho-stagec-corrupt-" (into-array FileAttribute [])))
+             corrupt-file (io/file temp-dir "state.fressian")
+             st-atom (atom {:diagnostics {}})
+             diags-atom (atom [])]
+         (Files/write (.toPath corrupt-file)
+                      (byte-array (map unchecked-byte [0x01 0x02 0x03 0xff 0xfe 0x10 0x20]))
+                      (into-array java.nio.file.OpenOption []))
+         (let [loaded (shell-light/load-light-state! (.getAbsolutePath corrupt-file)
+                                                     {:state-atom st-atom
+                                                      :diagnostics-atom diags-atom})]
+           (is (nil? loaded))
+           (is (= 1 (get-in @st-atom [:diagnostics :local-state-corrupt-fallback])))
+           (is (some #(= :local-state-corrupt-fallback (:reason %)) @diags-atom)))))))
+
+(deftest test-self-path-owner-blob-rate-limit-and-unreferenced-gc
+  (testing "F8: :self-path-owner-blob enforces per-sender unreferenced cap with counted :diagnose, and GC-evicts expired unreferenced blobs"
+    (let [owner-seed #?(:clj (byte-array (map unchecked-byte (range 32)))
+                        :cljs (js/Uint8Array. (clj->js (vec (range 32)))))
+          admin-seed #?(:clj (byte-array (map unchecked-byte (range 32 64)))
+                        :cljs (js/Uint8Array. (clj->js (vec (range 32 64)))))
+          admin-hex (fressian/bytes->hex (:public (crypto/pure-ed25519-keypair admin-seed)))
+          owner-kp (kp/make-memory-key-provider owner-seed :encrypted-keystore-0600)
+          owner-pk (kp/public-key owner-kp)
+          policy (core-infra/default-infra-policy {:trust-anchors #{admin-hex} :threshold 1})
+          t0 1700000000000
+          init-inst (:instance (subnet/init-subnet-instance policy))
+          after-8 (reduce (fn [inst i]
+                            (let [blob (data/make-blob (str "unreferenced-backup-blob-" i)
+                                                       "application/x-bitecho-e2ee-fressian")
+                                  res (subnet/reduce-subnet inst {:type :put-blob
+                                                                  :sender owner-pk
+                                                                  :now-ms (+ t0 i)
+                                                                  :blob blob})]
+                              (is (true? (:applied? res)))
+                              (:state res)))
+                          init-inst
+                          (range 8))]
+      ;; 9th unreferenced blob from same sender at t0+10 must be rate-limited with counted :diagnose
+      (let [blob9 (data/make-blob "unreferenced-backup-blob-9" "application/x-bitecho-e2ee-fressian")
+            res-9 (subnet/reduce-subnet after-8 {:type :put-blob
+                                                 :sender owner-pk
+                                                 :now-ms (+ t0 10)
+                                                 :blob blob9})]
+        (is (false? (:applied? res-9)))
+        (is (= :self-path-owner-blob-rate-limited (:error res-9)))
+        (is (some #(= :self-path-owner-blob-rate-limited (:reason %)) (:effects res-9)))
+        (is (= 1 (get-in (:state res-9) [:diagnostics :self-path-owner-blob-rate-limited]))))
+
+      ;; After TTL (300,000 ms) passes, GC evicts the 8 stale unreferenced blobs and admits the 9th!
+      (let [blob-gc (data/make-blob "unreferenced-backup-blob-after-gc" "application/x-bitecho-e2ee-fressian")
+            res-gc (subnet/reduce-subnet after-8 {:type :put-blob
+                                                  :sender owner-pk
+                                                  :now-ms (+ t0 300050)
+                                                  :blob blob-gc})]
+        (is (true? (:applied? res-gc)))
+        (is (= 1 (count (:self-owner-blobs (:state res-gc)))))
+        (is (= 1 (count (get-in (:state res-gc) [:data :blobs :entries]))))
+        (is (= 8 (get-in (:state res-gc) [:diagnostics :self-path-owner-blob-gc-evicted])))))))

@@ -332,20 +332,53 @@
         (:subnet/path-acl policy)))
 
 (def ^:private default-self-owner-max-blob-bytes (* 512 1024))
+(def ^:private default-self-owner-max-unreferenced-per-sender 8)
+(def ^:private default-self-owner-blob-ttl-ms 300000)
 
 (defn- policy-has-self-path-owner?
   [policy]
   (boolean (some #(= :self-path-owner (get-in % [:principal :type]))
                  (:subnet/path-acl policy))))
 
+(defn- gc-expired-self-owner-blobs
+  "Purely evicts stale unreferenced `:self-path-owner-blob` entries past TTL from `state`."
+  [state policy now-ms]
+  (let [ttl-ms (long (or (get-in policy [:subnet/storage :self-owner-blob-ttl-ms])
+                         default-self-owner-blob-ttl-ms))
+        tracked (or (:self-owner-blobs state) {})
+        now (long (or now-ms 0))]
+    (if (or (empty? tracked) (<= now 0))
+      state
+      (let [expired-cids (keep (fn [[cid {:keys [added-ms]}]]
+                                 (when (and (> now 0)
+                                            (>= (- now (long (or added-ms 0))) ttl-ms)
+                                            (not (data/blob-pinned? (get-in state [:data :blobs]) cid)))
+                                   cid))
+                               tracked)]
+        (if (empty? expired-cids)
+          state
+          (reduce (fn [st cid]
+                    (let [entry (get-in st [:data :blobs :entries cid])
+                          sz (long (or (:size entry) 0))
+                          hot? (some? (:bytes entry))]
+                      (-> st
+                          (update :self-owner-blobs dissoc cid)
+                          (update-in [:data :blobs :entries] dissoc cid)
+                          (update-in [:data :blobs :unpinned-bytes] #(max 0 (- (long (or % 0)) sz)))
+                          (cond-> hot? (update-in [:data :blobs :hot-bytes] #(max 0 (- (long (or % 0)) sz))))
+                          (update-in [:diagnostics :self-path-owner-blob-gc-evicted] (fnil inc 0)))))
+                  state
+                  expired-cids))))))
+
 (defn- check-self-path-owner-admission
-  "Pure helper (BIP-022 Stage C §3.3): evaluates `:self-path-owner` admission for non-allowlisted
+  "Pure helper (BIP-022 Stage C §3.3 + F8): evaluates `:self-path-owner` admission for non-allowlisted
    senders on `:allowlist` subnets.
    - `:publish-pointer`: admits ONLY if `:pointer/path` matches a `:self-path-owner` ACL rule AND
      `(normalize-pubkey-hex (:pointer/authority ptr)) == (normalize-pubkey-hex (:owner match-info))`
      (matching `sender` when supplied). Rejects cross-owner writes with `:unauthorized-pointer-authority`.
-   - `:put-blob`: admits ONLY if policy declares `:self-path-owner`, blob verifies `SHA-256 == CID`,
-     and blob size is within `max-chunk-bytes` (512 KiB) and unpinned quota."
+   - `:put-blob`: admits ONLY if policy declares `:self-path-owner`, blob is encrypted self-storage
+     (`application/x-bitecho-e2ee-fressian`), verifies `SHA-256 == CID`, is within `max-chunk-bytes`
+     (512 KiB), fits unpinned quota, and sender has not exceeded per-sender unreferenced blob cap."
   [policy state event sender]
   (case (:type event)
     :publish-pointer
@@ -373,12 +406,22 @@
                                    (true? (:self-path-owner? event)))
             max-bytes (long (or (get-in policy [:subnet/storage :max-chunk-bytes])
                                 default-self-owner-max-blob-bytes))
+            max-per-sender (long (or (get-in policy [:subnet/storage :max-unreferenced-blobs-per-sender])
+                                     default-self-owner-max-unreferenced-per-sender))
             blob-len (if (and (map? blob) (:blob/bytes blob))
                        (fressian/count-bytes (:blob/bytes blob))
                        -1)
-            unpinned-cur (long (or (get-in state [:data :blobs :unpinned-bytes]) 0))
-            unpinned-max (long (or (get-in state [:data :blobs :max-unpinned-bytes])
-                                   data/default-max-unpinned-bytes))]
+            norm-sender (or (normalize-pubkey-hex sender) :self-storage)
+            now-ms (long (or (:now-ms event) 0))
+            cleaned-st (gc-expired-self-owner-blobs state policy now-ms)
+            unpinned-cur (long (or (get-in cleaned-st [:data :blobs :unpinned-bytes]) 0))
+            unpinned-max (long (or (get-in cleaned-st [:data :blobs :max-unpinned-bytes])
+                                   data/default-max-unpinned-bytes))
+            sender-unpinned-cnt (count (filter (fn [[cid rec]]
+                                                 (and (= (:sender rec) norm-sender)
+                                                      (not= cid (:blob/cid blob))
+                                                      (not (data/blob-pinned? (get-in cleaned-st [:data :blobs]) cid))))
+                                               (:self-owner-blobs cleaned-st)))]
         (when self-storage-blob?
           (cond
             (not (data/verify-blob blob))
@@ -387,12 +430,15 @@
             (> blob-len max-bytes)
             {:admitted? false :error :payload-too-large}
 
+            (>= sender-unpinned-cnt max-per-sender)
+            {:admitted? false :error :self-path-owner-blob-rate-limited}
+
             (> (+ unpinned-cur blob-len) unpinned-max)
             {:admitted? false :error :chunk-store-quota-exceeded}
 
             :else
             {:admitted? true
-             :member (or (normalize-pubkey-hex sender) :self-storage)
+             :member norm-sender
              :admission-via :self-path-owner-blob}))))
 
     nil))
@@ -694,13 +740,17 @@
       ;; Data / Pointer operations go through Gate -> Economy -> Replication
       (let [adm (check-gate-admission policy instance event)]
         (if-not (:admitted? adm)
-          (let [diag {:effect :diagnose
-                      :reason :subnet-gate-rejected
-                      :error (:error adm)
-                      :subnet sid}]
-            {:state (update-in instance [:diagnostics :gate-rejected] (fnil inc 0))
+          (let [err (:error adm)
+                rate-limited? (= :self-path-owner-blob-rate-limited err)
+                diag {:effect :diagnose
+                      :reason (if rate-limited? :self-path-owner-blob-rate-limited :subnet-gate-rejected)
+                      :error err
+                      :subnet sid}
+                st' (cond-> (update-in instance [:diagnostics :gate-rejected] (fnil inc 0))
+                      rate-limited? (update-in [:diagnostics :self-path-owner-blob-rate-limited] (fnil inc 0)))]
+            {:state st'
              :applied? false
-             :error (:error adm)
+             :error err
              :effects [diag]})
           (let [econ (:subnet/economy policy)
                 econ-mode (:economy/mode econ :none)
@@ -719,7 +769,10 @@
                  :error :insufficient-burn
                  :effects [diag]})
               (let [admitted-member (:member adm)
-                    inst1 (cond-> instance
+                    inst0 (if (= :self-path-owner-blob (:admission-via adm))
+                            (gc-expired-self-owner-blobs instance policy now-ms)
+                            instance)
+                    inst1 (cond-> inst0
                             (and (not= econ-mode :none) (pos? provided-burn))
                             (update :burned-ech (fnil + 0) provided-burn))]
                 (case etype
@@ -731,8 +784,12 @@
                                      :subnet sid
                                      :cid (:cid res)
                                      :blob (:blob event)}]
-                                   [])]
-                    {:state (assoc inst1 :data (:state res))
+                                   [])
+                        inst2 (cond-> (assoc inst1 :data (:state res))
+                                (and (:ok? res) (= :self-path-owner-blob (:admission-via adm)))
+                                (assoc-in [:self-owner-blobs (:cid res)]
+                                          {:sender admitted-member :added-ms now-ms}))]
+                    {:state inst2
                      :applied? (boolean (:ok? res))
                      :effects (into (vec (:effects res)) rep-effs)})
 
@@ -793,7 +850,9 @@
                                :effects (:effects res)}
                               (let [valid-ptr (:pointer res)
                                     is-policy-path? (= "subnet/policy" (:pointer/path valid-ptr))
-                                    inst2 (assoc inst1 :data (:state res))]
+                                    inst2 (cond-> (assoc inst1 :data (:state res))
+                                            (:pointer/target valid-ptr)
+                                            (update :self-owner-blobs dissoc (:pointer/target valid-ptr)))]
                                 (if-not is-policy-path?
                                   (let [ptr-rep (get-in policy [:subnet/replication :replication/pointers])
                                         rep-eff {:effect :replicate-pointer

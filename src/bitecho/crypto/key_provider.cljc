@@ -169,11 +169,11 @@
           (pure-cljs-pbkdf2-sha256-32 (fressian/utf8->bytes pw-str) salt iters))))))
 
 (defn seal-keystore-edn
-  "Purely encrypts identity secret material (`{:ed25519-seed <hex> :pubkey <hex> :created-ms <long>}`)
+  "Purely encrypts identity secret material (`{:ed25519-seed <hex> :pubkey <hex> :created-ms <long> :metadata <map>}`)
    using XSalsa20-Poly1305 under KEK derived from `passphrase` + `salt-bytes` + `nonce-bytes`.
    Returns pure EDN map `{:schema \"bitecho.keystore/v1\" :pubkey <hex> :kdf {...} :cipher \"xsalsa20-poly1305\"
    :nonce-hex <48-hex> :ciphertext-hex <hex>}`. Zero plaintext private-key bytes appear anywhere in the map."
-  [{:keys [pubkey seed-bytes passphrase salt-bytes nonce-bytes iterations created-ms]}]
+  [{:keys [pubkey seed-bytes passphrase salt-bytes nonce-bytes iterations created-ms metadata]}]
   (let [seed (extract-ed25519-seed seed-bytes)
         _ (when-not seed
             (throw (ex-info "Invalid Ed25519 seed bytes for seal-keystore-edn" {})))
@@ -183,9 +183,10 @@
         nonce (or nonce-bytes (crypto/random-bytes 24))
         iters (long (or iterations min-kdf-iterations))
         kek (derive-passphrase-kek passphrase salt {:iterations iters})
-        inner-payload {:ed25519-seed (str/lower-case (fressian/bytes->hex seed))
-                       :pubkey norm-pub
-                       :created-ms (long (or created-ms 0))}
+        inner-payload (cond-> {:ed25519-seed (str/lower-case (fressian/bytes->hex seed))
+                               :pubkey norm-pub
+                               :created-ms (long (or created-ms 0))}
+                        (map? metadata) (assoc :metadata metadata))
         pt-bytes (fressian/encode-canonical inner-payload)
         boxed (crypto/secretbox kek nonce pt-bytes)]
     {:schema keystore-schema-version
@@ -200,7 +201,7 @@
 (defn open-keystore-edn
   "Purely decrypts and verifies a `bitecho.keystore/v1` EDN map with `passphrase`.
    Verifies decrypted seed reproduces `:pubkey`.
-   Returns `{:ok? true :pubkey <hex> :seed-bytes <bytes> :security-tier :encrypted-keystore-0600}`
+   Returns `{:ok? true :pubkey <hex> :seed-bytes <bytes> :metadata <map-or-nil> :security-tier :encrypted-keystore-0600}`
    or `{:ok? false :error <:invalid-keystore-format | :invalid-passphrase-or-corrupt | :pubkey-mismatch>}`."
   [keystore-map passphrase]
   (if-not (and (map? keystore-map)
@@ -230,11 +231,12 @@
               (let [derived-pub (str/lower-case (fressian/bytes->hex (seed->raw-pubkey-bytes seed)))]
                 (if (not= derived-pub expected-pub)
                   {:ok? false :error :pubkey-mismatch}
-                  {:ok? true
-                   :pubkey derived-pub
-                   :seed-bytes seed
-                   :created-ms (:created-ms decoded)
-                   :security-tier :encrypted-keystore-0600}))))))
+                  (cond-> {:ok? true
+                           :pubkey derived-pub
+                           :seed-bytes seed
+                           :created-ms (:created-ms decoded)
+                           :security-tier :encrypted-keystore-0600}
+                    (map? (:metadata decoded)) (assoc :metadata (:metadata decoded)))))))))
       (catch #?(:clj Exception :cljs :default) _
         {:ok? false :error :invalid-passphrase-or-corrupt}))))
 
