@@ -5,6 +5,7 @@
   (:require [bitecho.backup.core :as backup]
             [bitecho.basalt.core :as basalt]
             [bitecho.config.flags :as flags]
+            [bitecho.core.mesh :as core-mesh]
             [bitecho.core.protocol.relay :as relay]
             [bitecho.crypto :as crypto]
             [bitecho.crypto.key-provider :as kp]
@@ -38,9 +39,75 @@
            [java.nio.file FileAlreadyExistsException Files StandardCopyOption StandardOpenOption]
            [java.nio.file.attribute PosixFilePermissions]
            [java.time Duration]
-           [java.util.concurrent Executors ThreadFactory]))
+           [java.util.concurrent Executors LinkedBlockingQueue ThreadFactory TimeUnit]))
 
 (declare dial-p2p-peer! send-routed-envelopes!)
+
+(defonce ^:private jvm-mesh-chunk-handlers-atom (atom {}))
+
+(defn- try-dispatch-jvm-mesh-chunk-res!
+  "Intercepts inbound `:artifact-blob-chunk-res` frames strictly by `:req-id` (BIP-022 Stage D.1)."
+  [payload]
+  (when (seq @jvm-mesh-chunk-handlers-atom)
+    (let [decoded (try (light-core/thaw-payload payload) (catch Exception _ nil))]
+      (when (and (map? decoded) (= :artifact-blob-chunk-res (:type decoded)))
+        (when-let [req-id (:req-id decoded)]
+          (when-let [^LinkedBlockingQueue q (get @jvm-mesh-chunk-handlers-atom req-id)]
+            (.offer q decoded)
+            true))))))
+
+(defn- fetch-mesh-chunks-jvm!
+  "Executes the bounded synchronous BIP-017a mesh chunk pull over the active JVM DataChannel."
+  [conn-atom identity cid eff]
+  (let [send-fn (when conn-atom (:send-fn @conn-atom))]
+    (if-not (fn? send-fn)
+      {:ok? false :reason :mesh-disconnected}
+      (let [gen (long (or (:generation eff) 1))
+            chunk-bytes (long (or (:chunk-size-bytes eff) deploy/default-mesh-chunk-size-bytes))
+            probe-ms (long (or (:probe-timeout-ms eff) deploy/default-mesh-probe-timeout-ms))
+            chunk-ms (long (or (:chunk-timeout-ms eff) deploy/default-mesh-chunk-timeout-ms))
+            total-ms (long (or (:total-timeout-ms eff) (deploy/compute-mesh-fetch-ceiling-ms 0)))
+            req-id (str "jvm-mesh-upd-" gen "-" (subs (str cid) 0 (min 8 (count (str cid)))) "-" (System/currentTimeMillis))
+            q (LinkedBlockingQueue.)
+            deadline-ms (+ (System/currentTimeMillis) total-ms)
+            pk-hex (or (:pubkey-hex identity) (:pubkey identity))
+            priv-bs (:privkey-bytes identity)]
+        (swap! jvm-mesh-chunk-handlers-atom assoc req-id q)
+        (try
+          (loop [asm (deploy/init-mesh-chunk-assembly cid chunk-bytes)
+                 offset 0
+                 length chunk-bytes
+                 wait-ms probe-ms
+                 retried? false]
+            (let [remaining (- deadline-ms (System/currentTimeMillis))]
+              (if (<= remaining 0)
+                {:ok? false :reason :mesh-total-timeout}
+                (let [req (deploy/build-mesh-chunk-request cid offset length req-id)
+                      wire (core-mesh/wrap-agent-event req pk-hex priv-bs)
+                      sent-ok? (try (send-fn wire) true (catch Exception _ false))]
+                  (if-not sent-ok?
+                    {:ok? false :reason :mesh-send-failed}
+                    (let [resp (.poll q (min wait-ms remaining) TimeUnit/MILLISECONDS)]
+                      (if (nil? resp)
+                        (if-not retried?
+                          (recur asm offset length chunk-ms true)
+                          {:ok? false :reason :mesh-chunk-timeout})
+                        (let [step (deploy/reduce-mesh-chunk-response asm resp)]
+                          (cond
+                            (not (:ok? step))
+                            {:ok? false :reason (or (:error step) :mesh-chunk-error)}
+
+                            (:done? step)
+                            {:ok? true :bytes (:bytes step)}
+
+                            :else
+                            (recur (:state step)
+                                   (long (get-in step [:next-req :offset]))
+                                   (long (get-in step [:next-req :length]))
+                                   chunk-ms
+                                   false))))))))))
+          (finally
+            (swap! jvm-mesh-chunk-handlers-atom dissoc req-id)))))))
 
 ;; -----------------------------------------------------------------------------
 ;; Shared Process-Wide HTTP Client & UDP Socket Buffer Helpers (P-SOAK-1, P-SOAK-4)
@@ -324,6 +391,7 @@
          pin-version (extract-flag-value clean-args "--pin-version" nil)
          auto-update-pointer (extract-flag-value clean-args "--auto-update-pointer" nil)
          auto-update-interval-ms (extract-long-flag clean-args "--auto-update-interval-ms" nil)
+         auto-update-force-http? (boolean (some #{"--auto-update-force-http"} clean-args))
          trusted-deploy-auths-present? (boolean (some #(or (= % "--trusted-deploy-authorities")
                                                            (str/starts-with? (str %) "--trusted-deploy-authorities="))
                                                       clean-args))
@@ -412,6 +480,7 @@
        pin-version (assoc :pin-version pin-version)
        auto-update-pointer (assoc :auto-update-pointer auto-update-pointer)
        auto-update-interval-ms (assoc :auto-update-interval-ms auto-update-interval-ms)
+       auto-update-force-http? (assoc :auto-update-force-http? true)
        trusted-deploy-auths-present? (assoc :trusted-deploy-authorities trusted-deploy-authorities)))))
 
 ;; -----------------------------------------------------------------------------
@@ -1897,34 +1966,35 @@
                        (when-let [cid (:channel-id evt)]
                          (reset! channel-id cid))
                        (when-let [payload (:payload evt)]
-                         (when-let [on-msg (:on-message ctx)]
-                           (try (on-msg payload) (catch Exception _ nil)))
-                         (when state-atom
-                           (let [lock-obj (or (:cmd-lock ctx) state-atom)
-                                 res (locking lock-obj
-                                       (let [st @state-atom
-                                             r (light-core/handle-wire-payload st payload (:privkey-bytes identity))]
-                                         (reset! state-atom (:state r))
-                                         (when (and state-file (not= st (:state r)))
-                                           (try
-                                             (save-light-state-async! state-file (:state r))
-                                             (catch Exception e
-                                               (when conn-atom
-                                                 (apply-conn-event! conn-atom
-                                                                    {:type :persist-failed
-                                                                     :error (or (.getMessage e) "persist-failed")}
-                                                                    cb-opts)
-                                                 (sync-conn-diagnostics! state-atom conn-atom)))))
-                                         r))]
-                             (when (and event-out (seq (:stdout-events res)))
-                               (doseq [ev (:stdout-events res)]
-                                 (event-out ev)))
-                             (when-let [dial-info (:p2p-dial res)]
-                               (dial-p2p-peer! state-atom (:p2p-peers-atom ctx) (:ingress-peers-atom ctx) (:mdns-atom ctx) (:privkey-bytes identity) event-out dial-info))
-                             (when (seq (:net-envelopes res))
-                               (if (some #(or (:p2p-direct? %) (:p2p-broadcast? %)) (:net-envelopes res))
-                                 (send-routed-envelopes! (:net-envelopes res) send-fn-atom (:p2p-peers-atom ctx) (:ingress-peers-atom ctx) state-atom (:privkey-bytes identity))
-                                 (dispatch-auto-reply! (:net-envelopes res) send-fn-atom state-atom conn-atom event-out reconnect-fn cb-opts)))))))))
+                         (when-not (try-dispatch-jvm-mesh-chunk-res! payload)
+                           (when-let [on-msg (:on-message ctx)]
+                             (try (on-msg payload) (catch Exception _ nil)))
+                           (when state-atom
+                             (let [lock-obj (or (:cmd-lock ctx) state-atom)
+                                   res (locking lock-obj
+                                         (let [st @state-atom
+                                               r (light-core/handle-wire-payload st payload (:privkey-bytes identity))]
+                                           (reset! state-atom (:state r))
+                                           (when (and state-file (not= st (:state r)))
+                                             (try
+                                               (save-light-state-async! state-file (:state r))
+                                               (catch Exception e
+                                                 (when conn-atom
+                                                   (apply-conn-event! conn-atom
+                                                                      {:type :persist-failed
+                                                                       :error (or (.getMessage e) "persist-failed")}
+                                                                      cb-opts)
+                                                   (sync-conn-diagnostics! state-atom conn-atom)))))
+                                           r))]
+                               (when (and event-out (seq (:stdout-events res)))
+                                 (doseq [ev (:stdout-events res)]
+                                   (event-out ev)))
+                               (when-let [dial-info (:p2p-dial res)]
+                                 (dial-p2p-peer! state-atom (:p2p-peers-atom ctx) (:ingress-peers-atom ctx) (:mdns-atom ctx) (:privkey-bytes identity) event-out dial-info))
+                               (when (seq (:net-envelopes res))
+                                 (if (some #(or (:p2p-direct? %) (:p2p-broadcast? %)) (:net-envelopes res))
+                                   (send-routed-envelopes! (:net-envelopes res) send-fn-atom (:p2p-peers-atom ctx) (:ingress-peers-atom ctx) state-atom (:privkey-bytes identity))
+                                   (dispatch-auto-reply! (:net-envelopes res) send-fn-atom state-atom conn-atom event-out reconnect-fn cb-opts))))))))))
      :on-error (fn [evt]
                  (when (str/includes? (str (:message evt)) "Fingerprint")
                    (deliver connected? :bad-fingerprint)))
@@ -4224,6 +4294,9 @@
                                       :pointer-url (:auto-update-pointer opts)
                                       :poll-interval-ms (:auto-update-interval-ms opts)
                                       :pinned-version (:pin-version opts)
+                                      :force-http? (boolean (:auto-update-force-http? opts))
+                                      :mesh-connected-fn (fn [] (fn? (:send-fn @conn-atom)))
+                                      :mesh-chunk-fetch-fn (fn [cid eff] (fetch-mesh-chunks-jvm! conn-atom identity cid eff))
                                       :on-event (fn [ev] (event-out ev))
                                       :stop-node-fn! (fn [] (try (save-light-state! state-file @state-atom) (catch Exception _ nil)))}
                                (contains? opts :trusted-deploy-authorities)

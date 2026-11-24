@@ -635,4 +635,12 @@
           (is (= "state-backup-v1" (:slot p-ks)))
           (doseq [v ["backup-put" "backup-restore" "backup-status" "identity-migrate"]]
             (is (contains? cli/all-recognized-cli-verbs-set v))
-            (is (some? (get (cli/desugar-cli-cmd-map {"cmd" v}) "canonical_cmd")))))))))
+            (is (some? (get (cli/desugar-cli-cmd-map {"cmd" v}) "canonical_cmd"))))))
+
+      (testing "BIP-022 Stage D.1 --auto-update-force-http flag inventory & parsing"
+        (let [flags (set cli/known-command-flags)
+              p-force (shell/parse-light-node-args ["serve" "--auto-update-pointer" "https://bitecho.org/pointer.edn" "--auto-update-force-http"])
+              p-default (shell/parse-light-node-args ["serve" "--auto-update-pointer" "https://bitecho.org/pointer.edn"])]
+          (is (contains? flags "--auto-update-force-http"))
+          (is (true? (:auto-update-force-http? p-force)))
+          (is (not (:auto-update-force-http? p-default))))))))

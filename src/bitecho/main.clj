@@ -207,7 +207,14 @@
                        :pointer-url (:auto-update-pointer cfg)
                        :poll-interval-ms (:auto-update-interval-ms cfg)
                        :pinned-version (:pin-version cfg)
+                       :force-http? (boolean (:auto-update-force-http? cfg))
                        :trusted-deploy-authorities (:trusted-deploy-authorities cfg)
+                       :mesh-connected-fn (fn [] (boolean (or peer-mesh val-node)))
+                       :mesh-chunk-fetch-fn (fn [cid _eff]
+                                              (let [r (infra/resolve-cid-blob! runtime cid)]
+                                                (if (and (:ok? r) (bytes? (get-in r [:blob :blob/bytes])))
+                                                  {:ok? true :bytes (get-in r [:blob :blob/bytes])}
+                                                  {:ok? false :reason :not-found})))
                        :stop-node-fn! (fn []
                                         (when val-node (mesh/stop-mesh-node! val-node))
                                         (infra/stop-subnet-runtime! runtime))}))
@@ -239,7 +246,15 @@
                                     :pointer-url (:auto-update-pointer cfg)
                                     :poll-interval-ms (:auto-update-interval-ms cfg)
                                     :pinned-version (:pin-version cfg)
+                                    :force-http? (boolean (:auto-update-force-http? cfg))
                                     :trusted-deploy-authorities (:trusted-deploy-authorities cfg)
+                                    :mesh-connected-fn (fn [] (boolean (:state-atom node)))
+                                    :mesh-chunk-fetch-fn (fn [cid _eff]
+                                                           (let [bs (when-let [sa (:state-atom node)]
+                                                                      (get-in @sa [:data :blob-store :entries cid :bytes]))]
+                                                             (if (bytes? bs)
+                                                               {:ok? true :bytes bs}
+                                                               {:ok? false :reason :not-found})))
                                     :stop-node-fn! #(mesh/stop-mesh-node! node)})]
                 (.addShutdownHook (Runtime/getRuntime) (Thread. ^Runnable stop-upd))))
           node-id (:node-id node)

@@ -1572,16 +1572,79 @@
           (normalize-hex (:code-target-cid pointer-map))
           (normalize-hex (:target-cid pointer-map))))))
 
+(def default-update-relay-origins
+  "Default ordered multi-relay origins for BIP-022 Stage D.1 HTTP fallback failover."
+  ["https://bitecho.org"
+   "https://ns1.bitecho.org"
+   "https://ns2.bitecho.org"
+   "https://ns3.bitecho.org"])
+
+(defn normalize-etag-cid
+  "Normalizes an HTTP ETag (quoted `\"<cid>\"`, weak `W/\"<cid>\"`, or unquoted `<cid>`)
+   to a lowercase trimmed string so cross-relay `Range` failover (`ns1 -> ns2`) never
+   false-rejects identical content-addressed chunks."
+  [etag]
+  (when (and (string? etag) (not (str/blank? etag)))
+    (let [trimmed (str/trim etag)
+          no-weak (if (or (str/starts-with? trimmed "W/")
+                          (str/starts-with? trimmed "w/"))
+                    (str/trim (subs trimmed 2))
+                    trimmed)
+          unquoted (if (and (>= (count no-weak) 2)
+                            (= \" (first no-weak))
+                            (= \" (last no-weak)))
+                     (subs no-weak 1 (dec (count no-weak)))
+                     no-weak)
+          clean (str/lower-case (str/trim unquoted))]
+      (when-not (str/blank? clean)
+        clean))))
+
+(defn parse-content-range
+  "Parses an HTTP `Content-Range: bytes S-E/T` header into `{:start S :end E :total-bytes T}`.
+   Returns nil when malformed or out of bounds."
+  [header-val]
+  (when (and (string? header-val) (not (str/blank? header-val)))
+    (when-let [[_ s-str e-str t-str] (re-matches #"(?i)\s*bytes\s+(\d+)-(\d+)/(\d+)\s*" (str/trim header-val))]
+      (let [s #?(:clj (Long/parseLong s-str) :cljs (js/parseInt s-str 10))
+            e #?(:clj (Long/parseLong e-str) :cljs (js/parseInt e-str 10))
+            t #?(:clj (Long/parseLong t-str) :cljs (js/parseInt t-str 10))]
+        (when (and (>= s 0) (>= e s) (> t 0) (< e t))
+          {:start s :end e :total-bytes t})))))
+
+(defn- extract-url-origin
+  [raw-url]
+  (let [s (str/trim (str (or raw-url "")))]
+    (when-not (str/blank? s)
+      (when-let [[_ origin] (re-find #"^(https?://[^/]+)" s)]
+        (str/replace origin #"/+$" "")))))
+
 (defn build-blob-fetch-url
   "Derives the HTTPS `/artifact/v1/blob/<cid>` fetch URL from a pointer URL and verified CID."
   [pointer-url cid]
   (let [norm-cid (normalize-hex cid)
         raw-url (str/trim (str (or pointer-url "")))]
     (when (and norm-cid (not (str/blank? raw-url)))
-      (let [origin (if-let [[_ scheme host] (re-find #"^(https?://[^/]+)" raw-url)]
-                     (str scheme host)
-                     "https://bitecho.org")]
+      (let [origin (or (extract-url-origin raw-url) "https://bitecho.org")]
         (str origin "/artifact/v1/blob/" norm-cid)))))
+
+(defn build-blob-fetch-urls
+  "Derives a deduplicated ordered vector of `/artifact/v1/blob/<cid>` URLs starting
+   with the `pointer-url` origin followed by `relay-origins` (`ns1..ns3`)."
+  [pointer-url relay-origins cid]
+  (let [norm-cid (normalize-hex cid)]
+    (if-not norm-cid
+      []
+      (let [ptr-origin (extract-url-origin pointer-url)
+            relays (if (some? relay-origins) relay-origins default-update-relay-origins)
+            raw-origins (cond-> []
+                          ptr-origin (conj ptr-origin)
+                          true (into (keep extract-url-origin relays)))
+            deduped (reduce (fn [acc o]
+                              (if (some #(= % o) acc) acc (conj acc o)))
+                            []
+                            raw-origins)
+            final-origins (if (seq deduped) deduped ["https://bitecho.org"])]
+        (mapv #(str % "/artifact/v1/blob/" norm-cid) final-origins)))))
 
 (def default-mesh-chunk-size-bytes
   "BIP-017a / BIP-021 §2.6.2 chunk size (192 KiB), strictly <= WebRTC SCTP 256 KiB cap."
@@ -1758,11 +1821,64 @@
                                                    (str (subs expected-cid 0 (min 8 (count expected-cid))) "-" next-idx))
                :state asm1})))))))
 
+(defn- init-http-fallback-state
+  [{:keys [max-retries-per-relay backoff-base-ms backoff-max-ms range-chunk-bytes urls]}]
+  {:relay-index 0
+   :attempt 0
+   :max-retries-per-relay (max 1 (long (or max-retries-per-relay 3)))
+   :backoff-base-ms (max 100 (long (or backoff-base-ms 1000)))
+   :backoff-max-ms (max 1000 (long (or backoff-max-ms 8000)))
+   :range-mode? false
+   :range-chunk-bytes (max 1024 (min 524288 (long (or range-chunk-bytes 262144))))
+   :range-offset 0
+   :total-bytes nil
+   :received-chunks []
+   :etag nil
+   :urls (vec (or urls []))})
+
+(defn- reset-http-fallback
+  [state urls]
+  (let [fb (:http-fallback state)]
+    (init-http-fallback-state {:max-retries-per-relay (:max-retries-per-relay fb 3)
+                               :backoff-base-ms (:backoff-base-ms fb 1000)
+                               :backoff-max-ms (:backoff-max-ms fb 8000)
+                               :range-chunk-bytes (:range-chunk-bytes fb 262144)
+                               :urls urls})))
+
+(defn- compute-http-backoff-ms
+  [attempt base-ms max-ms]
+  (let [exp (max 0 (min 10 (dec (long (max 1 attempt)))))
+        factor (bit-shift-left 1 exp)]
+    (long (min (long max-ms) (* (long base-ms) factor)))))
+
+(defn- next-range-window
+  [fb]
+  (let [off (long (:range-offset fb 0))
+        chunk-sz (long (:range-chunk-bytes fb 262144))
+        tot (:total-bytes fb)
+        raw-end (+ off chunk-sz -1)
+        end (if (and (integer? tot) (pos? (long tot)))
+              (min (dec (long tot)) raw-end)
+              raw-end)]
+    [off (max off end)]))
+
+(defn- record-light-diag
+  "Records a counted Rule 5 diagnostic in both `[:diagnostics :causes reason]` (canonical),
+   `[:diagnostics reason]` (backward-compatible flat key), `[:diagnostics :dropped]`, and `[:dropped]`."
+  [st reason]
+  (-> st
+      (update :dropped (fnil inc 0))
+      (update-in [:diagnostics :dropped] (fnil inc 0))
+      (update-in [:diagnostics :causes reason] (fnil inc 0))
+      (update-in [:diagnostics reason] (fnil inc 0))))
+
 (defn init-light-updater-state
-  "Initializes single-authority generation-tagged P-UPD-1 pointer auto-update state (`Rule 4`)
-   shared across Node.js, JVM, and Browser light & full nodes."
+  "Initializes single-authority generation-tagged P-UPD-1 / BIP-022 Stage D.1 pointer auto-update
+   state (`Rule 4`) shared across Node.js, JVM, and Browser light & full nodes."
   [{:keys [node-id artifact-role current-version current-cid trusted-deploy-authorities
-           pinned-version proxy-url poll-interval-ms last-applied-seq active-config-seq quarantined-cids]}]
+           pinned-version proxy-url pointer-url relay-origins force-http?
+           max-retries-per-relay backoff-base-ms backoff-max-ms range-chunk-bytes
+           poll-interval-ms last-applied-seq active-config-seq quarantined-cids]}]
   (let [init-seq (long (or last-applied-seq active-config-seq 0))]
     {:node-id (str (or node-id "light-node"))
      :artifact-role (keyword (or artifact-role :light-node))
@@ -1776,6 +1892,17 @@
                        (str/trim pinned-version))
      :proxy-url (when (and (string? proxy-url) (not (str/blank? proxy-url)))
                   (str/trim proxy-url))
+     :pointer-url (when (and (string? pointer-url) (not (str/blank? pointer-url)))
+                    (str/trim pointer-url))
+     :relay-origins (if (some? relay-origins)
+                      (vec relay-origins)
+                      default-update-relay-origins)
+     :force-http? (boolean force-http?)
+     :http-fallback (init-http-fallback-state {:max-retries-per-relay max-retries-per-relay
+                                               :backoff-base-ms backoff-base-ms
+                                               :backoff-max-ms backoff-max-ms
+                                               :range-chunk-bytes range-chunk-bytes
+                                               :urls []})
      :poll-interval-ms (max 5000 (long (or poll-interval-ms 60000)))
      :active-config-seq init-seq
      :last-applied-seq init-seq
@@ -1785,7 +1912,7 @@
      :next-obs-seq 1
      :dropped 0
      :last-error nil
-     :diagnostics {}}))
+     :diagnostics {:causes {} :dropped 0}}))
 
 (defn- light-update-obs-record
   [st epoch transition data]
@@ -1803,14 +1930,104 @@
                :delta-summary {:transition transition}
                :data (assoc (or data {}) :transition transition)}}]))
 
+(defn- wrong-phase-result
+  [state ev-type cur-gen]
+  (let [diag {:effect :diagnose
+              :type :diagnose
+              :reason :light-update-wrong-phase
+              :event-type ev-type
+              :phase (:phase state)
+              :generation cur-gen}]
+    [(record-light-diag state :light-update-wrong-phase) [diag]]))
+
+(defn- stage-verified-blob
+  [state ep cur-gen pending actual-cid full-bytes]
+  (let [next-gen (inc cur-gen)
+        st1 (assoc state
+                   :phase :health-checking
+                   :generation next-gen
+                   :pending-update (assoc pending :verified-cid actual-cid))
+        [st2 obs-eff] (light-update-obs-record st1 ep :staged {:target-version (:target-version pending)
+                                                               :cid actual-cid})]
+    [st2 [(cond-> {:effect :stage-light-bundle
+                   :cid actual-cid
+                   :target-version (:target-version pending)}
+            full-bytes (assoc :bytes full-bytes))
+          {:effect :atomic-swap-and-restart-light-node
+           :cid actual-cid
+           :generation next-gen}
+          obs-eff]]))
+
+(defn- failover-or-exhaust-http
+  "Fails over to the next relay origin in `urls` (preserving `range-offset`/`received-chunks`
+   unless `reset-range?` is true), or cleanly returns to `:watching` with
+   `:light-update-blob-fetch-failed` when all relays are exhausted."
+  [state ep cur-gen cause extra-diags {:keys [reset-range?]}]
+  (let [pending (:pending-update state)
+        target-cid (:target-cid pending)
+        target-ver (:target-version pending)
+        fb (:http-fallback state)
+        urls (vec (or (seq (:urls fb))
+                      (build-blob-fetch-urls (:pointer-url state) (:relay-origins state) target-cid)))
+        relay-idx (long (:relay-index fb 0))
+        cur-url (nth urls relay-idx (first urls))
+        next-idx (inc relay-idx)]
+    (if (< next-idx (count urls))
+      (let [next-url (nth urls next-idx)
+            range-mode? (= :fetching-https-range (:phase state))
+            fb' (cond-> (assoc fb
+                               :relay-index next-idx
+                               :attempt 1
+                               :urls urls)
+                  reset-range? (assoc :range-offset 0
+                                      :total-bytes nil
+                                      :received-chunks []
+                                      :etag nil))
+            diag-fo {:effect :diagnose
+                     :type :diagnose
+                     :reason :light-update-relay-failover
+                     :from-url cur-url
+                     :to-url next-url
+                     :cause cause
+                     :generation cur-gen}
+            st1 (-> state
+                    (assoc :http-fallback fb'
+                           :last-error cause)
+                    (record-light-diag :light-update-relay-failover))
+            fetch-eff {:effect :fetch-bundle-blob
+                       :cid target-cid
+                       :url next-url
+                       :attempt 1
+                       :range (when range-mode? (next-range-window fb'))
+                       :target-version target-ver
+                       :proxy-url (:proxy-url state)
+                       :generation cur-gen}]
+        [st1 (conj (vec extra-diags) diag-fo fetch-eff)])
+      (let [diag-fail {:effect :diagnose
+                       :type :diagnose
+                       :reason :light-update-blob-fetch-failed
+                       :cause :all-relays-exhausted
+                       :detail cause
+                       :generation (inc cur-gen)}
+            st1 (-> state
+                    (assoc :phase :watching
+                           :pending-update nil
+                           :http-fallback (reset-http-fallback state [])
+                           :last-error cause)
+                    (update :generation inc)
+                    (record-light-diag :light-update-blob-fetch-failed))
+            [st2 obs-eff] (light-update-obs-record st1 ep :refused {:reason :blob-fetch-failed :cause cause})]
+        [st2 (conj (vec extra-diags) diag-fail obs-eff)]))))
+
 (defn reduce-light-update-tick
-  "Pure P-UPD-1 / BIP-021 §2.6.2 light-node pointer auto-update state machine (`Rule 2`, `Rule 4`, `Rule 5`):
+  "Pure P-UPD-1 / BIP-021 §2.6.2 / BIP-022 Stage D.1 pointer auto-update state machine (`Rule 2`, `Rule 4`, `Rule 5`):
    `(reduce-light-update-tick state event) -> [new-state effects]`.
    - Enforces generation tagging (ignores stale callbacks with counted `:diagnose`).
-   - Guards `:poll-tick` and `:pointer-seen` with `(= :watching (:phase state))` (zero generation livelock).
-   - Enforces `--pin-version` opt-out (`pinned` node stays put and emits telemetry) and failed-CID quarantine.
+   - Enforces strict phase guards on every phase-specific event (Rule 4 & Rule 5).
+   - Enforces `--pin-version` opt-out (`pinned` node stays put) and failed-CID quarantine.
    - Verifies pointer authority signature (fail-closed on empty `:trusted-deploy-authorities`), version monotonicity, and CID == SHA-256.
-   - Supports two-phase waterfall: `:watching -> :fetching-mesh -> :fetching-https -> :health-checking -> :watching`.
+   - Supports unified waterfall: `:watching -> :fetching-mesh -> :fetching-https -> :fetching-https-range -> :health-checking -> :watching`,
+     with bounded exponential-backoff retry, multi-relay failover (`ns1..ns3`), HTTP `206 Range` chunked resume, and cross-relay ETag normalization.
    - Auto-rolls back to LKG bundle on health-check failure and quarantines the failed CID."
   [state event]
   (let [cur-gen (long (:generation state 1))
@@ -1822,9 +2039,7 @@
                   :reason :stale-generation-callback
                   :event-generation (long ev-gen)
                   :current-generation cur-gen}
-            st' (-> state
-                    (update :dropped (fnil inc 0))
-                    (update-in [:diagnostics :stale-generation-callback] (fnil inc 0)))]
+            st' (record-light-diag state :stale-generation-callback)]
         [st' [diag]])
       (case (:type event)
         :poll-tick
@@ -1834,7 +2049,7 @@
                       :reason :update-poll-suppressed
                       :phase (:phase state)
                       :generation cur-gen}
-                st' (update-in state [:diagnostics :update-poll-suppressed] (fnil inc 0))]
+                st' (record-light-diag state :update-poll-suppressed)]
             [st' [diag]])
           (let [eff {:effect :fetch-pointer
                      :proxy-url (:proxy-url state)
@@ -1848,7 +2063,7 @@
                       :reason :update-poll-suppressed
                       :phase (:phase state)
                       :generation cur-gen}
-                st' (update-in state [:diagnostics :update-poll-suppressed] (fnil inc 0))]
+                st' (record-light-diag state :update-poll-suppressed)]
             [st' [diag]])
           (let [ptr (:pointer event)
                 target-ver (str (or (:target-version ptr) (:version ptr) ""))
@@ -1868,7 +2083,7 @@
                           :reason :light-update-quarantined-cid
                           :cid target-cid
                           :target-version target-ver}
-                    st1 (update-in state [:diagnostics :light-update-quarantined-cid] (fnil inc 0))
+                    st1 (record-light-diag state :light-update-quarantined-cid)
                     [st2 obs-eff] (light-update-obs-record st1 ep :refused {:reason :quarantined-cid
                                                                             :cid target-cid})]
                 [st2 [diag obs-eff]])
@@ -1882,7 +2097,7 @@
                               :cause (:error v)}
                         st1 (-> state
                                 (assoc :last-error (:error v))
-                                (update-in [:diagnostics :light-update-pointer-rejected] (fnil inc 0)))
+                                (record-light-diag :light-update-pointer-rejected))
                         [st2 obs-eff] (light-update-obs-record st1 ep :refused {:cause (:error v)})]
                     [st2 [diag obs-eff]])
                   (let [ptr-seq-raw (:seq ptr)
@@ -1890,14 +2105,20 @@
                         last-seq (long (or (:last-applied-seq state) (:active-config-seq state) 0))
                         cur-cid (normalize-hex (:current-cid state))
                         valid-cid? (valid-cid-64? target-cid)
-                        mesh-connected? (true? (:mesh-connected? event))
+                        force-http? (or (true? (:force-http? state)) (true? (:force-http? event)))
+                        mesh-connected? (and (not force-http?) (true? (:mesh-connected? event)))
                         size-bytes (long (or (:artifact-size-bytes ptr) (:size-bytes event) 0))
                         next-phase (if mesh-connected? :fetching-mesh :fetching-https)
                         trigger-fetch (fn [effective-seq]
                                         (let [next-gen (inc cur-gen)
+                                              ptr-url (or (:pointer-url event) (:pointer-url state))
+                                              urls (build-blob-fetch-urls ptr-url (:relay-origins state) target-cid)
+                                              fb0 (cond-> (reset-http-fallback state urls)
+                                                    (not mesh-connected?) (assoc :attempt 1))
                                               st1 (assoc state
                                                          :phase next-phase
                                                          :generation next-gen
+                                                         :http-fallback fb0
                                                          :pending-update (cond-> {:pointer ptr
                                                                                   :target-version target-ver
                                                                                   :target-cid target-cid
@@ -1922,6 +2143,9 @@
                                                             (some? effective-seq) (assoc :pointer-seq effective-seq))
                                                           (cond-> {:effect :fetch-bundle-blob
                                                                    :cid target-cid
+                                                                   :url (first urls)
+                                                                   :attempt 1
+                                                                   :range nil
                                                                    :target-version target-ver
                                                                    :proxy-url (:proxy-url state)
                                                                    :generation next-gen}
@@ -1938,7 +2162,7 @@
                                       :current-seq last-seq
                                       :pointer-seq ptr-seq
                                       :target-version target-ver}
-                                st1 (update-in state [:diagnostics :light-update-non-monotonic-seq] (fnil inc 0))
+                                st1 (record-light-diag state :light-update-non-monotonic-seq)
                                 [st2 obs-eff] (light-update-obs-record st1 ep :refused {:reason :non-monotonic-seq
                                                                                         :current-seq last-seq
                                                                                         :pointer-seq ptr-seq
@@ -1957,7 +2181,7 @@
                                         :pointer-seq ptr-seq
                                         :target-cid target-cid
                                         :current-cid cur-cid}
-                                  st1 (update-in state [:diagnostics :light-update-non-monotonic-seq] (fnil inc 0))
+                                  st1 (record-light-diag state :light-update-non-monotonic-seq)
                                   [st2 obs-eff] (light-update-obs-record st1 ep :refused {:reason :non-monotonic-seq
                                                                                           :current-seq last-seq
                                                                                           :pointer-seq ptr-seq})]
@@ -1970,7 +2194,7 @@
                                       :cause :invalid-target-cid}
                                 st1 (-> state
                                         (assoc :last-error :invalid-target-cid)
-                                        (update-in [:diagnostics :light-update-pointer-rejected] (fnil inc 0)))
+                                        (record-light-diag :light-update-pointer-rejected))
                                 [st2 obs-eff] (light-update-obs-record st1 ep :refused {:cause :invalid-target-cid})]
                             [st2 [diag obs-eff]])
 
@@ -1998,7 +2222,7 @@
                                       :reason :light-update-non-monotonic-version
                                       :current-version (:current-version state)
                                       :target-version target-ver}
-                                st1 (update-in state [:diagnostics :light-update-non-monotonic-version] (fnil inc 0))
+                                st1 (record-light-diag state :light-update-non-monotonic-version)
                                 [st2 obs-eff] (light-update-obs-record st1 ep :refused {:reason :non-monotonic-version
                                                                                         :target-version target-ver})]
                             [st2 [diag obs-eff]])
@@ -2010,7 +2234,7 @@
                                       :cause :invalid-target-cid}
                                 st1 (-> state
                                         (assoc :last-error :invalid-target-cid)
-                                        (update-in [:diagnostics :light-update-pointer-rejected] (fnil inc 0)))
+                                        (record-light-diag :light-update-pointer-rejected))
                                 [st2 obs-eff] (light-update-obs-record st1 ep :refused {:cause :invalid-target-cid})]
                             [st2 [diag obs-eff]])
 
@@ -2018,138 +2242,362 @@
                           (trigger-fetch nil))))))))))
 
         :mesh-fetch-failed
-        (let [pending (:pending-update state)
-              target-cid (:target-cid pending)
-              target-ver (:target-version pending)
-              cause (or (:reason event) :mesh-fetch-failed)
-              next-gen (inc cur-gen)
-              diag {:effect :diagnose
-                    :type :diagnose
-                    :reason :auto-update-mesh-fallback
-                    :cause cause
-                    :cid target-cid
-                    :generation next-gen}
-              st1 (-> state
-                      (assoc :phase :fetching-https
-                             :generation next-gen
-                             :last-error cause)
-                      (update-in [:diagnostics :auto-update-mesh-fallback] (fnil inc 0)))
-              [st2 obs-eff] (light-update-obs-record st1 ep :mesh-fallback {:cause cause :cid target-cid})]
-          [st2 [diag
-                {:effect :fetch-bundle-blob
-                 :cid target-cid
-                 :target-version target-ver
-                 :proxy-url (:proxy-url state)
-                 :generation next-gen}
-                obs-eff]])
+        (if (not= :fetching-mesh (:phase state))
+          (wrong-phase-result state :mesh-fetch-failed cur-gen)
+          (let [pending (:pending-update state)
+                target-cid (:target-cid pending)
+                target-ver (:target-version pending)
+                cause (or (:reason event) :mesh-fetch-failed)
+                next-gen (inc cur-gen)
+                urls (build-blob-fetch-urls (:pointer-url state) (:relay-origins state) target-cid)
+                fb0 (assoc (reset-http-fallback state urls) :attempt 1)
+                diag {:effect :diagnose
+                      :type :diagnose
+                      :reason :auto-update-mesh-fallback
+                      :cause cause
+                      :cid target-cid
+                      :generation next-gen}
+                st1 (-> state
+                        (assoc :phase :fetching-https
+                               :generation next-gen
+                               :http-fallback fb0
+                               :last-error cause)
+                        (record-light-diag :auto-update-mesh-fallback))
+                [st2 obs-eff] (light-update-obs-record st1 ep :mesh-fallback {:cause cause :cid target-cid})]
+            [st2 [diag
+                  {:effect :fetch-bundle-blob
+                   :cid target-cid
+                   :url (first urls)
+                   :attempt 1
+                   :range nil
+                   :target-version target-ver
+                   :proxy-url (:proxy-url state)
+                   :generation next-gen}
+                  obs-eff]]))
 
         :blob-fetch-failed
-        (let [cause (or (:reason event) (:error event) :blob-fetch-failed)
-              diag {:effect :diagnose
-                    :type :diagnose
-                    :reason :light-update-blob-fetch-failed
-                    :cause cause}
-              st1 (-> state
-                      (assoc :phase :watching
-                             :pending-update nil
-                             :last-error cause)
-                      (update :generation inc)
-                      (update-in [:diagnostics :light-update-blob-fetch-failed] (fnil inc 0)))
-              [st2 obs-eff] (light-update-obs-record st1 ep :refused {:reason :blob-fetch-failed :cause cause})]
-          [st2 [diag obs-eff]])
+        (if-not (contains? #{:fetching-https :fetching-https-range} (:phase state))
+          (wrong-phase-result state :blob-fetch-failed cur-gen)
+          (let [pending (:pending-update state)
+                target-cid (:target-cid pending)
+                cause (or (:reason event) (:error event) :blob-fetch-failed)
+                status (:status event)
+                fb (:http-fallback state)
+                urls (vec (or (seq (:urls fb))
+                              (build-blob-fetch-urls (:pointer-url state) (:relay-origins state) target-cid)))
+                relay-idx (long (:relay-index fb 0))
+                cur-url (nth urls relay-idx (first urls))
+                attempt (long (:attempt fb 0))
+                max-retries (long (:max-retries-per-relay fb 3))
+                base-ms (long (:backoff-base-ms fb 1000))
+                max-ms (long (:backoff-max-ms fb 8000))
+                aborted-mid-body? (true? (:aborted-mid-body? event))
+                received-bytes (long (or (:received-bytes event) 0))
+                total-bytes (when (and (integer? (:total-bytes event))
+                                       (pos? (long (:total-bytes event)))
+                                       (<= (long (:total-bytes event)) max-mesh-bundle-bytes))
+                              (long (:total-bytes event)))
+                retryable? (if (boolean? (:retryable? event))
+                             (:retryable? event)
+                             (not (contains? #{400 401 403 404 405 410 416} status)))]
+            (cond
+              ;; Immediate switch to :fetching-https-range on mid-body abort during :fetching-https
+              (and (= :fetching-https (:phase state)) retryable? aborted-mid-body?)
+              (let [partial-bs (:partial-bytes event)
+                    valid-partial? (and partial-bs
+                                        (bytes? partial-bs)
+                                        (pos? received-bytes)
+                                        total-bytes
+                                        (< received-bytes total-bytes)
+                                        (= received-bytes #?(:clj (long (alength ^bytes partial-bs))
+                                                             :cljs (long (.-byteLength partial-bs)))))
+                    next-attempt (inc attempt)
+                    delay-ms (compute-http-backoff-ms next-attempt base-ms max-ms)
+                    fb' (assoc fb
+                               :urls urls
+                               :attempt next-attempt
+                               :range-mode? true
+                               :range-offset (if valid-partial? received-bytes 0)
+                               :total-bytes total-bytes
+                               :received-chunks (if valid-partial? [partial-bs] [])
+                               :etag (when valid-partial? (normalize-etag-cid (:etag event))))
+                    diag-range {:effect :diagnose
+                                :type :diagnose
+                                :reason :light-update-http-range-fallback
+                                :relay cur-url
+                                :received-bytes received-bytes
+                                :total-bytes total-bytes
+                                :cause cause
+                                :generation cur-gen}
+                    diag-retry {:effect :diagnose
+                                :type :diagnose
+                                :reason :light-update-http-retry
+                                :attempt next-attempt
+                                :relay cur-url
+                                :delay-ms delay-ms
+                                :cause cause
+                                :generation cur-gen}
+                    st1 (-> state
+                            (assoc :phase :fetching-https-range
+                                   :http-fallback fb'
+                                   :last-error cause)
+                            (record-light-diag :light-update-http-range-fallback)
+                            (record-light-diag :light-update-http-retry))]
+                [st1 [diag-range
+                      diag-retry
+                      {:effect :schedule-http-retry
+                       :delay-ms delay-ms
+                       :generation cur-gen}]])
+
+              ;; Bounded exponential-backoff retry on current relay
+              (and retryable? (< attempt max-retries))
+              (let [next-attempt (inc attempt)
+                    delay-ms (compute-http-backoff-ms next-attempt base-ms max-ms)
+                    fb' (assoc fb :urls urls :attempt next-attempt)
+                    diag-retry {:effect :diagnose
+                                :type :diagnose
+                                :reason :light-update-http-retry
+                                :attempt next-attempt
+                                :relay cur-url
+                                :delay-ms delay-ms
+                                :cause cause
+                                :generation cur-gen}
+                    st1 (-> state
+                            (assoc :http-fallback fb'
+                                   :last-error cause)
+                            (record-light-diag :light-update-http-retry))]
+                [st1 [diag-retry
+                      {:effect :schedule-http-retry
+                       :delay-ms delay-ms
+                       :generation cur-gen}]])
+
+              ;; Failover to next relay origin (or exhaust cleanly to :watching)
+              :else
+              (failover-or-exhaust-http state ep cur-gen cause [] {:reset-range? (= 416 status)}))))
+
+        :http-retry-timer-fired
+        (if-not (contains? #{:fetching-https :fetching-https-range} (:phase state))
+          (wrong-phase-result state :http-retry-timer-fired cur-gen)
+          (let [pending (:pending-update state)
+                target-cid (:target-cid pending)
+                target-ver (:target-version pending)
+                fb (:http-fallback state)
+                urls (vec (or (seq (:urls fb))
+                              (build-blob-fetch-urls (:pointer-url state) (:relay-origins state) target-cid)))
+                relay-idx (long (:relay-index fb 0))
+                cur-url (nth urls relay-idx (first urls))
+                range-mode? (= :fetching-https-range (:phase state))]
+            [state [{:effect :fetch-bundle-blob
+                     :cid target-cid
+                     :url cur-url
+                     :attempt (max 1 (long (:attempt fb 1)))
+                     :range (when range-mode? (next-range-window fb))
+                     :target-version target-ver
+                     :proxy-url (:proxy-url state)
+                     :generation cur-gen}]]))
+
+        :http-range-chunk-fetched
+        (if (not= :fetching-https-range (:phase state))
+          (wrong-phase-result state :http-range-chunk-fetched cur-gen)
+          (let [pending (:pending-update state)
+                target-cid (:target-cid pending)
+                target-ver (:target-version pending)
+                status (long (or (:status event) 0))
+                fb (:http-fallback state)
+                urls (vec (or (seq (:urls fb))
+                              (build-blob-fetch-urls (:pointer-url state) (:relay-origins state) target-cid)))
+                relay-idx (long (:relay-index fb 0))
+                cur-url (nth urls relay-idx (first urls))]
+            (cond
+              ;; Origin ignored Range header and sent full 200 OK body
+              (= 200 status)
+              (let [bs (:bytes event)
+                    actual-cid (when (and bs (bytes? bs)) (sha256-hex bs))]
+                (if (and target-cid actual-cid (= target-cid actual-cid))
+                  (stage-verified-blob state ep cur-gen pending actual-cid bs)
+                  (let [diag {:effect :diagnose
+                              :type :diagnose
+                              :reason :light-update-hash-mismatch
+                              :expected-cid target-cid
+                              :actual-cid actual-cid
+                              :generation cur-gen}
+                        st1 (record-light-diag state :light-update-hash-mismatch)]
+                    (failover-or-exhaust-http st1 ep cur-gen :light-update-hash-mismatch [diag] {:reset-range? true}))))
+
+              ;; 206 Partial Content chunk
+              (= 206 status)
+              (let [start (long (or (:start event) -1))
+                    end (long (or (:end event) -1))
+                    total (long (or (:total-bytes event) -1))
+                    chunk-bs (:bytes event)
+                    chunk-len (if (and chunk-bs (bytes? chunk-bs))
+                                #?(:clj (long (alength ^bytes chunk-bs))
+                                   :cljs (long (.-byteLength chunk-bs)))
+                                -1)
+                    expected-off (long (:range-offset fb 0))
+                    prev-total (:total-bytes fb)
+                    norm-etag (normalize-etag-cid (:etag event))
+                    prev-etag (normalize-etag-cid (:etag fb))
+                    etag-conflict? (or (and prev-etag norm-etag (not= prev-etag norm-etag))
+                                       (and norm-etag (valid-cid-64? norm-etag) (not= norm-etag target-cid)))
+                    bounds-invalid? (or (not= start expected-off)
+                                        (< end start)
+                                        (<= chunk-len 0)
+                                        (not= chunk-len (inc (- end start)))
+                                        (<= total 0)
+                                        (> total max-mesh-bundle-bytes)
+                                        (> (inc end) total)
+                                        (and (some? prev-total) (not= total (long prev-total))))]
+                (if (or bounds-invalid? etag-conflict?)
+                  (let [cause (if etag-conflict? :etag-mismatch :invalid-range-bounds)
+                        diag {:effect :diagnose
+                              :type :diagnose
+                              :reason :light-update-http-truncated
+                              :cause cause
+                              :relay cur-url
+                              :generation cur-gen}
+                        st1 (record-light-diag state :light-update-http-truncated)]
+                    (failover-or-exhaust-http st1 ep cur-gen cause [diag] {:reset-range? true}))
+                  (let [next-chunks (conj (vec (:received-chunks fb)) chunk-bs)
+                        next-off (inc end)
+                        fb' (assoc fb
+                                   :urls urls
+                                   :attempt 0
+                                   :range-offset next-off
+                                   :total-bytes total
+                                   :received-chunks next-chunks
+                                   :etag (or norm-etag prev-etag))]
+                    (if (= next-off total)
+                      (let [full-bytes (concat-byte-chunks next-chunks total)
+                            actual-cid (sha256-hex full-bytes)]
+                        (if (= actual-cid target-cid)
+                          (stage-verified-blob (assoc state :http-fallback fb') ep cur-gen pending actual-cid full-bytes)
+                          (let [diag {:effect :diagnose
+                                      :type :diagnose
+                                      :reason :light-update-hash-mismatch
+                                      :expected-cid target-cid
+                                      :actual-cid actual-cid
+                                      :generation cur-gen}
+                                st1 (-> state
+                                        (assoc :http-fallback fb' :last-error :light-update-hash-mismatch)
+                                        (record-light-diag :light-update-hash-mismatch))]
+                            (if (< (inc relay-idx) (count urls))
+                              (failover-or-exhaust-http st1 ep cur-gen :light-update-hash-mismatch [diag] {:reset-range? true})
+                              (let [st2 (-> st1
+                                            (assoc :phase :watching
+                                                   :pending-update nil
+                                                   :http-fallback (reset-http-fallback st1 []))
+                                            (update :generation inc))
+                                    [st3 obs-eff] (light-update-obs-record st2 ep :refused {:reason :light-update-hash-mismatch
+                                                                                            :expected-cid target-cid
+                                                                                            :actual-cid actual-cid})]
+                                [st3 [diag obs-eff]])))))
+                      [(assoc state :http-fallback fb')
+                       [{:effect :fetch-bundle-blob
+                         :cid target-cid
+                         :url cur-url
+                         :attempt 1
+                         :range (next-range-window fb')
+                         :target-version target-ver
+                         :proxy-url (:proxy-url state)
+                         :generation cur-gen}]]))))
+
+              :else
+              (let [diag {:effect :diagnose
+                          :type :diagnose
+                          :reason :light-update-http-truncated
+                          :status status
+                          :relay cur-url
+                          :generation cur-gen}
+                    st1 (record-light-diag state :light-update-http-truncated)]
+                (failover-or-exhaust-http st1 ep cur-gen :unexpected-range-status [diag] {:reset-range? false})))))
 
         :blob-fetched
-        (let [pending (:pending-update state)
-              expected-cid (or (:target-cid pending) (normalize-hex (:cid event)))
-              bs (:bytes event)
-              actual-cid (when (and bs (bytes? bs)) (sha256-hex bs))]
-          (if (and expected-cid actual-cid (= expected-cid actual-cid))
-            (let [next-gen (inc cur-gen)
-                  st1 (assoc state
-                             :phase :health-checking
-                             :generation next-gen
-                             :pending-update (assoc pending :verified-cid actual-cid))
-                  [st2 obs-eff] (light-update-obs-record st1 ep :staged {:target-version (:target-version pending)
-                                                                         :cid actual-cid})]
-              [st2 [{:effect :stage-light-bundle
-                     :cid actual-cid
-                     :target-version (:target-version pending)}
-                    {:effect :atomic-swap-and-restart-light-node
-                     :cid actual-cid
-                     :generation next-gen}
-                    obs-eff]])
-            (let [diag {:effect :diagnose
-                        :type :diagnose
-                        :reason :light-update-hash-mismatch
-                        :expected-cid expected-cid
-                        :actual-cid actual-cid}
-                  st1 (-> state
-                          (assoc :phase :watching
-                                 :pending-update nil
-                                 :last-error :light-update-hash-mismatch)
-                          (update :generation inc)
-                          (update-in [:diagnostics :light-update-hash-mismatch] (fnil inc 0)))
-                  [st2 obs-eff] (light-update-obs-record st1 ep :refused {:reason :light-update-hash-mismatch
-                                                                          :expected-cid expected-cid
-                                                                          :actual-cid actual-cid})]
-              [st2 [diag obs-eff]])))
+        (if-not (contains? #{:fetching-mesh :fetching-https :fetching-https-range} (:phase state))
+          (wrong-phase-result state :blob-fetched cur-gen)
+          (let [pending (:pending-update state)
+                expected-cid (or (:target-cid pending) (normalize-hex (:cid event)))
+                bs (:bytes event)
+                actual-cid (when (and bs (bytes? bs)) (sha256-hex bs))]
+            (if (and expected-cid actual-cid (= expected-cid actual-cid))
+              (stage-verified-blob state ep cur-gen pending actual-cid bs)
+              (let [diag {:effect :diagnose
+                          :type :diagnose
+                          :reason :light-update-hash-mismatch
+                          :expected-cid expected-cid
+                          :actual-cid actual-cid}
+                    st1 (-> state
+                            (assoc :phase :watching
+                                   :pending-update nil
+                                   :http-fallback (reset-http-fallback state [])
+                                   :last-error :light-update-hash-mismatch)
+                            (update :generation inc)
+                            (record-light-diag :light-update-hash-mismatch))
+                    [st2 obs-eff] (light-update-obs-record st1 ep :refused {:reason :light-update-hash-mismatch
+                                                                            :expected-cid expected-cid
+                                                                            :actual-cid actual-cid})]
+                [st2 [diag obs-eff]]))))
 
         :health-check-result
-        (let [pending (:pending-update state)
-              healthy? (and (true? (:healthy? event))
-                            (not (false? (:connected? event)))
-                            (not (false? (:syncing? event)))
-                            (not (false? (:finalized-epoch-advancing? event)))
-                            (not (false? (:balance-sane? event))))]
-          (if healthy?
-            (let [new-ver (or (:target-version pending) (:current-version state))
-                  new-cid (or (:target-cid pending) (:current-cid state))
-                  new-seq (long (or (:pointer-seq pending)
-                                    (get-in pending [:pointer :seq])
-                                    (:last-applied-seq state)
-                                    (:active-config-seq state)
-                                    0))
-                  st1 (assoc state
-                             :phase :watching
-                             :current-version new-ver
-                             :current-cid new-cid
-                             :lkg-version new-ver
-                             :lkg-cid new-cid
-                             :active-config-seq new-seq
-                             :last-applied-seq new-seq
-                             :pending-update nil
-                             :last-error nil)
-                  [st2 obs-eff] (light-update-obs-record st1 ep :verified {:version new-ver :cid new-cid})]
-              [st2 [obs-eff]])
-            (let [lkg-ver (:lkg-version state)
-                  lkg-cid (:lkg-cid state)
-                  failed-cid (or (:verified-cid pending) (:target-cid pending))
-                  diag {:effect :diagnose
-                        :type :diagnose
-                        :reason :light-update-health-check-failed-rollback
-                        :lkg-version lkg-ver
-                        :lkg-cid lkg-cid
-                        :quarantined-cid failed-cid}
-                  st1 (-> state
-                          (assoc :phase :watching
-                                 :current-version lkg-ver
-                                 :current-cid lkg-cid
-                                 :last-rollback-cid failed-cid
-                                 :pending-update nil
-                                 :last-error :light-update-health-check-failed-rollback)
-                          (update :rollback-count (fnil inc 0))
-                          (cond-> failed-cid (update :quarantined-cids (fnil conj #{}) failed-cid))
-                          (update :generation inc)
-                          (update-in [:diagnostics :light-update-health-check-failed-rollback] (fnil inc 0)))
-                  [st2 obs-eff] (light-update-obs-record st1 ep :rolled-back {:lkg-version lkg-ver
-                                                                              :lkg-cid lkg-cid
-                                                                              :quarantined-cid failed-cid})]
-              [st2 [{:effect :restore-lkg-light-bundle
-                     :lkg-version lkg-ver
-                     :lkg-cid lkg-cid
-                     :quarantined-cid failed-cid}
-                    diag
-                    obs-eff]])))
+        (if (not= :health-checking (:phase state))
+          (wrong-phase-result state :health-check-result cur-gen)
+          (let [pending (:pending-update state)
+                healthy? (and (true? (:healthy? event))
+                              (not (false? (:connected? event)))
+                              (not (false? (:syncing? event)))
+                              (not (false? (:finalized-epoch-advancing? event)))
+                              (not (false? (:balance-sane? event))))]
+            (if healthy?
+              (let [new-ver (or (:target-version pending) (:current-version state))
+                    new-cid (or (:target-cid pending) (:current-cid state))
+                    new-seq (long (or (:pointer-seq pending)
+                                      (get-in pending [:pointer :seq])
+                                      (:last-applied-seq state)
+                                      (:active-config-seq state)
+                                      0))
+                    st1 (assoc state
+                               :phase :watching
+                               :current-version new-ver
+                               :current-cid new-cid
+                               :lkg-version new-ver
+                               :lkg-cid new-cid
+                               :active-config-seq new-seq
+                               :last-applied-seq new-seq
+                               :pending-update nil
+                               :http-fallback (reset-http-fallback state [])
+                               :last-error nil)
+                    [st2 obs-eff] (light-update-obs-record st1 ep :verified {:version new-ver :cid new-cid})]
+                [st2 [obs-eff]])
+              (let [lkg-ver (:lkg-version state)
+                    lkg-cid (:lkg-cid state)
+                    failed-cid (or (:verified-cid pending) (:target-cid pending))
+                    diag {:effect :diagnose
+                          :type :diagnose
+                          :reason :light-update-health-check-failed-rollback
+                          :lkg-version lkg-ver
+                          :lkg-cid lkg-cid
+                          :quarantined-cid failed-cid}
+                    st1 (-> state
+                            (assoc :phase :watching
+                                   :current-version lkg-ver
+                                   :current-cid lkg-cid
+                                   :last-rollback-cid failed-cid
+                                   :pending-update nil
+                                   :http-fallback (reset-http-fallback state [])
+                                   :last-error :light-update-health-check-failed-rollback)
+                            (update :rollback-count (fnil inc 0))
+                            (cond-> failed-cid (update :quarantined-cids (fnil conj #{}) failed-cid))
+                            (update :generation inc)
+                            (record-light-diag :light-update-health-check-failed-rollback))
+                    [st2 obs-eff] (light-update-obs-record st1 ep :rolled-back {:lkg-version lkg-ver
+                                                                                :lkg-cid lkg-cid
+                                                                                :quarantined-cid failed-cid})]
+                [st2 [{:effect :restore-lkg-light-bundle
+                       :lkg-version lkg-ver
+                       :lkg-cid lkg-cid
+                       :quarantined-cid failed-cid}
+                      diag
+                      obs-eff]]))))
 
         [state []]))))
 

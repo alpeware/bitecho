@@ -26,7 +26,8 @@
             [clojure.string :as str]
             [datachannel.api :as api]
             [datachannel.dtls :as dtls]
-            [datachannel.mdns :as mdns]))
+            [datachannel.mdns :as mdns]
+            [goog.object :as gobj]))
 
 (def ^:private node-fs (js/require "node:fs"))
 (def ^:private node-fsp (.-promises node-fs))
@@ -558,64 +559,149 @@
 
 (defn- http-get-bytes!
   "Fetches raw bytes from `url-str` over HTTP/HTTPS (honoring `proxy-url` / `HTTPS_PROXY`),
-   invoking `(cb {:ok? bool :status int :bytes Uint8Array :headers map :error str})`."
-  [url-str proxy-url timeout-ms cb]
-  (let [settled? (atom false)
-        done! (fn [res]
-                (when (compare-and-set! settled? false true)
-                  (cb res)))]
-    (try
-      (let [https? (str/starts-with? (str/lower-case (str url-str)) "https://")
-            url-obj (js/URL. url-str)
-            target-host (.-hostname url-obj)
-            target-port (int (or (not-empty (str (.-port url-obj))) (if https? 443 80)))
-            eff-proxy (when (and https?
-                                 (not= target-host "127.0.0.1")
-                                 (not= target-host "localhost"))
-                        (or proxy-url (resolve-proxy-url nil)))
-            run-get! (fn [tls-sock]
-                       (try
-                         (let [client (if https? node-https node-http)
-                               opts-obj #js {:protocol (.-protocol url-obj)
-                                             :hostname target-host
-                                             :port target-port
-                                             :path (str (.-pathname url-obj) (.-search url-obj))
-                                             :method "GET"
-                                             :timeout (or timeout-ms 15000)}
-                               _ (when tls-sock
-                                   (set! (.-agent opts-obj) false)
-                                   (let [h (or (.-headers opts-obj) #js {})]
-                                     (aset h "Connection" "close")
-                                     (set! (.-headers opts-obj) h))
-                                   (set! (.-createConnection opts-obj) (fn [_ _] tls-sock)))
-                               req (.request client opts-obj
-                                             (fn [res]
-                                               (let [status-code (.-statusCode res)
-                                                     chunks #js []]
-                                                 (.on res "data" (fn [c] (.push chunks c)))
-                                                 (.on res "end" (fn []
-                                                                  (let [buf (js/Buffer.concat chunks)
-                                                                        u8 (crypto/compact-u8 buf)]
-                                                                    (done! {:ok? (and (>= status-code 200) (< status-code 300))
-                                                                            :status status-code
-                                                                            :bytes u8
-                                                                            :headers (js->clj (.-headers res))}))))
-                                                 (.on res "error" (fn [err] (done! {:ok? false :status status-code :error (str err)}))))))]
-                           (.on req "timeout" (fn [] (.destroy req) (done! {:ok? false :status 408 :error "timeout"})))
-                           (.on req "error" (fn [err] (done! {:ok? false :status 500 :error (str err)})))
-                           (.end req))
-                         (catch :default e
-                           (done! {:ok? false :status 500 :error (str e)}))))]
-        (if eff-proxy
-          (open-https-proxy-tls-socket!
-           eff-proxy target-host target-port (or timeout-ms 15000)
-           (fn [tls-sock err]
-             (if tls-sock
-               (run-get! tls-sock)
-               (done! {:ok? false :status 502 :error (or err "proxy-connect-failed")}))))
-          (run-get! nil)))
-      (catch :default e
-        (done! {:ok? false :status 500 :error (str e)})))))
+   using a dedicated non-pooled connection (`agent: false`, `Connection: close`,
+   `Accept-Encoding: identity`), explicit `aborted`/`close`/truncation detection, optional
+   HTTP `Range: bytes=S-E`, and a hard total transfer deadline (BIP-022 Stage D.1)."
+  ([url-str proxy-url timeout-ms cb]
+   (http-get-bytes! url-str proxy-url timeout-ms nil cb))
+  ([url-str proxy-url timeout-ms extra-opts cb]
+   (let [settled? (atom false)
+         total-timer (atom nil)
+         active-req (atom nil)
+         done! (fn [res]
+                 (when (compare-and-set! settled? false true)
+                   (when-let [t @total-timer]
+                     (js/clearTimeout t)
+                     (reset! total-timer nil))
+                   (cb res)))
+         total-deadline-ms (long (or (:total-timeout-ms extra-opts) timeout-ms 30000))
+         inactivity-ms (long (min 15000 (or timeout-ms 15000)))
+         range-vec (:range extra-opts)]
+     (try
+       (let [https? (str/starts-with? (str/lower-case (str url-str)) "https://")
+             ^js url-obj (js/URL. url-str)
+             target-host (.-hostname url-obj)
+             target-port (int (or (not-empty (str (.-port url-obj))) (if https? 443 80)))
+             eff-proxy (when (and https?
+                                  (not= target-host "127.0.0.1")
+                                  (not= target-host "localhost"))
+                         (or proxy-url (resolve-proxy-url nil)))
+             run-get! (fn [tls-sock]
+                        (try
+                          (let [^js client (if https? node-https node-http)
+                                hdrs #js {"Connection" "close"
+                                          "Accept-Encoding" "identity"}
+                                _ (when (and (vector? range-vec) (= 2 (count range-vec)))
+                                    (gobj/set hdrs "Range" (str "bytes=" (first range-vec) "-" (second range-vec))))
+                                opts-obj #js {:protocol (.-protocol url-obj)
+                                              :hostname target-host
+                                              :port target-port
+                                              :path (str (.-pathname url-obj) (.-search url-obj))
+                                              :method "GET"
+                                              :agent false
+                                              :headers hdrs
+                                              :timeout inactivity-ms}
+                                _ (when tls-sock
+                                    (gobj/set opts-obj "createConnection" (fn [_ _] tls-sock)))
+                                ^js req (.request
+                                         client opts-obj
+                                         (fn [^js res]
+                                           (let [status-code (.-statusCode res)
+                                                 res-hdrs (.-headers res)
+                                                 cl-raw (gobj/get res-hdrs "content-length")
+                                                 expected-len (when (and cl-raw (not (str/blank? (str cl-raw))))
+                                                                (let [n (js/parseInt (str cl-raw) 10)]
+                                                                  (when (and (not (js/isNaN n)) (>= n 0)) n)))
+                                                 etag (gobj/get res-hdrs "etag")
+                                                 content-range (gobj/get res-hdrs "content-range")
+                                                 chunks #js []
+                                                 received-len (atom 0)
+                                                 partial-u8 (fn []
+                                                              (when (pos? @received-len)
+                                                                (crypto/compact-u8 (js/Buffer.concat chunks))))]
+                                             (.on res "data" (fn [^js c]
+                                                               (.push chunks c)
+                                                               (swap! received-len + (.-length c))))
+                                             (.on res "aborted"
+                                                  (fn []
+                                                    (let [n @received-len]
+                                                      (done! {:ok? false
+                                                              :status status-code
+                                                              :aborted-mid-body? (pos? n)
+                                                              :received-bytes n
+                                                              :total-bytes expected-len
+                                                              :partial-bytes (partial-u8)
+                                                              :etag etag
+                                                              :error "aborted"}))))
+                                             (.on res "close"
+                                                  (fn []
+                                                    (when (and (not @settled?)
+                                                               (not (boolean (gobj/get res "complete"))))
+                                                      (let [n @received-len]
+                                                        (done! {:ok? false
+                                                                :status status-code
+                                                                :aborted-mid-body? (pos? n)
+                                                                :received-bytes n
+                                                                :total-bytes expected-len
+                                                                :partial-bytes (partial-u8)
+                                                                :etag etag
+                                                                :error "premature-close"})))))
+                                             (.on res "end"
+                                                  (fn []
+                                                    (let [n @received-len]
+                                                      (if (and (>= status-code 200) (< status-code 300)
+                                                               (number? expected-len)
+                                                               (< (long n) (long expected-len)))
+                                                        (done! {:ok? false
+                                                                :status status-code
+                                                                :aborted-mid-body? true
+                                                                :received-bytes n
+                                                                :total-bytes expected-len
+                                                                :partial-bytes (partial-u8)
+                                                                :etag etag
+                                                                :error "truncated-body"})
+                                                        (let [buf (js/Buffer.concat chunks)
+                                                              u8 (crypto/compact-u8 buf)]
+                                                          (done! {:ok? (and (>= status-code 200) (< status-code 300))
+                                                                  :status status-code
+                                                                  :bytes u8
+                                                                  :content-range content-range
+                                                                  :etag etag
+                                                                  :total-bytes expected-len
+                                                                  :headers (js->clj res-hdrs)}))))))
+                                             (.on res "error"
+                                                  (fn [err]
+                                                    (let [n @received-len]
+                                                      (done! {:ok? false
+                                                              :status status-code
+                                                              :aborted-mid-body? (pos? n)
+                                                              :received-bytes n
+                                                              :total-bytes expected-len
+                                                              :partial-bytes (partial-u8)
+                                                              :etag etag
+                                                              :error (str err)})))))))]
+                            (reset! active-req req)
+                            (.on req "timeout" (fn [] (.destroy req) (done! {:ok? false :status 408 :error "timeout"})))
+                            (.on req "error" (fn [err] (done! {:ok? false :status 500 :error (str err)})))
+                            (.end req))
+                          (catch :default e
+                            (done! {:ok? false :status 500 :error (str e)}))))]
+         (reset! total-timer
+                 (js/setTimeout (fn []
+                                  (when-let [^js r @active-req]
+                                    (try (.destroy r) (catch :default _ nil)))
+                                  (done! {:ok? false :status 408 :error "total-transfer-timeout"}))
+                                total-deadline-ms))
+         (if eff-proxy
+           (open-https-proxy-tls-socket!
+            eff-proxy target-host target-port inactivity-ms
+            (fn [tls-sock err]
+              (if tls-sock
+                (run-get! tls-sock)
+                (done! {:ok? false :status 502 :error (or err "proxy-connect-failed")}))))
+           (run-get! nil)))
+       (catch :default e
+         (done! {:ok? false :status 500 :error (str e)}))))))
 
 (defn- http-post-json!
   "Posts `json-body-str` to `url-str` over HTTP/HTTPS with a timeout (tunneling via HTTPS_PROXY when present),
@@ -1173,6 +1259,7 @@
          pin-version (extract-flag-value clean-args "--pin-version" nil)
          auto-update-pointer (extract-flag-value clean-args "--auto-update-pointer" nil)
          auto-update-interval-ms (extract-long-flag clean-args "--auto-update-interval-ms" nil)
+         auto-update-force-http? (boolean (some #{"--auto-update-force-http"} clean-args))
          trusted-deploy-auths-present? (boolean (some #(or (= % "--trusted-deploy-authorities")
                                                            (str/starts-with? (str %) "--trusted-deploy-authorities="))
                                                       clean-args))
@@ -1270,6 +1357,7 @@
        pin-version (assoc :pin-version pin-version)
        auto-update-pointer (assoc :auto-update-pointer auto-update-pointer)
        auto-update-interval-ms (assoc :auto-update-interval-ms auto-update-interval-ms)
+       auto-update-force-http? (assoc :auto-update-force-http? true)
        trusted-deploy-auths-present? (assoc :trusted-deploy-authorities trusted-deploy-authorities)
        relay-url (assoc :relay-url relay-url)
        turn-config (assoc :turn-config turn-config)))))
@@ -2259,7 +2347,7 @@
 (defonce ^:private mesh-chunk-handlers-atom (atom {}))
 
 (defn- try-dispatch-mesh-chunk-res!
-  "Intercepts inbound `:artifact-blob-chunk-res` frames for active BIP-017a mesh chunk fetches.
+  "Intercepts inbound `:artifact-blob-chunk-res` frames strictly by `:req-id` (BIP-022 Stage D.1).
    Returns true if handled, false otherwise. Emits counted Rule 5 `:mesh-chunk-dispatch-error`
    diagnostic if a chunk handler throws (zero silent catches)."
   ([payload]
@@ -2270,8 +2358,7 @@
        (when (and (map? decoded) (= :artifact-blob-chunk-res (:type decoded)))
          (let [req-id (:req-id decoded)
                cid (str (:cid decoded))
-               handler (or (when req-id (get @mesh-chunk-handlers-atom req-id))
-                           (get @mesh-chunk-handlers-atom cid))]
+               handler (when req-id (get @mesh-chunk-handlers-atom req-id))]
            (when (fn? handler)
              (try
                (handler decoded)
@@ -4667,6 +4754,8 @@
                                         :artifact-role :light-node
                                         :current-version "0.23.22"
                                         :current-cid current-cid
+                                        :pointer-url pointer-url
+                                        :force-http? (boolean (:auto-update-force-http? opts))
                                         :trusted-deploy-authorities trusted-auths
                                         :pinned-version (:pin-version opts)
                                         :proxy-url proxy-url
@@ -4675,6 +4764,7 @@
            staged-bytes-atom (atom nil)
            staged-path-atom (atom nil)
            stage-write-promise-atom (atom nil)
+           retry-timer-atom (atom nil)
            dispatch! (fn dispatch! [ev]
                        (let [effs-box (atom [])]
                          (swap! updater-atom
@@ -4696,6 +4786,7 @@
                                         (let [mesh-ok? (boolean (and conn-atom (fn? (:send-fn @conn-atom))))]
                                           (dispatch! {:type :pointer-seen
                                                       :pointer ptr
+                                                      :pointer-url pointer-url
                                                       :mesh-connected? mesh-ok?
                                                       :generation gen}))
                                         (emit-json-line! {"event" "auto-update-diagnose"
@@ -4727,7 +4818,7 @@
                                        chunk-timer (atom nil)
                                        total-timer (atom nil)
                                        cleanup! (fn []
-                                                  (swap! mesh-chunk-handlers-atom dissoc req-id cid)
+                                                  (swap! mesh-chunk-handlers-atom dissoc req-id)
                                                   (when-let [t @chunk-timer]
                                                     (js/clearTimeout t)
                                                     (reset! chunk-timer nil))
@@ -4741,11 +4832,16 @@
                                                              :cid cid
                                                              :reason reason
                                                              :generation gen})))
-                                       send-chunk! (fn [offset length timeout-ms]
+                                       send-chunk! (fn send-chunk! [offset length timeout-ms retried?]
                                                      (when-let [t @chunk-timer]
                                                        (js/clearTimeout t))
                                                      (reset! chunk-timer
-                                                             (js/setTimeout #(fail! :mesh-chunk-timeout) timeout-ms))
+                                                             (js/setTimeout
+                                                              (fn []
+                                                                (if (and (not @settled?) (not retried?))
+                                                                  (send-chunk! offset length chunk-ms true)
+                                                                  (fail! :mesh-chunk-timeout)))
+                                                              timeout-ms))
                                                      (try
                                                        (let [req (deploy/build-mesh-chunk-request cid offset length req-id)
                                                              pk-hex (or (:pubkey-hex identity) (:pubkey identity))
@@ -4754,7 +4850,8 @@
                                                        (catch :default _
                                                          (fail! :mesh-send-failed))))
                                        on-chunk-res (fn [res]
-                                                      (when-not @settled?
+                                                      (when (and (not @settled?)
+                                                                 (= req-id (:req-id res)))
                                                         (let [step (deploy/reduce-mesh-chunk-response @asm-atom res)]
                                                           (cond
                                                             (not (:ok? step))
@@ -4775,48 +4872,100 @@
                                                               (reset! asm-atom (:state step))
                                                               (send-chunk! (get-in step [:next-req :offset])
                                                                            (get-in step [:next-req :length])
-                                                                           chunk-ms))))))]
-                                   (swap! mesh-chunk-handlers-atom assoc req-id on-chunk-res cid on-chunk-res)
+                                                                           chunk-ms
+                                                                           false))))))]
+                                   (swap! mesh-chunk-handlers-atom assoc req-id on-chunk-res)
                                    (reset! total-timer (js/setTimeout #(fail! :mesh-total-timeout) total-ms))
-                                   (send-chunk! 0 chunk-bytes probe-ms))))
+                                   (send-chunk! 0 chunk-bytes probe-ms false))))
+
+                             :schedule-http-retry
+                             (let [gen (:generation eff)
+                                   delay-ms (max 100 (long (or (:delay-ms eff) 1000)))]
+                               (when-let [prev @retry-timer-atom]
+                                 (js/clearTimeout prev))
+                               (reset! retry-timer-atom
+                                       (js/setTimeout #(dispatch! {:type :http-retry-timer-fired :generation gen})
+                                                      delay-ms)))
 
                              :fetch-bundle-blob
                              (let [gen (:generation eff)
                                    cid (:cid eff)
-                                   blob-url (deploy/build-blob-fetch-url pointer-url cid)]
+                                   range-vec (:range eff)
+                                   blob-url (or (:url eff) (deploy/build-blob-fetch-url pointer-url cid))
+                                   timeout-ms (if range-vec 15000 30000)]
                                (http-get-bytes!
-                                blob-url (:proxy-url eff) 30000
+                                blob-url (:proxy-url eff) timeout-ms
+                                {:range range-vec :total-timeout-ms timeout-ms}
                                 (fn [res]
-                                  (if (:ok? res)
+                                  (cond
+                                    (and range-vec (:ok? res) (= 206 (:status res)))
+                                    (if-let [cr (deploy/parse-content-range (:content-range res))]
+                                      (dispatch! {:type :http-range-chunk-fetched
+                                                  :status 206
+                                                  :start (:start cr)
+                                                  :end (:end cr)
+                                                  :total-bytes (:total-bytes cr)
+                                                  :bytes (:bytes res)
+                                                  :etag (:etag res)
+                                                  :generation gen})
+                                      (dispatch! {:type :blob-fetch-failed
+                                                  :cid cid
+                                                  :status 206
+                                                  :reason :malformed-content-range
+                                                  :generation gen}))
+
+                                    (and range-vec (:ok? res) (= 200 (:status res)))
+                                    (do
+                                      (reset! staged-bytes-atom (:bytes res))
+                                      (dispatch! {:type :http-range-chunk-fetched
+                                                  :status 200
+                                                  :bytes (:bytes res)
+                                                  :generation gen}))
+
+                                    (:ok? res)
                                     (do
                                       (reset! staged-bytes-atom (:bytes res))
                                       (dispatch! {:type :blob-fetched :cid cid :bytes (:bytes res) :generation gen}))
+
+                                    :else
                                     (do
                                       (emit-json-line! {"event" "auto-update-diagnose"
                                                         "reason" "fetch-bundle-blob-failed"
                                                         "cid" cid
+                                                        "url" blob-url
                                                         "status" (:status res)
                                                         "error" (:error res)}
                                                        events-out)
-                                      (dispatch! {:type :blob-fetch-failed :cid cid :reason (:error res) :generation gen}))))))
+                                      (dispatch! (cond-> {:type :blob-fetch-failed
+                                                          :cid cid
+                                                          :status (:status res)
+                                                          :reason (or (:error res) :http-fetch-failed)
+                                                          :aborted-mid-body? (true? (:aborted-mid-body? res))
+                                                          :received-bytes (long (or (:received-bytes res) 0))
+                                                          :generation gen}
+                                                   (:total-bytes res) (assoc :total-bytes (:total-bytes res))
+                                                   (:partial-bytes res) (assoc :partial-bytes (:partial-bytes res))
+                                                   (:etag res) (assoc :etag (:etag res)))))))))
 
                              :stage-light-bundle
-                             (when (and bundle-path @staged-bytes-atom)
-                               (let [dir (.dirname node-path bundle-path)
-                                     cid8 (subs (str (:cid eff)) 0 (min 8 (count (str (:cid eff)))))
-                                     tmp-p (.join node-path dir (str ".bitecho-update-" cid8 ".cjs.tmp"))
-                                     buf (.from js/Buffer (.-buffer @staged-bytes-atom)
-                                                (.-byteOffset @staged-bytes-atom)
-                                                (.-byteLength @staged-bytes-atom))]
-                                 (reset! staged-path-atom tmp-p)
-                                 (reset! stage-write-promise-atom
-                                         (-> (.writeFile node-fsp tmp-p buf #js {:mode 0755})
-                                             (.catch (fn [e]
-                                                       (emit-json-line! {"event" "auto-update-diagnose"
-                                                                         "reason" "stage-write-failed"
-                                                                         "detail" (.-message e)}
-                                                                        events-out)
-                                                       (throw e)))))))
+                             (let [bs (or (:bytes eff) @staged-bytes-atom)]
+                               (when (and bundle-path bs)
+                                 (reset! staged-bytes-atom bs)
+                                 (let [dir (.dirname node-path bundle-path)
+                                       cid8 (subs (str (:cid eff)) 0 (min 8 (count (str (:cid eff)))))
+                                       tmp-p (.join node-path dir (str ".bitecho-update-" cid8 ".cjs.tmp"))
+                                       buf (.from js/Buffer (.-buffer bs)
+                                                  (.-byteOffset bs)
+                                                  (.-byteLength bs))]
+                                   (reset! staged-path-atom tmp-p)
+                                   (reset! stage-write-promise-atom
+                                           (-> (.writeFile node-fsp tmp-p buf #js {:mode 0755})
+                                               (.catch (fn [e]
+                                                         (emit-json-line! {"event" "auto-update-diagnose"
+                                                                           "reason" "stage-write-failed"
+                                                                           "detail" (.-message e)}
+                                                                          events-out)
+                                                         (throw e))))))))
 
                              :atomic-swap-and-restart-light-node
                              (let [gen (:generation eff)
@@ -4879,7 +5028,10 @@
            iv (js/setInterval #(dispatch! {:type :poll-tick}) poll-ms)]
        (fn []
          (js/clearTimeout t0)
-         (js/clearInterval iv))))))
+         (js/clearInterval iv)
+         (when-let [rt @retry-timer-atom]
+           (js/clearTimeout rt)
+           (reset! retry-timer-atom nil)))))))
 
 (defn- node-pid-alive?
   [pid]

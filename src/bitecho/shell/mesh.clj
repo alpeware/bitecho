@@ -12,6 +12,7 @@
             [bitecho.economy.treasury :as treasury]
             [bitecho.fressian :as fressian]
             [bitecho.rendezvous.core :as rendezvous]
+            [bitecho.shell.blob-fs :as blob-fs]
             [bitecho.shell.identity :as identity]
             [bitecho.shell.persistence :as persistence]
             [bitecho.snapshot.core :as snap]
@@ -24,8 +25,11 @@
             [datachannel.api :as api])
   (:import [com.sun.net.httpserver HttpExchange HttpHandler HttpServer]
            [java.net InetSocketAddress]
+           [java.nio ByteBuffer]
+           [java.nio.channels FileChannel]
            [java.nio.charset StandardCharsets]
-           [java.util.concurrent Executors TimeUnit]))
+           [java.nio.file OpenOption StandardOpenOption]
+           [java.util.concurrent Executors Semaphore TimeUnit]))
 
 (defn log-mesh-error
   "Logs an error message and exception with context for mesh operations."
@@ -38,6 +42,73 @@
 ;; ---------------------------------------------------------------------------
 
 (defonce ^:private in-memory-bus (atom {}))
+
+(def ^:private max-concurrent-mesh-chunk-reads 2)
+(defonce ^:private mesh-chunk-read-semaphore (Semaphore. max-concurrent-mesh-chunk-reads true))
+
+(defn read-disk-blob-chunk-positional
+  "Bounded positional `FileChannel` read of `[offset, offset + min(length, 192 KiB))` from disk CAS
+   (`<store-dir>/blobs/<2-char>/<cid>`), gated by a `max=2` concurrency semaphore (zero full-file
+   heap allocation; BIP-022 Stage D.1)."
+  [state-dir cid offset length]
+  (let [off (long (or offset 0))
+        req-len (max 1 (min deploy/default-mesh-chunk-size-bytes (long (or length deploy/default-mesh-chunk-size-bytes))))
+        f (when (and state-dir cid) (blob-fs/blob-file state-dir cid))]
+    (cond
+      (or (nil? f) (not (.exists f)))
+      {:ok? false :error :not-found}
+
+      (not (.tryAcquire ^Semaphore mesh-chunk-read-semaphore))
+      {:ok? false :error :busy}
+
+      :else
+      (try
+        (with-open [^FileChannel fc (FileChannel/open (.toPath f)
+                                                      (into-array OpenOption [StandardOpenOption/READ]))]
+          (let [total-len (.size fc)]
+            (if (or (neg? off) (and (pos? total-len) (>= off total-len)))
+              {:ok? false :error :offset-out-of-range :total-bytes total-len}
+              (let [actual-len (int (min req-len (max 0 (- total-len off))))
+                    buf (byte-array actual-len)
+                    bb (ByteBuffer/wrap buf)]
+                (loop [pos off]
+                  (when (.hasRemaining bb)
+                    (let [n (.read fc bb pos)]
+                      (when (pos? n)
+                        (recur (+ pos n))))))
+                {:ok? true
+                 :bytes buf
+                 :offset off
+                 :length actual-len
+                 :total-bytes total-len
+                 :eof? (>= (+ off actual-len) total-len)}))))
+        (catch Exception e
+          (log-mesh-error "Positional disk blob chunk read failed" e)
+          {:ok? false :error :io-error})
+        (finally
+          (.release ^Semaphore mesh-chunk-read-semaphore))))))
+
+(defn- serve-disk-blob-chunk-req
+  [state-dir unwrapped]
+  (let [req-cid (str (:cid unwrapped))
+        req-id (:req-id unwrapped)
+        r (read-disk-blob-chunk-positional state-dir req-cid (:offset unwrapped) (:length unwrapped))]
+    (if (:ok? r)
+      (cond-> {:type :artifact-blob-chunk-res
+               :ok? true
+               :cid req-cid
+               :offset (:offset r)
+               :length (:length r)
+               :total-bytes (:total-bytes r)
+               :eof? (:eof? r)
+               :bytes (:bytes r)}
+        req-id (assoc :req-id req-id))
+      (cond-> {:type :artifact-blob-chunk-res
+               :ok? false
+               :error (:error r)
+               :cid req-cid}
+        (:total-bytes r) (assoc :total-bytes (:total-bytes r))
+        req-id (assoc :req-id req-id)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Pure Network Command & Event Translation
@@ -2190,7 +2261,12 @@
                                    st (or (when-let [sa (:state-atom shell-node)] @sa)
                                           (when shell-node (query-node-state shell-node 500)))
                                    blob-bs (get-in st [:data :blob-store :entries req-cid :bytes])
-                                   res-map (deploy/serve-mesh-blob-chunk blob-bs unwrapped)]
+                                   res-map (if (fressian/bytes? blob-bs)
+                                             (deploy/serve-mesh-blob-chunk blob-bs unwrapped)
+                                             (if-let [sdir (or (:state-dir shell-node)
+                                                               (get-in shell-node [:config :state-dir]))]
+                                               (serve-disk-blob-chunk-req sdir unwrapped)
+                                               (deploy/serve-mesh-blob-chunk nil unwrapped)))]
                                (try
                                  (api/send! agent-node (fressian/encode-wire res-map) cid)
                                  (catch Exception e

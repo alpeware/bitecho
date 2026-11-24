@@ -491,14 +491,17 @@
 
 (defn safe-blob-response-headers
   "Builds the normative BIP-017a HTTP response headers for `GET/HEAD /artifact/v1/blob/<cid>`.
-   NOTE: `Access-Control-Allow-Origin: *` is scoped STRICTLY to `/artifact/v1/blob/<cid>`."
-  [{:keys [cid content-type content-length]}]
+   NOTE: `Access-Control-Allow-Origin: *` is scoped STRICTLY to `/artifact/v1/blob/<cid>`.
+   Includes `Accept-Ranges: bytes` and optional `Content-Range` for `206 Partial Content` (BIP-022 Stage D.1)."
+  [{:keys [cid content-type content-length content-range]}]
   (let [{:keys [content-type sandbox-csp?]} (normalize-safe-blob-content-type content-type)]
     (cond-> {"Content-Type" content-type
              "Cache-Control" "public, max-age=31536000, immutable"
              "Access-Control-Allow-Origin" "*"
+             "Accept-Ranges" "bytes"
              "X-Content-Type-Options" "nosniff"
              "ETag" (str "\"" cid "\"")
              "X-Bitecho-Blob-Cid" (str cid)}
       (some? content-length) (assoc "Content-Length" (str content-length))
+      (and (string? content-range) (not (str/blank? content-range))) (assoc "Content-Range" content-range)
       sandbox-csp? (assoc "Content-Security-Policy" "sandbox"))))

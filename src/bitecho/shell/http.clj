@@ -2218,14 +2218,44 @@
             (if (:ok? res)
               (let [b (:blob res)
                     bs ^bytes (:blob/bytes b)
-                    hdrs (chunk-const/safe-blob-response-headers
-                          {:cid (:blob/cid b)
-                           :content-type (or (:blob/media-type b) "application/octet-stream")
-                           :content-length (alength bs)})]
-                (send-response exchange
-                               {:response/status 200
-                                :response/headers hdrs
-                                :response/body (if (= method :HEAD) nil bs)}))
+                    ^File disk-file (:disk-file res)
+                    tier1? (some? bs)
+                    total-size (long (if tier1? (alength bs) (if (and disk-file (.exists disk-file)) (.length disk-file) 0)))
+                    ct (or (:blob/media-type b) "application/octet-stream")
+                    range-hdr (first (get (:request/headers req) :header/range))]
+                (if range-hdr
+                  (if-let [[start end] (parse-byte-range range-hdr total-size)]
+                    (let [part-len (inc (- end start))
+                          hdrs (chunk-const/safe-blob-response-headers
+                                {:cid (:blob/cid b)
+                                 :content-type ct
+                                 :content-length part-len
+                                 :content-range (str "bytes " start "-" end "/" total-size)})
+                          body (cond
+                                 (= method :HEAD) nil
+                                 tier1? (Arrays/copyOfRange bs (int start) (int (inc end)))
+                                 :else {:file disk-file :offset start :length part-len})]
+                      (send-response exchange
+                                     {:response/status 206
+                                      :response/headers hdrs
+                                      :response/body body}))
+                    (send-response exchange
+                                   {:response/status 416
+                                    :response/headers {"Content-Range" (str "bytes */" total-size)
+                                                       "Accept-Ranges" "bytes"}
+                                    :response/body nil}))
+                  (let [hdrs (chunk-const/safe-blob-response-headers
+                              {:cid (:blob/cid b)
+                               :content-type ct
+                               :content-length total-size})
+                        body (cond
+                               (= method :HEAD) nil
+                               tier1? bs
+                               :else {:file disk-file :offset 0 :length total-size})]
+                    (send-response exchange
+                                   {:response/status 200
+                                    :response/headers hdrs
+                                    :response/body body}))))
               (send-response exchange
                              {:response/status 404
                               :response/headers {"Content-Type" "application/json; charset=utf-8"}
