@@ -24,6 +24,10 @@ Complete registry of committed Bitecho Improvement Proposals (**BIP-000** throug
 | **BIP-017b** | D44 / `v0.23.20` | `:consented` | [`bip-017b-v02320.edn`](bip-017b-v02320.edn) ([Spec](bip-017b-web-app-release-spec.md)) | `d8c0d3ca715f41e4012e8b0859ddf3cf9a7910a4818c48312eb17b968ac5c0da` |
 | **BIP-023** | Host Policy / `v0.23.21` | `:consented` | [`bip-023-gentoo-host-update-policy.edn`](bip-023-gentoo-host-update-policy.edn) ([Policy](bip-023-gentoo-host-update-policy.md)) | `8a7b7cadeb65234c724d4457ddcafd0a5d5377197af7e195d56d1e3bb1aa94bc` |
 
+## Active Staged Rollouts
+
+- **BIP-022 Stage D.1 (`v0.23.22+`):** Mesh-First Self-Update Fetch & Large-Body HTTP Fallback Hardening (Gate 4 spec SHA-256 `40eb2a19d25d0856ea8ad4efb1a8e181011c266137bd925679309b7c73a9684a`, implemented across `deploy/core.cljc`, `node_main.cljs`, `full_node_main.cljs`, `shell/updater.clj`, `shell/http.clj`, `shell/mesh.clj`, `shell/light_node.clj`, and `main.clj`; verified by `bitecho.d52-bip022-stage-d1-mesh-updater-test`).
+
 ## Verification
 
 This index is automatically verified against all committed `docs/bips/*.edn` files and their exact SHA-256 digests by `bitecho.d41-bip015-governance-and-docs-test/test-s-d41-3-docs-links-staleness-and-bip-index` (Rule 6).

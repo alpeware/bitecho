@@ -598,11 +598,15 @@
                                               :port target-port
                                               :path (str (.-pathname url-obj) (.-search url-obj))
                                               :method "GET"
-                                              :agent false
                                               :headers hdrs
                                               :timeout inactivity-ms}
-                                _ (when tls-sock
-                                    (gobj/set opts-obj "createConnection" (fn [_ _] tls-sock)))
+                                ;; F8: On Node 22, setting `agent: false` alongside `createConnection`
+                                ;; silently ignores `createConnection` and bypasses the proxy tunnel.
+                                ;; Omit `agent` when using a proxy `tls-sock`, and set `agent: false`
+                                ;; only for direct connections to avoid keep-alive pool reuse.
+                                _ (if tls-sock
+                                    (gobj/set opts-obj "createConnection" (fn [_ _] tls-sock))
+                                    (gobj/set opts-obj "agent" false))
                                 ^js req (.request
                                          client opts-obj
                                          (fn [^js res]

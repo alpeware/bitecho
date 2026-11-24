@@ -28,10 +28,13 @@
                       [bitecho.shell.http :as http-shell]
                       [bitecho.shell.infra :as infra]
                       [bitecho.shell.mesh :as mesh-shell]
+                      [bitecho.shell.updater :as updater-shell]
                       [clojure.java.io :as io]
                       [datachannel.api :as dc-api]]))
-  #?(:clj (:import [java.net URI]
+  #?(:clj (:import [java.io BufferedReader InputStreamReader OutputStream]
+                   [java.net InetAddress ServerSocket Socket URI]
                    [java.net.http HttpClient HttpRequest HttpResponse$BodyHandlers]
+                   [java.nio.charset StandardCharsets]
                    [java.nio.file Files]
                    [java.nio.file.attribute FileAttribute])))
 
@@ -740,6 +743,122 @@
              (is (= target-cid (deploy/sha256-hex (:bytes res))))))))))
 
 #?(:clj
+   (deftest jvm-updater-g4-c1-abort-range-resume-test
+     (testing "F3 & F5 (G4-C1): Real TCP mid-body abort at 512 KiB preserves :partial-bytes in JVM fetch-bytes! and completes bit-exact via 206 Range resume"
+       (let [total-sz 655360 ; 640 KiB
+             abort-at 524288 ; 512 KiB
+             payload (byte-array (map #(unchecked-byte (mod (* 7 %) 251)) (range total-sz)))
+             target-cid (deploy/sha256-hex payload)
+             auth-kp (gen-kp 5212)
+             ptr (make-signed-ptr auth-kp {:seq 12 :jvm-jar-cid target-cid :artifact-size-bytes total-sz})
+             req-log (atom [])
+             ^ServerSocket srv (ServerSocket. 0 16 (InetAddress/getByName "127.0.0.1"))
+             port (.getLocalPort srv)
+             running? (atom true)
+             srv-fut (future
+                       (while @running?
+                         (try
+                           (let [^Socket sock (.accept srv)]
+                             (try
+                               (let [in (BufferedReader. (InputStreamReader. (.getInputStream sock) StandardCharsets/UTF_8))
+                                     ^OutputStream out (.getOutputStream sock)
+                                     req-line (.readLine in)
+                                     hdrs (loop [acc {}]
+                                            (let [line (.readLine in)]
+                                              (if (or (nil? line) (str/blank? line))
+                                                acc
+                                                (let [[k v] (str/split line #":\s*" 2)]
+                                                  (recur (assoc acc (str/lower-case (str k)) (str v)))))))
+                                     range-hdr (get hdrs "range")]
+                                 (swap! req-log conj {:line req-line :range range-hdr})
+                                 (if-not range-hdr
+                                   ;; Request 1: Send 200 OK header with full Content-Length, write 512 KiB, then hard-close TCP!
+                                   (let [hdr-str (str "HTTP/1.1 200 OK\r\n"
+                                                      "Content-Length: " total-sz "\r\n"
+                                                      "Accept-Ranges: bytes\r\n"
+                                                      "ETag: \"" target-cid "\"\r\n"
+                                                      "Connection: close\r\n\r\n")]
+                                     (.write out (.getBytes hdr-str StandardCharsets/US_ASCII))
+                                     (.write out payload 0 abort-at)
+                                     (.flush out))
+                                   ;; Request 2+: Serve 206 Partial Content for requested Range
+                                   (let [[_ s-str e-str] (re-matches #"bytes=(\d+)-(\d+)" range-hdr)
+                                         s (Long/parseLong s-str)
+                                         e (min (dec total-sz) (Long/parseLong e-str))
+                                         part-len (inc (- e s))
+                                         hdr-str (str "HTTP/1.1 206 Partial Content\r\n"
+                                                      "Content-Length: " part-len "\r\n"
+                                                      "Content-Range: bytes " s "-" e "/" total-sz "\r\n"
+                                                      "Accept-Ranges: bytes\r\n"
+                                                      "ETag: \"" target-cid "\"\r\n"
+                                                      "Connection: close\r\n\r\n")]
+                                     (.write out (.getBytes hdr-str StandardCharsets/US_ASCII))
+                                     (.write out payload (int s) (int part-len))
+                                     (.flush out))))
+                               (finally
+                                 (try (.close sock) (catch Exception _ nil)))))
+                           (catch Exception _ nil))))]
+         (try
+           (let [fetch-fn #'updater-shell/fetch-bytes!
+                 client (HttpClient/newHttpClient)
+                 ptr-url (str "http://127.0.0.1:" port "/pointer.edn")
+                 st0 (deploy/init-light-updater-state
+                      {:node-id "g4-c1-jvm"
+                       :artifact-role :jvm-jar
+                       :current-version "0.23.22"
+                       :current-cid (deploy/sha256-hex (fressian/utf8->bytes "old"))
+                       :pointer-url ptr-url
+                       :relay-origins []
+                       :trusted-deploy-authorities #{(:pub-hex auth-kp)}})
+                 [st1 effs1] (deploy/reduce-light-update-tick st0 {:type :pointer-seen :pointer ptr :mesh-connected? false :generation 1})
+                 fetch1 (first (filter #(= :fetch-bundle-blob (:effect %)) effs1))
+                 ;; Step 1: Full GET aborts at 512 KiB -> JVM fetch-bytes! MUST preserve partial prefix!
+                 r1 (fetch-fn client (:url fetch1) 10000 nil)
+                 [st2 effs2] (deploy/reduce-light-update-tick st1 (cond-> {:type :blob-fetch-failed
+                                                                           :cid target-cid
+                                                                           :status (:status r1)
+                                                                           :reason (or (:error r1) "aborted")
+                                                                           :aborted-mid-body? (true? (:aborted-mid-body? r1))
+                                                                           :received-bytes (long (or (:received-bytes r1) 0))
+                                                                           :generation (:generation st1)}
+                                                                    (:total-bytes r1) (assoc :total-bytes (:total-bytes r1))
+                                                                    (:partial-bytes r1) (assoc :partial-bytes (:partial-bytes r1))
+                                                                    (:etag r1) (assoc :etag (:etag r1))))
+                 ;; Step 2: Retry timer fires -> Range: bytes=524288-655359
+                 [st3 effs3] (deploy/reduce-light-update-tick st2 {:type :http-retry-timer-fired :generation (:generation st2)})
+                 fetch2 (first (filter #(= :fetch-bundle-blob (:effect %)) effs3))
+                 r2 (fetch-fn client (:url fetch2) 10000 {:range (:range fetch2)})
+                 cr (deploy/parse-content-range (:content-range r2))
+                 [st4 effs4] (deploy/reduce-light-update-tick st3 {:type :http-range-chunk-fetched
+                                                                   :status 206
+                                                                   :start (:start cr)
+                                                                   :end (:end cr)
+                                                                   :total-bytes (:total-bytes cr)
+                                                                   :bytes (:bytes r2)
+                                                                   :etag (:etag r2)
+                                                                   :generation (:generation st3)})
+                 stage-eff (first (filter #(= :stage-light-bundle (:effect %)) effs4))]
+             (is (false? (:ok? r1)))
+             (is (true? (:aborted-mid-body? r1)))
+             (is (= abort-at (:received-bytes r1)))
+             (is (= abort-at (alength ^bytes (:partial-bytes r1)))
+                 "F5: JVM fetch-bytes! must preserve the 512 KiB partial prefix on mid-body abort")
+             (is (= :fetching-https-range (:phase st2)))
+             (is (some #(and (= :diagnose (:effect %)) (= :light-update-http-range-fallback (:reason %))) effs2))
+             (is (= [abort-at (dec total-sz)] (:range fetch2))
+                 "Resumed Range request must start at 524288 instead of 0")
+             (is (true? (:ok? r2)))
+             (is (= 206 (:status r2)))
+             (is (= :health-checking (:phase st4)))
+             (is (some? stage-eff))
+             (is (= target-cid (deploy/sha256-hex (:bytes stage-eff))))
+             (is (= 2 (count @req-log))))
+           (finally
+             (reset! running? false)
+             (try (.close srv) (catch Exception _ nil))
+             (future-cancel srv-fut)))))))
+
+#?(:clj
    (deftest stage-d1-closure-advanced-and-wiring-audit-test
      (testing "full_node_main.cljs uses bounded positional fh.read + semaphore, peer mesh chunk fetch, strict open-peer check, and positional Range serving"
        (let [full-src (slurp "src/bitecho/full_node_main.cljs")]
@@ -754,12 +873,14 @@
              "F1: Full node must query open DataChannel peers with :artifact-blob-chunk-req")
          (is (str/includes? full-src "list-open-peer-conns")
              "F6: Full node :mesh-connected? must require open peer DataChannels")))
-     (testing "node_main.cljs hardens http-get-bytes! with agent: false, Connection: close, aborted/complete checks, and req-id-only mesh dispatch"
+     (testing "node_main.cljs hardens http-get-bytes! with conditional agent: false (F8 proxy safety), Connection: close, aborted/complete checks, and req-id-only mesh dispatch"
        (let [node-src (slurp "src/bitecho/node_main.cljs")]
          (is (str/includes? node-src "\"aborted\""))
          (is (str/includes? node-src ":schedule-http-retry"))
          (is (str/includes? node-src ":http-range-chunk-fetched"))
-         (is (str/includes? node-src "--auto-update-force-http"))))
+         (is (str/includes? node-src "--auto-update-force-http"))
+         (is (str/includes? node-src "(if tls-sock")
+             "F8: http-get-bytes! must NOT set agent: false alongside createConnection when tls-sock is active")))
      (testing "JVM callers (shell/light_node.clj & main.clj) wire :mesh-connected-fn, :mesh-chunk-fetch-fn, and ByteArrayOutputStream partial-prefix preservation"
        (let [ln-src (slurp "src/bitecho/shell/light_node.clj")
              main-src (slurp "src/bitecho/main.clj")
