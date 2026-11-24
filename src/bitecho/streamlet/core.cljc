@@ -588,12 +588,23 @@
         (string? entry) (try (hex->bytes entry) (catch #?(:clj Exception :cljs :default) _ nil))
         :else nil))))
 
+(defn committee-at-epoch
+  "BIP-024 §2.5 (Blocker 4): Resolves the active committee entry from epoch-indexed
+   `:validator-set-history` `{epoch-effective -> {:committee [...] :quorum-threshold q ...}}`
+   for the given `epoch`. Returns nil if no entry is effective at or before `epoch`."
+  [validator-set-history epoch]
+  (when (and (map? validator-set-history) (seq validator-set-history) (integer? epoch))
+    (let [ep (long epoch)
+          eligible (filter #(<= (long %) ep) (keys validator-set-history))]
+      (when (seq eligible)
+        (get validator-set-history (apply max eligible))))))
+
 (defn valid-block-proposal?
   "Validates a block proposal event against state:
    - event and block must be maps
    - :peers-map must be non-empty
    - epoch must be a positive integer
-   - proposer must be a string, in :peers-map, and in the active Streamlet BFT :validators committee
+   - proposer must be a string, in :peers-map, and in the Streamlet BFT committee active at `(:epoch block)`
    - proposer must match expected round-robin leader for epoch
    - if :sender is present on event, must equal (:proposer block)
    - proposer signature must be valid Ed25519 signature verified by proposer's pubkey bytes"
@@ -601,10 +612,15 @@
   (boolean
    (when (and (map? state) (map? event) (map? (:block event)))
      (let [block (:block event)
-           validator-hexes (extract-validator-hexes state)
-           validator-set (set validator-hexes)
-           total-nodes (total-node-count state validator-hexes)
            epoch (:epoch block)
+           hist-entry (committee-at-epoch (:validator-set-history state) epoch)
+           validator-hexes (if hist-entry
+                             (vec (sort (:committee hist-entry)))
+                             (extract-validator-hexes state))
+           validator-set (set validator-hexes)
+           total-nodes (if hist-entry
+                         (count validator-hexes)
+                         (total-node-count state validator-hexes))
            proposer (:proposer block)
            sender (:sender event)
            sender-hex (cond
@@ -729,9 +745,42 @@
               (recur p-hash (inc depth) (conj visited p-hash) next-acc)))
           acc)))))
 
+(defn resolve-active-validators
+  "BIP-024 §2.5 Anti-Downgrade Rule: Static `:config :validators` fallback is permitted
+   strictly iff `last-finalized-epoch == 0`. Once `last-finalized-epoch >= 1`, nodes with
+   `:strict-validator-history? true` (or non-empty `:validator-set-history`) MUST reject
+   static fallback with `{:ok? false :error :static-validator-fallback-forbidden}`."
+  [state]
+  (let [history (:validator-set-history state)
+        last-fin (long (or (:last-finalized-epoch state) (:last-executed-finalized-epoch state) 0))
+        curr-ep (long (or (:epoch state) last-fin))
+        entry (committee-at-epoch history curr-ep)
+        strict? (or (boolean (:strict-validator-history? state))
+                    (boolean (get-in state [:config :strict-validator-history?])))]
+    (cond
+      entry
+      {:ok? true
+       :validators (vec (:committee entry))
+       :quorum-threshold (or (:quorum-threshold entry)
+                             (quorum-threshold (count (:committee entry))))}
+
+      (and strict? (>= last-fin 1))
+      {:ok? false
+       :error :static-validator-fallback-forbidden
+       :effects [{:effect :diagnose
+                  :reason :static-validator-fallback-forbidden
+                  :last-finalized-epoch last-fin}]}
+
+      :else
+      (let [vhex (extract-validator-hexes state)]
+        {:ok? true
+         :validators vhex
+         :quorum-threshold (quorum-threshold (total-node-count state vhex))}))))
+
 (defn verify-ancestor-quorum
   "Verifies that an ancestor entry contains a valid block proposal within max-epoch-catchup-delta
-   and a quorum of validly signed votes from Streamlet BFT committee members."
+   and a quorum of validly signed votes from the Streamlet BFT committee active at `(:epoch block)`
+   (resolving `:validator-set-history` for historical catchup across rotations, BIP-024 §2.5)."
   [state ancestor-entry]
   (if-not (and (map? ancestor-entry)
                (map? (:block ancestor-entry))
@@ -747,10 +796,16 @@
       (if-not proposal-ok?
         {:valid? false}
         (let [b-hash (hash-block block)
-              validator-hexes (extract-validator-hexes state)
+              hist-entry (committee-at-epoch (:validator-set-history state) (:epoch block))
+              validator-hexes (if hist-entry
+                                (vec (:committee hist-entry))
+                                (extract-validator-hexes state))
               validator-set (set validator-hexes)
-              total-nodes (total-node-count state validator-hexes)
-              threshold (quorum-threshold total-nodes)
+              total-nodes (if hist-entry
+                            (count validator-hexes)
+                            (total-node-count state validator-hexes))
+              threshold (or (:quorum-threshold hist-entry)
+                            (quorum-threshold total-nodes))
               verified-votes
               (into {}
                     (filter (fn [[voter-hex vote]]

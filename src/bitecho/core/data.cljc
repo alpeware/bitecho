@@ -469,7 +469,9 @@
       (some? (:pointer/leader-term pointer))
       (assoc :pointer/leader-term (long (:pointer/leader-term pointer)))
       (some? (:pointer/expires pointer))
-      (assoc :pointer/expires (long (:pointer/expires pointer))))))
+      (assoc :pointer/expires (long (:pointer/expires pointer)))
+      (some? (:pointer/expires-epoch pointer))
+      (assoc :pointer/expires-epoch (long (:pointer/expires-epoch pointer))))))
 
 (defn canonical-pointer-signing-payload
   "Returns the domain-separated canonical structure signed by `:pointer/authority`."
@@ -511,6 +513,47 @@
        (and norm-prev rot-sig)
        (assoc :prev-pubkey norm-prev
               :rotation-sig (str/lower-case rot-sig))))))
+
+(defn- normalize-spki-hex
+  "Canonicalizes 64-char raw or 88-char SPKI DER Ed25519 hex to lowercase 88-char SPKI DER hex."
+  [s]
+  (when-let [h (normalize-hex s)]
+    (cond
+      (and (= 88 (count h)) (str/starts-with? h ed25519-spki-prefix-hex)) h
+      (= 64 (count h)) (str ed25519-spki-prefix-hex h)
+      :else h)))
+
+(defn create-directory-entity-proof
+  "Constructs a BIP-024 `:directory-entity` quorum proof (`threshold >= 1`, supporting 1-of-1
+   sovereign individuals and k-of-n circles) with canonical 88-char SPKI DER pubkeys and
+   optional `:incoming-pop-signatures` for key rotation."
+  ([signer-maps subnet path seq-num target-cid owner-threshold owner-pubkeys]
+   (create-directory-entity-proof signer-maps subnet path seq-num target-cid owner-threshold owner-pubkeys nil))
+  ([signer-maps subnet path seq-num target-cid owner-threshold owner-pubkeys opts]
+   (let [norm-target (normalize-hex target-cid)
+         canon-owners (->> owner-pubkeys (keep normalize-spki-hex) distinct sort vec)
+         tuple ["bitecho-pointer-directory-entity-v2"
+                (str subnet)
+                (str path)
+                (long seq-num)
+                (or norm-target "tombstone")]
+         sigs (into (sorted-map)
+                    (keep (fn [{:keys [pubkey privkey]}]
+                            (when-let [pk (normalize-spki-hex pubkey)]
+                              [pk (str/lower-case (basalt/bytes->hex (crypto/sign-canonical privkey tuple)))])))
+                    signer-maps)
+         incoming-pops (when (seq (:incoming-signers opts))
+                         (into (sorted-map)
+                               (keep (fn [{:keys [pubkey privkey]}]
+                                       (when-let [pk (normalize-spki-hex pubkey)]
+                                         (let [pt ["bitecho-pointer-incoming-pop-v2" (str subnet) (str path) (long seq-num) pk]]
+                                           [pk (str/lower-case (basalt/bytes->hex (crypto/sign-canonical privkey pt)))]))))
+                               (:incoming-signers opts)))]
+     (cond-> {:proof/type :directory-entity
+              :owner-threshold (long owner-threshold)
+              :owner-pubkeys canon-owners
+              :signatures sigs}
+       incoming-pops (assoc :incoming-pop-signatures incoming-pops)))))
 
 (defn create-quorum-proof
   "Constructs a threshold `:quorum` proof signed by a collection of `{:pubkey :privkey}` signers."
@@ -634,6 +677,29 @@
                   {:ok? true :principal-type :quorum :signers signers :threshold threshold}
                   {:ok? false :error :quorum-proof-required}))
 
+              :directory-entity
+              (let [expected-auth (when (:authority principal) (normalize-spki-hex (:authority principal)))
+                    norm-auth (normalize-spki-hex auth)
+                    ms (or (:owner-multisig principal) (:owner-multisig ctx) {})
+                    owners (set (keep normalize-spki-hex (or (:pubkeys ms) (:owner-pubkeys proof) [])))
+                    threshold (long (or (:threshold ms) (:owner-threshold proof) 1))]
+                (cond
+                  (and expected-auth (not= norm-auth expected-auth))
+                  {:ok? false :error :unauthorized-pointer-authority}
+
+                  (not= :directory-entity (:proof/type proof))
+                  {:ok? false :error :directory-entity-proof-required}
+
+                  (or (empty? owners) (< threshold 1) (> threshold (count owners)))
+                  {:ok? false :error :invalid-owner-multisig}
+
+                  :else
+                  {:ok? true
+                   :principal-type :directory-entity
+                   :signers owners
+                   :threshold threshold
+                   :incoming-pubkeys (set (keep normalize-spki-hex (or (:incoming-pubkeys ctx) [])))}))
+
               :governance
               (let [gov (or (:governance principal) (:governance ctx) {})
                     gtype (:governance/type gov)
@@ -671,15 +737,76 @@
   [pointer acl-res ctx]
   (let [proof (or (:pointer/proof pointer) {})
         ptype (:proof/type proof)
-        target (normalize-hex (:pointer/target pointer))]
-    ;; Explicit tombstones (:pointer/target nil) may use :self or :quorum once ACL passes
-    (if (and (nil? target) (= ptype :self) (not= :quorum (:principal-type acl-res)))
+        target (normalize-hex (:pointer/target pointer))
+        path (str (:pointer/path pointer))
+        dir-path? (str/starts-with? path "dir/")
+        legacy-flat-dir? (and dir-path?
+                              (some? target)
+                              (= :pubkey (:principal-type acl-res))
+                              (not= path "dir/root")
+                              (not (str/starts-with? path "dir/root/"))
+                              (= 2 (count (str/split path #"/"))))]
+    ;; BIP-024 Blocker 2: dir/* paths MUST reject :proof/type :self for all hierarchical writes,
+    ;; dir/root, :directory-entity ACLs, and ALL tombstones!
+    ;; (n+1 legacy flat single-segment dir/<nick> with non-nil target & :pubkey ACL remains readable during n+1)
+    (cond
+      (and dir-path? (= ptype :self) (not legacy-flat-dir?))
+      {:ok? false :error :directory-self-proof-forbidden}
+
+      ;; Explicit tombstones (:pointer/target nil) may use :self on non-dir/* non-quorum paths
+      (and (nil? target) (= ptype :self)
+           (not= :quorum (:principal-type acl-res))
+           (not= :directory-entity (:principal-type acl-res)))
       {:ok? true}
+
+      :else
       (case ptype
         :self
-        (if (= :quorum (:principal-type acl-res))
+        (if (contains? #{:quorum :directory-entity} (:principal-type acl-res))
           {:ok? false :error :quorum-proof-required}
           {:ok? true})
+
+        :directory-entity
+        (let [sigs (:signatures proof)
+              allowed (set (keep normalize-spki-hex (or (:signers acl-res) (:owner-pubkeys proof) #{})))
+              threshold (long (or (:threshold acl-res) (:owner-threshold proof) 1))
+              tuple ["bitecho-pointer-directory-entity-v2"
+                     (str (:pointer/subnet pointer))
+                     path
+                     (long (:pointer/seq pointer 0))
+                     (or target "tombstone")]
+              valid-signers (keep (fn [[pk sig]]
+                                    (let [spki (normalize-spki-hex pk)]
+                                      (when (and spki
+                                                 (contains? allowed spki)
+                                                 (string? sig)
+                                                 (crypto/verify-with-fallback spki tuple sig))
+                                        spki)))
+                                  sigs)
+              incoming-pks (or (:incoming-pubkeys acl-res) #{})
+              pop-sigs (or (:incoming-pop-signatures proof) {})
+              incoming-ok? (every? (fn [pk]
+                                     (let [spki (normalize-spki-hex pk)
+                                           sig (or (get pop-sigs spki) (get pop-sigs pk))
+                                           pt ["bitecho-pointer-incoming-pop-v2"
+                                               (str (:pointer/subnet pointer))
+                                               path
+                                               (long (:pointer/seq pointer 0))
+                                               spki]]
+                                       (and spki (string? sig) (crypto/verify-with-fallback spki pt sig))))
+                                   incoming-pks)]
+          (cond
+            (< threshold 1)
+            {:ok? false :error :invalid-owner-multisig}
+
+            (< (count (distinct valid-signers)) threshold)
+            {:ok? false :error :insufficient-directory-entity-signatures}
+
+            (not incoming-ok?)
+            {:ok? false :error :missing-or-invalid-incoming-pop}
+
+            :else
+            {:ok? true}))
 
         :pop
         (let [agent-pub (normalize-hex (:agent-pubkey proof))
@@ -914,13 +1041,25 @@
        (if (and expected-subnet (not= (str expected-subnet) (str ptr-subnet)))
          {:ok? false :error :pointer-subnet-mismatch}
          (let [expires (:pointer/expires pointer)
+               expires-epoch (:pointer/expires-epoch pointer)
                now-ms (:now-ms ctx)
-               skew-ms (pointer-skew-tolerance-ms pointer ctx)]
-           (if (and (some? expires) (some? now-ms)
-                    (>= (long now-ms) (+ (long expires) skew-ms)))
+               current-epoch (:current-epoch ctx)
+               skew-ms (pointer-skew-tolerance-ms pointer ctx)
+               ms-expired? (and (some? expires) (some? now-ms)
+                                (>= (long now-ms) (+ (long expires) skew-ms)))
+               epoch-expired? (and (some? expires-epoch) (some? current-epoch)
+                                   (>= (long current-epoch) (long expires-epoch)))]
+           (if (or ms-expired? epoch-expired?)
              {:ok? false :error :pointer-expired}
-             (let [acl-res (if (or (nil? ctx) (not (contains? ctx :path-acl)))
+             (let [dir-path? (str/starts-with? (str (:pointer/path pointer)) "dir/")
+                   acl-res (cond
+                             (and (nil? ctx) (not dir-path?))
                              {:ok? true :principal-type :self-path-owner}
+
+                             (or (nil? ctx) (empty? (:path-acl ctx)))
+                             {:ok? false :error :missing-path-acl}
+
+                             :else
                              (authorize-path-acl pointer ctx))]
                (if-not (:ok? acl-res)
                  acl-res
@@ -1012,18 +1151,36 @@
                         (assoc-in [:pointers k] valid-ptr))]
             {:ok? true :applied? true :pointer valid-ptr :state st' :effects []}))))))
 
+(defn pin-checkpoint-descriptors
+  "BIP-024 §2.2 item 4: Pins verified genesis/checkpoint descriptor CIDs for `dir/root` and
+   `root/validators` exempt from rolling retention eviction so offline nodes can always restore."
+  [state cids]
+  (reduce (fn [st cid]
+            (if-let [ncid (normalize-hex cid)]
+              (-> st
+                  (update :blobs pin-blob ncid)
+                  (update :pinned-checkpoint-cids (fnil conj #{}) ncid))
+              st))
+          state
+          cids))
+
 (defn resolve-pointer
   "Resolves the active Pointer at `(subnet, path)`. Returns `nil` if absent, tombstoned (`:pointer/target nil`),
-   or expired relative to optional `now-ms` + skew tolerance."
+   or expired relative to optional `now-ms` + skew tolerance or `{:anchor-epoch ...}`."
   ([state subnet path]
    (resolve-pointer state subnet path nil))
-  ([state subnet path now-ms]
+  ([state subnet path time-or-opts]
    (let [data-st (or (:data state) state)
          ptr (get-in data-st [:pointers [(str subnet) (str path)]])]
      (when (and ptr (some? (:pointer/target ptr)))
-       (let [exp (:pointer/expires ptr)
-             skew (pointer-skew-tolerance-ms ptr nil)]
-         (if (and (some? exp) (some? now-ms) (>= (long now-ms) (+ (long exp) skew)))
+       (let [now-ms (if (map? time-or-opts) (:now-ms time-or-opts) time-or-opts)
+             anchor-epoch (when (map? time-or-opts) (or (:anchor-epoch time-or-opts) (:current-epoch time-or-opts)))
+             exp (:pointer/expires ptr)
+             exp-ep (:pointer/expires-epoch ptr)
+             skew (pointer-skew-tolerance-ms ptr nil)
+             ms-expired? (and (some? exp) (some? now-ms) (>= (long now-ms) (+ (long exp) skew)))
+             ep-expired? (and (some? exp-ep) (some? anchor-epoch) (>= (long anchor-epoch) (long exp-ep)))]
+         (if (or ms-expired? ep-expired?)
            nil
            ptr))))))
 

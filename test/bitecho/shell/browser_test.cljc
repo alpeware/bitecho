@@ -374,6 +374,12 @@
                          :sess-kennwort :kennwort-pubkey]
           independent-allowed-schema
           #{"pubkey" "pubkeys" "public-key" "public-keys" "public" "public-hex"
+            ;; BIP-024 non-liveness persistence keys (Blocker 2)
+            "entity-descriptors" "vaults" "validator-set-history" "network-genesis-cid"
+            "advisory-twin-pubkeys" "directory-cache-v2" "vault-seq" "committee"
+            "purpose-cid" "consent-round-cid" "custody-bucket" "owner-multisig"
+            "storage-accounting" "retention-policy" "entity-kind" "visibility"
+            "lease-holder-uri" "prev-descriptor-cid"
             "pubkey-hex" "public-key-hex" "pubkey-bytes" "public-key-bytes"
             "x25519-pubkey" "x25519-public-key" "ed25519-pubkey" "ed25519-public-key"
             "ed25519" "xpub" "ypub" "zpub" "tpub" "vpub" "upub" "vk" "verification-key"

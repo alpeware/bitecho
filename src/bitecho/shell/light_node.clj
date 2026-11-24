@@ -292,7 +292,8 @@
                                 "--amount" "--text" "--message" "--payload-hex"
                                 "--wait-open-ms" "--until-event"
                                 "--path" "--cid" "--file" "--out" "--out-file" "--hex" "--seq" "--authority" "--prefix"
-                                "--pin-version" "--auto-update-pointer" "--auto-update-interval-ms"}
+                                "--pin-version" "--auto-update-pointer" "--auto-update-interval-ms"
+                                "--cold-root-recovery-cid"}
         runner-valued-flags #{"--state-dir" "--control-port" "--bootstrap"}]
     (loop [rem (vec tokens)]
       (if (empty? rem)
@@ -392,6 +393,7 @@
          auto-update-pointer (extract-flag-value clean-args "--auto-update-pointer" nil)
          auto-update-interval-ms (extract-long-flag clean-args "--auto-update-interval-ms" nil)
          auto-update-force-http? (boolean (some #{"--auto-update-force-http"} clean-args))
+         cold-root-recovery-cid (extract-flag-value clean-args "--cold-root-recovery-cid" nil)
          trusted-deploy-auths-present? (boolean (some #(or (= % "--trusted-deploy-authorities")
                                                            (str/starts-with? (str %) "--trusted-deploy-authorities="))
                                                       clean-args))
@@ -463,6 +465,7 @@
        min-broadcast-seq (assoc :min-broadcast-seq min-broadcast-seq)
        min-balance (assoc :min-balance min-balance)
        after-ts (assoc :after-ts after-ts)
+       cold-root-recovery-cid (assoc :cold-root-recovery-cid cold-root-recovery-cid)
        subnet-id (assoc :subnet-id subnet-id)
        keystore-passphrase-file (assoc :keystore-passphrase-file keystore-passphrase-file)
        backup-slot (assoc :slot backup-slot)

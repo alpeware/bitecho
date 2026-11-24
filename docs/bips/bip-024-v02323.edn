@@ -1,0 +1,23 @@
+{:bip-id "BIP-024"
+ :bip/id "BIP-024"
+ :title "BIP-024: Circles on Subnets — Root Structure, Hierarchical Directory & Validator-Set Anchor"
+ :bip/title "BIP-024: Circles on Subnets — Root Structure, Hierarchical Directory & Validator-Set Anchor"
+ :version "v0.23.23"
+ :bip/version "v0.23.23"
+ :milestone "BIP-024"
+ :bip/milestone "BIP-024"
+ :bip/status :consented
+ :date "2026-11-24"
+ :subnet-id "bitecho.org/dev"
+ :bip/subnet-id "bitecho.org/dev"
+ :change-class :consensus-storage-rollout
+ :proposal-cid "048e907185153195ad968e76f6e5fc907903b05186c1e1f994e48d4493d003a2"
+ :draft-2-cid "048e907185153195ad968e76f6e5fc907903b05186c1e1f994e48d4493d003a2"
+ :consensus-impact :in-band-validator-rotation-and-persistent-vaults
+ :consensus-impact-note "Closes all 7 Blind Round-1 Digital Twin blockers: (1) removes devnet.bitecho.org <-> bitecho.org replay alias and enables :strict-network-uri? true + :network-genesis-cid binding on all networks; (2) separates :pointer/expires-epoch from now-ms, enforces fail-closed :path-acl + :directory-entity proofs (forbidding :self on dir/*), multi-segment /directory/v1/<net>/<path...> routing, canonical 88-char SPKI DER pubkeys, and browser allowed-persistence-keys; (3) adds dedicated [:vaults vault-id] SCI persistent vaults with monotonic :vault-seq, anti-malleability spend digest, 0-take :allocate restriction, :vault-spend-dac atomic revocation, and full 7-bucket 42B INV-C1 conservation; (4) wires in-band :rotate-validator-set & :cold-root-recovery receipts into Streamlet and checkpoint digest with epoch-indexed :validator-set-history catchup; (5) hardens hardware YubiKey faucet fail-closed (never trusting client authenticator_verified) with hardware uniqueness nullifiers and unlinkable blinded vouchers; (6) implements sovereign <net>/id/<pubkey-cid> roots, sociocratic double-linked consent with :purpose-cid (Simon's ratified amendment), 2027-06-30 human-anchor sunset, dissolve-circle, timelocked recovery, grow-only :advisory-twin-pubkeys, and :shared-encrypted privacy; (7) integrates deterministic CRN Monte Carlo harness + §8 fractal isolation foundations."
+ :consent-records [{:agent "simon" :role :human-anchor :verdict :consented :pubkey "302a300506032b657003210023f2014ffc18439ebf8731ba7906f03628c336b22327f91f1ec8739d8e570c3d" :note "5/5 Unanimous Real Stage 2 CONSENT with ratified :purpose-cid sociocratic amendment"}
+                   {:agent "axiom" :role :architect :verdict :consented :pubkey "302a300506032b6570032100b53afd55492fe17fca9d0ef0e07b367bf8333490e43b4ecd3610c12c8e6a79f8" :note "5/5 Unanimous Real Stage 2 CONSENT (with non-blocking devnet fleet cutover note for removing devnet <-> bitecho.org alias)"}
+                   {:agent "vector" :role :soak-tester :verdict :consented :pubkey "302a300506032b6570032100365bd3dc35b4f609d6ac147c129c5b791798765b181d53341e58d6fcf1c6cd62" :note "5/5 Unanimous Real Stage 2 CONSENT (all Round-1 falsifiers closed)"}
+                   {:agent "lumen" :role :steward :verdict :consented :pubkey "302a300506032b6570032100ccc35a321c00d0f05a056228a5d0682038235aea817a4a0bd4d6c681f5c970de" :note "5/5 Unanimous Real Stage 2 CONSENT"}
+                   {:agent "nexus" :role :builder-lead :verdict :consented :pubkey "302a300506032b65700321009b33a9ebd1866d6db419edabe2de9ee74c884dc86b4214f60e3a26f04cbd9cfc" :note "Proposer + 5/5 Unanimous Real Stage 2 CONSENT"}]
+ :open-findings []}

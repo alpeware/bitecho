@@ -222,24 +222,47 @@
           (pos? (:fee-ech acct))
           (zero? (:fee-ech acct))))))
 
+(defn valid-owner-multisig?
+  "Validates BIP-024 `:owner-multisig` `{:threshold k :pubkeys [pk1 ...]}` (`1 <= k <= (count pubkeys)`)."
+  [ms]
+  (boolean
+   (and (map? ms)
+        (valid-owner-pubkeys? (:pubkeys ms))
+        (integer? (:threshold ms))
+        (<= 1 (long (:threshold ms)) (count (:pubkeys ms))))))
+
+(def bip024-storage-mandatory-types
+  "BIP-024 descriptor types that strictly mandate `:storage-accounting` (Blocker 2)."
+  #{:directory/entity-descriptor
+    :root/validator-set-descriptor})
+
 (defn validate-pointer-discipline
   "Validates Simon's binding state discipline on any pointer or state descriptor.
+   Supports both legacy `:owner-pubkeys` and BIP-024 `:owner-multisig`, and mandates
+   `:storage-accounting` on `:directory/entity-descriptor` and `:root/validator-set-descriptor`.
    Returns {:ok? true} or {:ok? false :code <keyword> :detail <map>}."
   [descriptor]
-  (cond
-    (not (valid-owner-pubkeys? (:owner-pubkeys descriptor)))
-    {:ok? false :code :missing-state-owner :detail {:owner-pubkeys (:owner-pubkeys descriptor)}}
+  (let [has-valid-owner? (or (valid-owner-pubkeys? (:owner-pubkeys descriptor))
+                             (valid-owner-multisig? (:owner-multisig descriptor)))
+        storage-mandatory? (contains? bip024-storage-mandatory-types (:bitecho/type descriptor))]
+    (cond
+      (not has-valid-owner?)
+      {:ok? false :code :missing-state-owner :detail {:owner-pubkeys (:owner-pubkeys descriptor)
+                                                      :owner-multisig (:owner-multisig descriptor)}}
 
-    (not (valid-retention-policy? (:retention-policy descriptor)))
-    {:ok? false :code :missing-retention-policy :detail {:retention-policy (:retention-policy descriptor)}}
+      (not (valid-retention-policy? (:retention-policy descriptor)))
+      {:ok? false :code :missing-retention-policy :detail {:retention-policy (:retention-policy descriptor)}}
 
-    (and (contains? descriptor :storage-accounting)
-         (some? (:storage-accounting descriptor))
-         (not (valid-storage-accounting? (:storage-accounting descriptor))))
-    {:ok? false :code :invalid-storage-accounting :detail {:storage-accounting (:storage-accounting descriptor)}}
+      (and storage-mandatory? (not (valid-storage-accounting? (:storage-accounting descriptor))))
+      {:ok? false :code :missing-storage-accounting :detail {:storage-accounting (:storage-accounting descriptor)}}
 
-    :else
-    {:ok? true}))
+      (and (contains? descriptor :storage-accounting)
+           (some? (:storage-accounting descriptor))
+           (not (valid-storage-accounting? (:storage-accounting descriptor))))
+      {:ok? false :code :invalid-storage-accounting :detail {:storage-accounting (:storage-accounting descriptor)}}
+
+      :else
+      {:ok? true})))
 
 (defn be64-bytes
   "Encodes a non-negative 64-bit integer as 8 big-endian bytes."

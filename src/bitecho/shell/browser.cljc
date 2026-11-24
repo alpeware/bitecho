@@ -858,6 +858,12 @@
     "ice-creds"
     "a" "b" "c" "x" "y" "z" "k" "v" "foo" "bar" "baz" "qux"
     "ok" "ok?" "safe" "safe-field" "safe-val" "safe-value" "safe-data" "safe-map"
+    ;; BIP-024 non-liveness persistence keys (Blocker 2)
+    "entity-descriptors" "vaults" "validator-set-history" "network-genesis-cid"
+    "advisory-twin-pubkeys" "directory-cache-v2" "vault-seq" "committee"
+    "purpose-cid" "consent-round-cid" "custody-bucket" "owner-multisig"
+    "storage-accounting" "retention-policy" "entity-kind" "visibility"
+    "lease-holder-uri" "prev-descriptor-cid"
     "keep" "keep-me" "innocent" "control" "allowed"
     "harmless" "benign" "normal" "regular" "pub" "label" "name" "title" "description"
     "text" "message" "msg" "memo" "note" "notes" "comment" "summary" "count" "total" "index" "idx"
@@ -1011,6 +1017,9 @@
                       (allowed-persistence-key? (second k)))))) true
     (and (string? k)
          (boolean (re-matches #"^(?:[0-9a-fA-F]{64}|[0-9a-fA-F]{88})$" k))) true
+    (and (string? k)
+         (or (str/starts-with? k "vault:")
+             (boolean (re-matches #"^[a-z0-9.-]+\.[a-z]{2,}/[a-zA-Z0-9._/-]+$" k)))) true
     :else
     (boolean
      (when-let [canon (canonical-key-name k)]

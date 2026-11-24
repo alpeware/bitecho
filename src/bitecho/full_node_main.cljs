@@ -2353,20 +2353,25 @@
     (send-json! res 405 {:ok false :error "method-not-allowed"})
     (let [subpath (subs clean-path (count "/directory/v1/"))
           segs (remove str/blank? (str/split subpath #"/"))
-          [net-uri nick] (if (>= (count segs) 2)
-                           [(first segs) (second segs)]
-                           [(or (:domain (:config rt)) "bitecho.org") (first segs)])
+          ;; BIP-024 §2.2 (Blocker 2): Multi-segment /directory/v1/<network-uri>/<path...> routing
+          [net-uri dir-path] (if (>= (count segs) 2)
+                               [(first segs) (str/join "/" (rest segs))]
+                               [(or (:domain (:config rt)) "bitecho.org") (first segs)])
           now-ms (.now js/Date)
-          r (when nick
-              (let [r1 (resolve-path-blob! rt (str "dir/" net-uri "/" nick) now-ms)]
-                (if (:ok? r1) r1 (resolve-path-blob! rt (str "dir/" nick) now-ms))))]
+          r (when dir-path
+              (let [r1 (resolve-path-blob! rt (str "dir/" net-uri "/" dir-path) now-ms)]
+                (if (:ok? r1) r1 (resolve-path-blob! rt (str "dir/" dir-path) now-ms))))]
       (if (and r (:ok? r))
-        (let [buf (u8->buf (get-in r [:blob :blob/bytes]))]
-          (.writeHead res 200 #js {"Content-Type" "application/json; charset=utf-8"
+        (let [blob (:blob r)
+              buf (u8->buf (:blob/bytes blob))
+              ct (if (= "application/fressian" (:blob/media-type blob))
+                   "application/fressian"
+                   "application/json; charset=utf-8")]
+          (.writeHead res 200 #js {"Content-Type" ct
                                    "Cache-Control" "public, max-age=60"
                                    "Content-Length" (.-length buf)})
           (if (= method "HEAD") (.end res) (.end res buf)))
-        (send-json! res 404 {:ok false :error "nickname-not-found" :nickname nick :network_uri net-uri})))))
+        (send-json! res 404 {:ok false :error "nickname-not-found" :nickname dir-path :path dir-path :network_uri net-uri})))))
 
 (defn- handle-faucet-endpoint!
   [req res rt faucet-atom clean-path query-str method]
@@ -2408,12 +2413,22 @@
                    cred-hash (or (get body-json "credential_id_hash") (get body-json "credential_hash"))
                    claimant-pk (or (get body-json "claimant_pubkey") (get body-json "pubkey"))
                    claim-net (or (get body-json "network_uri") (:network-uri config) "devnet.bitecho.org")
-                   auth-ver (get body-json "authenticator_verified?" (get body-json "authenticator_verified" true))
-                   claim-req {:nonce nonce
-                              :credential-id-hash cred-hash
-                              :claimant-pubkey claimant-pk
-                              :network-uri claim-net
-                              :authenticator-verified? auth-ver}
+                   raw-att (get body-json "attestation")
+                   attestation (when (map? raw-att)
+                                 {:fmt (get raw-att "fmt")
+                                  :aaguid (get raw-att "aaguid")
+                                  :x5c (get raw-att "x5c")
+                                  :hw-pubkey (or (get raw-att "hw_pubkey") (get raw-att "hw-pubkey"))
+                                  :assertion-sig (or (get raw-att "assertion_sig") (get raw-att "assertion-sig"))
+                                  :claimant-pop-sig (or (get raw-att "claimant_pop_sig") (get raw-att "claimant-pop-sig"))
+                                  :cred-hash-bound? (boolean (or (get raw-att "cred_hash_bound?") (get raw-att "cred-hash-bound?")))})
+                   ;; BIP-024 §2.9 (Blocker 5 / MUT-11): Fail closed; NEVER trust client-supplied authenticator_verified
+                   claim-req (cond-> {:nonce nonce
+                                      :credential-id-hash cred-hash
+                                      :claimant-pubkey claimant-pk
+                                      :network-uri claim-net
+                                      :authenticator-verified? false}
+                               attestation (assoc :attestation attestation))
                    res-box (atom nil)
                    _ (swap! faucet-atom
                             (fn [st]

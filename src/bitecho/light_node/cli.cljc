@@ -244,6 +244,7 @@
    "--path" "--cid" "--file" "--out" "--local-only" "--hex" "--seq" "--authority" "--prefix" "--endpoint" "--candidates"
    "--nickname" "--name" "--domain"
    "--pin-version" "--auto-update-pointer" "--auto-update-interval-ms" "--auto-update-force-http" "--trusted-deploy-authorities"
+   "--cold-root-recovery-cid"
    "--node-role" "--retention-max-entries" "--retention-max-bytes" "--rotate-every"
    "--grace-epochs" "--lkg-cid" "--walk-depth-cap" "--owner-pubkey" "--cache-incentive"
    "--chunk-size" "--concurrency" "--resume-dir" "--max-bytes"

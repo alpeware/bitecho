@@ -2018,12 +2018,22 @@
                     cred-hash (or (get body-json "credential_id_hash") (get body-json "credential_hash"))
                     claimant-pk (or (get body-json "claimant_pubkey") (get body-json "pubkey"))
                     claim-net (or (get body-json "network_uri") (:network-uri config) "devnet.bitecho.org")
-                    auth-ver (get body-json "authenticator_verified?" (get body-json "authenticator_verified" true))
-                    claim-req {:nonce nonce
-                               :credential-id-hash cred-hash
-                               :claimant-pubkey claimant-pk
-                               :network-uri claim-net
-                               :authenticator-verified? auth-ver}
+                    raw-att (get body-json "attestation")
+                    attestation (when (map? raw-att)
+                                  {:fmt (get raw-att "fmt")
+                                   :aaguid (get raw-att "aaguid")
+                                   :x5c (get raw-att "x5c")
+                                   :hw-pubkey (or (get raw-att "hw_pubkey") (get raw-att "hw-pubkey"))
+                                   :assertion-sig (or (get raw-att "assertion_sig") (get raw-att "assertion-sig"))
+                                   :claimant-pop-sig (or (get raw-att "claimant_pop_sig") (get raw-att "claimant-pop-sig"))
+                                   :cred-hash-bound? (boolean (or (get raw-att "cred_hash_bound?") (get raw-att "cred-hash-bound?")))})
+                    ;; BIP-024 §2.9 (Blocker 5 / MUT-11): Fail closed; NEVER trust client-supplied authenticator_verified
+                    claim-req (cond-> {:nonce nonce
+                                       :credential-id-hash cred-hash
+                                       :claimant-pubkey claimant-pk
+                                       :network-uri claim-net
+                                       :authenticator-verified? false}
+                                attestation (assoc :attestation attestation))
                     res-box (atom nil)
                     _ (swap! faucet-atom
                              (fn [st]
@@ -2083,29 +2093,33 @@
                       :response/body (json/write-str {"ok" false "error" "method-not-allowed"})})
       (let [subpath (subs clean-path (count "/directory/v1/"))
             segs (remove str/blank? (str/split subpath #"/"))
-            [net-uri nick] (if (>= (count segs) 2)
-                             [(first segs) (second segs)]
-                             [(or (:network-uri config) "bitecho.org") (first segs)])
-            resolved (when (and target-rt nick)
-                       (let [r1 (infra/resolve-path-blob! target-rt (str "dir/" net-uri "/" nick) now-ms)]
+            ;; BIP-024 §2.2 (Blocker 2): Multi-segment /directory/v1/<network-uri>/<path...> routing
+            [net-uri dir-path] (if (>= (count segs) 2)
+                                 [(first segs) (str/join "/" (rest segs))]
+                                 [(or (:network-uri config) "bitecho.org") (first segs)])
+            resolved (when (and target-rt dir-path)
+                       (let [r1 (infra/resolve-path-blob! target-rt (str "dir/" net-uri "/" dir-path) now-ms)]
                          (if (:ok? r1)
                            r1
-                           (infra/resolve-path-blob! target-rt (str "dir/" nick) now-ms))))]
+                           (infra/resolve-path-blob! target-rt (str "dir/" dir-path) now-ms))))]
         (if (and resolved (:ok? resolved))
           (let [blob (:blob resolved)
                 bs (or (:blob/bytes blob)
                        (when-let [^File f (:file resolved)]
                          (when (.exists f) (Files/readAllBytes (.toPath f))))
-                       (byte-array 0))]
+                       (byte-array 0))
+                ct (if (= "application/fressian" (:blob/media-type blob))
+                     "application/fressian"
+                     "application/json; charset=utf-8")]
             (send-response exchange
                            {:response/status 200
-                            :response/headers {"Content-Type" "application/json; charset=utf-8"
+                            :response/headers {"Content-Type" ct
                                                "Cache-Control" "public, max-age=60"}
                             :response/body (if (= method :HEAD) nil bs)}))
           (send-response exchange
                          {:response/status 404
                           :response/headers {"Content-Type" "application/json; charset=utf-8"}
-                          :response/body (json/write-str {"ok" false "error" "nickname-not-found" "nickname" nick "network_uri" net-uri})}))))))
+                          :response/body (json/write-str {"ok" false "error" "nickname-not-found" "nickname" dir-path "path" dir-path "network_uri" net-uri})}))))))
 
 (defn handle-artifact-endpoint
   "Dispatches HTTP /artifact/v1/* endpoints (BIP-004 D30):

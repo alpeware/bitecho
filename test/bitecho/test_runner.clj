@@ -39,6 +39,8 @@
             [bitecho.d50-bip022-stage-b-contracts-test]
             [bitecho.d51-bip022-stage-c-state-identity-test]
             [bitecho.d52-bip022-stage-d1-mesh-updater-test]
+            [bitecho.d54-bip024-circles-on-subnets-test]
+            [bitecho.d54-bip024-integration-test]
             [bitecho.e2e.d29-remediation-scenario-test]
             [bitecho.economy.account-fuzz-test]
             [bitecho.economy.account-test]

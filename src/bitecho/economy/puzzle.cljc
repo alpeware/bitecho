@@ -307,6 +307,7 @@
      'reduce (coll reduce)
      'every? (coll every?)
      'some (coll some)
+     'distinct (coll distinct)
      'range safe-range}))
 
 (defn- to-cond-map
@@ -326,103 +327,130 @@
 
 (defn- normalize-conditions
   [res env-ctx]
-  (cond
-    (true? res)
-    {:valid? true
-     :conditions [{:type :release :receiver (:receiver env-ctx) :amount (long (or (:amount env-ctx) 0))}]}
+  (let [vault-mode? (boolean (:vault-mode? env-ctx))]
+    (cond
+      (true? res)
+      (if vault-mode?
+        {:valid? false :error :vault-requires-explicit-conditions}
+        {:valid? true
+         :conditions [{:type :release :receiver (:receiver env-ctx) :amount (long (or (:amount env-ctx) 0))}]})
 
-    (or (false? res) (nil? res))
-    {:valid? false :error :puzzle-returned-false}
+      (or (false? res) (nil? res))
+      {:valid? false :error :puzzle-returned-false}
 
-    (or (map? res) (vector? res) (seq? res))
-    (let [raw-conds (cond (map? res) (or (:conditions res) [res])
-                          (or (vector? res) (seq? res)) (vec res)
-                          :else [res])
-          conditions (mapv to-cond-map raw-conds)
-          env-epoch (long (or (:epoch env-ctx) 0))
-          env-amount (long (or (:amount env-ctx) 0))]
-      (if-not (and (sequential? conditions) (seq conditions) (every? map? conditions))
-        {:valid? false :error :invalid-puzzle-conditions}
-        (loop [rem conditions
-               out-conds []]
-          (if (empty? rem)
-            (let [final-outs (if (empty? out-conds)
-                               [{:type :release :receiver (:receiver env-ctx) :amount env-amount}]
-                               out-conds)
-                  total-released (reduce + 0 (map (comp long :amount) final-outs))]
-              (if (> total-released env-amount)
-                {:valid? false :error :puzzle-overspend-violation}
-                (let [remainder (- env-amount total-released)
-                      final-conditions (cond-> final-outs
-                                         (and (pos? remainder) (string? (:payer env-ctx)))
-                                         (conj {:type :refund-remainder
-                                                :receiver (:payer env-ctx)
-                                                :amount remainder}))]
-                  {:valid? true :conditions final-conditions})))
-            (let [c (first rem)
-                  c-type (:type c)]
-              (case c-type
-                (:assert-epoch-gte :assert-after-epoch)
-                (let [min-ep (long (or (:epoch c) (:min-epoch c) 0))]
-                  (if (< env-epoch min-ep)
-                    {:valid? false :error :epoch-before-min}
-                    (recur (rest rem) out-conds)))
+      (or (map? res) (vector? res) (seq? res))
+      (let [raw-conds (cond (map? res) (or (:conditions res) [res])
+                            (or (vector? res) (seq? res)) (vec res)
+                            :else [res])
+            conditions (mapv to-cond-map raw-conds)
+            env-epoch (long (or (:epoch env-ctx) 0))
+            env-amount (long (or (:amount env-ctx) 0))]
+        (if-not (and (sequential? conditions) (seq conditions) (every? map? conditions))
+          {:valid? false :error :invalid-puzzle-conditions}
+          (loop [rem conditions
+                 out-conds []]
+            (if (empty? rem)
+              (if vault-mode?
+                (let [total-out (reduce + 0 (map (comp long :amount) out-conds))]
+                  (if (or (empty? out-conds) (not= total-out env-amount))
+                    {:valid? false :error :vault-conservation-mismatch}
+                    {:valid? true :conditions out-conds}))
+                (let [final-outs (if (empty? out-conds)
+                                   [{:type :release :receiver (:receiver env-ctx) :amount env-amount}]
+                                   out-conds)
+                      total-released (reduce + 0 (map (comp long :amount) final-outs))]
+                  (if (> total-released env-amount)
+                    {:valid? false :error :puzzle-overspend-violation}
+                    (let [remainder (- env-amount total-released)
+                          final-conditions (cond-> final-outs
+                                             (and (pos? remainder) (string? (:payer env-ctx)))
+                                             (conj {:type :refund-remainder
+                                                    :receiver (:payer env-ctx)
+                                                    :amount remainder}))]
+                      {:valid? true :conditions final-conditions}))))
+              (let [c (first rem)
+                    c-type (:type c)]
+                (case c-type
+                  (:assert-epoch-gte :assert-after-epoch)
+                  (let [min-ep (long (or (:epoch c) (:min-epoch c) 0))]
+                    (if (< env-epoch min-ep)
+                      {:valid? false :error :epoch-before-min}
+                      (recur (rest rem) out-conds)))
 
-                (:assert-epoch-lte :assert-before-epoch)
-                (let [max-ep (long (or (:epoch c) (:max-epoch c) #?(:clj Long/MAX_VALUE :cljs js/Number.MAX_SAFE_INTEGER)))]
-                  (if (> env-epoch max-ep)
-                    {:valid? false :error :epoch-after-max}
-                    (recur (rest rem) out-conds)))
+                  (:assert-epoch-lte :assert-before-epoch)
+                  (let [max-ep (long (or (:epoch c) (:max-epoch c) #?(:clj Long/MAX_VALUE :cljs js/Number.MAX_SAFE_INTEGER)))]
+                    (if (> env-epoch max-ep)
+                      {:valid? false :error :epoch-after-max}
+                      (recur (rest rem) out-conds)))
 
-                :assert-sig
-                (let [pk (:pubkey c)
-                      sig (:signature c)
-                      raw-msg (or (:message c) (:msg c))
-                      bs (cond
-                           (fressian/bytes? raw-msg) raw-msg
-                           (string? raw-msg) (fressian/utf8->bytes (str raw-msg))
-                           :else (fressian/encode-canonical raw-msg))
-                      valid-sig? (try
-                                   (boolean (and (string? pk) (string? sig) (crypto/verify pk bs sig)))
-                                   (catch #?(:clj Throwable :cljs :default) _ false))]
-                  (if-not valid-sig?
-                    {:valid? false :error :invalid-signature-condition}
-                    (recur (rest rem) out-conds)))
+                  :assert-sig
+                  (let [pk (:pubkey c)
+                        sig (:signature c)
+                        raw-msg (or (:message c) (:msg c))
+                        bs (cond
+                             (fressian/bytes? raw-msg) raw-msg
+                             (string? raw-msg) (fressian/utf8->bytes (str raw-msg))
+                             :else (fressian/encode-canonical raw-msg))
+                        valid-sig? (try
+                                     (boolean (and (string? pk) (string? sig) (crypto/verify pk bs sig)))
+                                     (catch #?(:clj Throwable :cljs :default) _ false))]
+                    (if-not valid-sig?
+                      {:valid? false :error :invalid-signature-condition}
+                      (recur (rest rem) out-conds)))
 
-                :assert-sha256
-                (let [raw-pre (or (:preimage c) (:deliverable c))
-                      bs (cond
-                           (fressian/bytes? raw-pre) raw-pre
-                           (string? raw-pre) (fressian/utf8->bytes (str raw-pre))
-                           :else (fressian/encode-canonical raw-pre))
-                      computed (str/lower-case (basalt/bytes->hex (crypto/sha256 bs)))
-                      expected (str/lower-case (str (or (:hash c) (:deliverable-hash c))))]
-                  (if (not= computed expected)
-                    {:valid? false :error :hash-mismatch-condition}
-                    (recur (rest rem) out-conds)))
+                  :assert-sha256
+                  (let [raw-pre (or (:preimage c) (:deliverable c))
+                        bs (cond
+                             (fressian/bytes? raw-pre) raw-pre
+                             (string? raw-pre) (fressian/utf8->bytes (str raw-pre))
+                             :else (fressian/encode-canonical raw-pre))
+                        computed (str/lower-case (basalt/bytes->hex (crypto/sha256 bs)))
+                        expected (str/lower-case (str (or (:hash c) (:deliverable-hash c))))]
+                    (if (not= computed expected)
+                      {:valid? false :error :hash-mismatch-condition}
+                      (recur (rest rem) out-conds)))
 
-                :release
-                (let [recv (:receiver c)
-                      amt (long (or (:amount c) (:value c) 0))]
-                  (if-not (and (string? recv) (not (str/blank? recv)) (pos? amt))
-                    {:valid? false :error :invalid-puzzle-conditions}
-                    (recur (rest rem) (conj out-conds {:type :release :receiver recv :amount amt}))))
+                  :release
+                  (let [recv (:receiver c)
+                        amt (long (or (:amount c) (:value c) 0))]
+                    (if-not (and (string? recv) (not (str/blank? recv)) (pos? amt))
+                      {:valid? false :error :invalid-puzzle-conditions}
+                      (recur (rest rem) (conj out-conds {:type :release :receiver recv :amount amt}))))
 
-                :refund
-                (let [recv (or (:receiver c) (:payer env-ctx))
-                      amt (long (or (:amount c) (:value c) 0))]
-                  (if-not (and (string? recv)
-                               (not (str/blank? recv))
-                               (pos? amt)
-                               (or (nil? (:payer env-ctx)) (= recv (:payer env-ctx))))
-                    {:valid? false :error :invalid-puzzle-conditions}
-                    (recur (rest rem) (conj out-conds {:type :refund :receiver recv :amount amt}))))
+                  :allocate
+                  (let [target-v (:target-vault-id c)
+                        amt (long (or (:amount c) (:value c) 0))]
+                    (if-not (and vault-mode? (string? target-v) (not (str/blank? target-v)) (pos? amt))
+                      {:valid? false :error :invalid-puzzle-conditions}
+                      (recur (rest rem) (conj out-conds {:type :allocate :target-vault-id target-v :amount amt}))))
 
-                ;; Unrecognized condition type
-                {:valid? false :error :invalid-puzzle-conditions}))))))
+                  :relock
+                  (let [amt (long (or (:amount c) (:value c) 0))
+                        next-ph (:next-puzzle-hash c)]
+                    (if-not (and vault-mode?
+                                 (not (neg? amt))
+                                 (string? next-ph)
+                                 (not (str/blank? next-ph)))
+                      {:valid? false :error :invalid-puzzle-conditions}
+                      (recur (rest rem) (conj out-conds {:type :relock :amount amt :next-puzzle-hash (str/lower-case (str/trim next-ph))}))))
 
-    :else
-    {:valid? false :error :puzzle-returned-invalid-type}))
+                  (:refund :refund-remainder)
+                  (if vault-mode?
+                    {:valid? false :error :vault-refund-forbidden}
+                    (let [recv (or (:receiver c) (:payer env-ctx))
+                          amt (long (or (:amount c) (:value c) 0))]
+                      (if-not (and (string? recv)
+                                   (not (str/blank? recv))
+                                   (pos? amt)
+                                   (or (nil? (:payer env-ctx)) (= recv (:payer env-ctx))))
+                        {:valid? false :error :invalid-puzzle-conditions}
+                        (recur (rest rem) (conj out-conds {:type :refund :receiver recv :amount amt})))))
+
+                  ;; Unrecognized condition type
+                  {:valid? false :error :invalid-puzzle-conditions}))))))
+
+      :else
+      {:valid? false :error :puzzle-returned-invalid-type})))
 
 (defn eval-puzzle
   "Evaluates a ChiaLisp-style SCI puzzle source against a solution in an env context.

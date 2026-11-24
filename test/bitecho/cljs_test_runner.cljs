@@ -17,6 +17,7 @@
             [bitecho.d50-bip022-stage-b-contracts-test]
             [bitecho.d51-bip022-stage-c-state-identity-test]
             [bitecho.d52-bip022-stage-d1-mesh-updater-test]
+            [bitecho.d54-bip024-circles-on-subnets-test]
             [bitecho.economy.account-test]
             [bitecho.economy.burn-test]
             [bitecho.economy.treasury-test]
@@ -83,6 +84,7 @@
              'bitecho.d50-bip022-stage-b-contracts-test
              'bitecho.d51-bip022-stage-c-state-identity-test
              'bitecho.d52-bip022-stage-d1-mesh-updater-test
+             'bitecho.d54-bip024-circles-on-subnets-test
              'bitecho.v02322-hotfix-test))
 
 (set! *main-cli-fn* -main)

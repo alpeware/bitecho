@@ -643,4 +643,13 @@
               p-default (shell/parse-light-node-args ["serve" "--auto-update-pointer" "https://bitecho.org/pointer.edn"])]
           (is (contains? flags "--auto-update-force-http"))
           (is (true? (:auto-update-force-http? p-force)))
-          (is (not (:auto-update-force-http? p-default))))))))
+          (is (not (:auto-update-force-http? p-default)))))
+
+      (testing "BIP-024 --cold-root-recovery-cid flag inventory & parsing"
+        (let [flags (set cli/known-command-flags)
+              cid (apply str (repeat 64 "c"))
+              p-rec (shell/parse-light-node-args ["serve" "--cold-root-recovery-cid" cid])
+              p-default (shell/parse-light-node-args ["serve"])]
+          (is (contains? flags "--cold-root-recovery-cid"))
+          (is (= cid (:cold-root-recovery-cid p-rec)))
+          (is (not (contains? p-default :cold-root-recovery-cid))))))))

@@ -754,7 +754,9 @@
                      :nodes {:node1 {:pubkey v1-pub :ip "127.0.0.1" :port 5000 :agent-port 5010}
                              :node2 {:pubkey v2-pub :ip "127.0.0.1" :port 5002 :agent-port 5012}
                              :node3 {:pubkey v3-pub :ip "127.0.0.1" :port 5004 :agent-port 5014}}}
-          alice-st0 (-> (light-node/init-light-state {:pubkey-hex alice-pub} {:bootstrap bootstrap})
+          alice-st0 (-> (light-node/init-light-state {:pubkey-hex alice-pub}
+                                                     {:bootstrap (assoc bootstrap :network-uri "devnet.bitecho.org")
+                                                      :network-uri "devnet.bitecho.org"})
                         (assoc :account {:balance 100000 :spendable 100000 :seq 0 :deps []}))
           ;; Step 1: Alice executes transfer command
           tf-res (light-node/handle-command alice-st0
@@ -762,7 +764,8 @@
                                              "receiver" bob-pub
                                              "amount" 25000
                                              "seq" 1
-                                             "burn" 500}
+                                             "burn" 500
+                                             "network_uri" "devnet.bitecho.org"}
                                             (:private alice-kp))
           _ (is (true? (get-in tf-res [:response "ok"])))
           _ (is (= 2 (count (:net-envelopes tf-res))))

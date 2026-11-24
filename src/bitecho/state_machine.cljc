@@ -4,8 +4,10 @@
    Portable across Clojure (JVM) and ClojureScript (Node/Browser)."
   (:refer-clojure :exclude [bytes?])
   (:require [bitecho.basalt.core :as basalt]
+            [bitecho.circles.vault :as vault]
             [bitecho.config :as config]
             [bitecho.contagion.core :as contagion]
+            [bitecho.core.circle :as circle]
             [bitecho.crypto :as crypto]
             [bitecho.deploy.core :as deploy]
             [bitecho.economy.account :as account]
@@ -1024,6 +1026,8 @@
                                                   (contains? ancestor-rids rid)))))
                                   (sort-by (fn [r]
                                              [(case (:type r)
+                                                :cold-root-recovery -2
+                                                :rotate-validator-set -1
                                                 :reconfigure-membership -1
                                                 :register-home-set 0
                                                 :burn 1
@@ -2205,37 +2209,43 @@
 
                                        :refund-intent
                                        (let [escrow-id (:escrow-id r)
+                                             vault-id (or (:vault-id r) escrow-id)
                                              escrow (get-in s [:escrows escrow-id])
                                              sender (:sender r)
                                              sender-hex (when sender (if (string? sender) sender (basalt/bytes->hex sender)))]
-                                         (if (and escrow (= :locked (:status escrow)))
-                                           (let [payer (:payer escrow)
-                                                 receiver (:receiver escrow)
-                                                 expires-epoch (long (or (:expires-epoch escrow) 0))
-                                                 amount (long (:amount escrow))
-                                                 timeout? (and (> closing-ep expires-epoch)
-                                                               (or (nil? sender-hex) (contains? #{payer receiver} sender-hex)))
-                                                 receiver-voluntary? (= sender-hex receiver)]
-                                             (if (or timeout? receiver-voluntary?)
-                                               (let [payer-acct (get-in s [:ledger payer]
-                                                                        (account/map->AccountState {:balance 0 :seq 0 :deps []}))
-                                                     new-payer (assoc payer-acct :balance (+ (or (:balance payer-acct) 0) amount))
-                                                     updated-escrow (assoc escrow
-                                                                           :status :refunded
-                                                                           :settled-epoch closing-ep
-                                                                           :refund-amount amount
-                                                                           :refund-reason (if receiver-voluntary? :receiver-voluntary :timeout))
-                                                     [next-settled-ids next-settled-ord] (fifo-track (:settled-escrow-ids s)
-                                                                                                     (:settled-escrow-order s)
-                                                                                                     escrow-id
-                                                                                                     max-tracked)]
-                                                 (-> s
-                                                     (assoc-in [:ledger payer] new-payer)
-                                                     (assoc-in [:escrows escrow-id] updated-escrow)
-                                                     (assoc :settled-escrow-ids next-settled-ids
-                                                            :settled-escrow-order next-settled-ord)))
-                                               (update s :failed-receipts-count (fnil inc 0))))
-                                           (update s :failed-receipts-count (fnil inc 0))))
+                                         (if (contains? (:vaults s) vault-id)
+                                           ;; BIP-024 §2.8.2 (MUT-10): :refund-intent is unconditionally forbidden on persistent vaults
+                                           (-> s
+                                               (update :failed-receipts-count (fnil inc 0))
+                                               (update-in [:diagnostics :vault-refund-forbidden] (fnil inc 0)))
+                                           (if (and escrow (= :locked (:status escrow)))
+                                             (let [payer (:payer escrow)
+                                                   receiver (:receiver escrow)
+                                                   expires-epoch (long (or (:expires-epoch escrow) 0))
+                                                   amount (long (:amount escrow))
+                                                   timeout? (and (> closing-ep expires-epoch)
+                                                                 (or (nil? sender-hex) (contains? #{payer receiver} sender-hex)))
+                                                   receiver-voluntary? (= sender-hex receiver)]
+                                               (if (or timeout? receiver-voluntary?)
+                                                 (let [payer-acct (get-in s [:ledger payer]
+                                                                          (account/map->AccountState {:balance 0 :seq 0 :deps []}))
+                                                       new-payer (assoc payer-acct :balance (+ (or (:balance payer-acct) 0) amount))
+                                                       updated-escrow (assoc escrow
+                                                                             :status :refunded
+                                                                             :settled-epoch closing-ep
+                                                                             :refund-amount amount
+                                                                             :refund-reason (if receiver-voluntary? :receiver-voluntary :timeout))
+                                                       [next-settled-ids next-settled-ord] (fifo-track (:settled-escrow-ids s)
+                                                                                                       (:settled-escrow-order s)
+                                                                                                       escrow-id
+                                                                                                       max-tracked)]
+                                                   (-> s
+                                                       (assoc-in [:ledger payer] new-payer)
+                                                       (assoc-in [:escrows escrow-id] updated-escrow)
+                                                       (assoc :settled-escrow-ids next-settled-ids
+                                                              :settled-escrow-order next-settled-ord)))
+                                                 (update s :failed-receipts-count (fnil inc 0))))
+                                             (update s :failed-receipts-count (fnil inc 0)))))
 
                                        :register-home-set
                                        (let [tuple [(:callee r) (or (:epoch r) closing-ep)]
@@ -2337,6 +2347,84 @@
 
                                            :else
                                            (update s :failed-receipts-count (fnil inc 0))))
+
+                                       :vault-create
+                                       (let [res (vault/create-vault s (assoc r :created-epoch closing-ep))]
+                                         (if (:ok? res)
+                                           (:state res)
+                                           (-> (:state res)
+                                               (update :failed-receipts-count (fnil inc 0)))))
+
+                                       :vault-spend
+                                       (let [res (vault/spend-vault s (assoc r :epoch closing-ep))]
+                                         (if (:ok? res)
+                                           (:state res)
+                                           (-> (:state res)
+                                               (update :failed-receipts-count (fnil inc 0)))))
+
+                                       :vault-spend-dac-issue
+                                       (let [res (vault/issue-vault-spend-dac s (assoc r :issued-epoch closing-ep))]
+                                         (if (:ok? res)
+                                           (:state res)
+                                           (-> (:state res)
+                                               (update :failed-receipts-count (fnil inc 0)))))
+
+                                       :vault-spend-dac-spend
+                                       (let [res (vault/spend-via-vault-dac s (assoc r :epoch closing-ep))]
+                                         (if (:ok? res)
+                                           (:state res)
+                                           (-> (:state res)
+                                               (update :failed-receipts-count (fnil inc 0)))))
+
+                                       :vault-spend-dac-revoke
+                                       (let [res (vault/revoke-vault-spend-dac s (:dac-id r))]
+                                         (if (:ok? res)
+                                           (:state res)
+                                           (-> (:state res)
+                                               (update :failed-receipts-count (fnil inc 0)))))
+
+                                       :rotate-validator-set
+                                       (let [desc (:descriptor r)
+                                             root-ms (or (:root-owner-multisig s)
+                                                         (get-in s [:config :root-owner-multisig]))
+                                             lead (long (or (get-in s [:config :validator-activation-lead-epochs]) 6))
+                                             v-res (circle/verify-validator-set-descriptor
+                                                    desc
+                                                    {:root-owner-multisig root-ms
+                                                     :network-uri (or (:network-uri s) (get-in s [:config :network-uri]))
+                                                     :network-genesis-cid (or (:network-genesis-cid s) (get-in s [:config :network-genesis-cid]))
+                                                     :advisory-twin-pubkeys (:advisory-twin-pubkeys s)
+                                                     :lead-epochs lead})]
+                                         (if (:ok? v-res)
+                                           (let [ep-eff (:epoch-effective v-res)
+                                                 comm (:committee v-res)
+                                                 entry {:committee comm
+                                                        :quorum-threshold (:quorum-threshold v-res)
+                                                        :descriptor-cid (:cid v-res)}
+                                                 s1 (assoc-in s [:validator-set-history ep-eff] entry)]
+                                             (if (<= ep-eff b-epoch)
+                                               (assoc s1 :validators comm)
+                                               s1))
+                                           (-> s
+                                               (update :failed-receipts-count (fnil inc 0))
+                                               (update-in [:diagnostics (or (:error v-res) :invalid-validator-rotation)] (fnil inc 0)))))
+
+                                       :cold-root-recovery
+                                       (let [bundle (:bundle r)
+                                             root-ms (or (:root-owner-multisig s)
+                                                         (get-in s [:config :root-owner-multisig]))
+                                             rec-res (circle/apply-cold-root-recovery
+                                                      s
+                                                      bundle
+                                                      {:root-owner-multisig root-ms
+                                                       :network-uri (or (:network-uri s) (get-in s [:config :network-uri]))
+                                                       :network-genesis-cid (or (:network-genesis-cid s) (get-in s [:config :network-genesis-cid]))
+                                                       :advisory-twin-pubkeys (:advisory-twin-pubkeys s)})]
+                                         (if (:ok? rec-res)
+                                           (:state rec-res)
+                                           (-> s
+                                               (update :failed-receipts-count (fnil inc 0))
+                                               (update-in [:diagnostics (or (:error rec-res) :invalid-cold-root-recovery)] (fnil inc 0)))))
 
                                        :reconfigure-membership
                                        (if (and (verify-reconfigure-membership? s r)
@@ -3718,14 +3806,27 @@
                     (or (:mesh-nodes snapshot)
                         (get-in snapshot [:config :mesh-nodes])
                         canon-vals))
-        payload {:ledger canon-ledger
-                 :escrows canon-escrows
-                 :total-minted (long (or (:total-minted snapshot) 0))
-                 :mint-dust (long (or (:mint-dust snapshot) 0))
-                 :unclaimed-mint (long (or (:unclaimed-mint snapshot) 0))
-                 :sunset-custody-burned (long (or (:sunset-custody-burned snapshot) 0))
-                 :validators canon-vals
-                 :mesh-nodes canon-mesh}]
+        payload (cond-> {:ledger canon-ledger
+                         :escrows canon-escrows
+                         :total-minted (long (or (:total-minted snapshot) 0))
+                         :mint-dust (long (or (:mint-dust snapshot) 0))
+                         :unclaimed-mint (long (or (:unclaimed-mint snapshot) 0))
+                         :sunset-custody-burned (long (or (:sunset-custody-burned snapshot) 0))
+                         :validators canon-vals
+                         :mesh-nodes canon-mesh}
+                  (seq (:vaults snapshot))
+                  (assoc :vaults (into (sorted-map)
+                                       (map (fn [[k v]] [(str k) (into (sorted-map) v)]))
+                                       (:vaults snapshot)))
+                  (seq (:validator-set-history snapshot))
+                  (assoc :validator-set-history
+                         (into (sorted-map)
+                               (map (fn [[ep entry]]
+                                      [(long ep)
+                                       {:committee (vec (sort (map str (:committee entry))))
+                                        :quorum-threshold (long (or (:quorum-threshold entry) 0))
+                                        :descriptor-cid (str (or (:descriptor-cid entry) ""))}]))
+                               (:validator-set-history snapshot))))]
     (basalt/bytes->hex (crypto/sha256 (fressian/encode-canonical payload)))))
 
 (defn checkpoint-signing-bytes

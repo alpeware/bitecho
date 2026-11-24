@@ -96,17 +96,23 @@
     "global"
     "validator-core"})
 
+(def ^:private dns-root-uri-pattern
+  #"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$")
+
 (defn root-subnet-id?
-  "Returns true if sid is a recognized root subnet identifier."
+  "Returns true if sid is a recognized root subnet identifier or any valid DNS-scoped
+   external root network URI (BIP-024 §8.1)."
   [sid]
-  (contains? root-subnet-ids (str sid)))
+  (let [s (str sid)]
+    (or (contains? root-subnet-ids s)
+        (boolean (and (not (str/includes? s "/"))
+                      (re-matches dns-root-uri-pattern (str/lower-case (str/trim s))))))))
 
 (defn equivalent-subnet-id?
   "Returns true if subnet identifiers s1 and s2 refer to the same subnet.
-   During N/N+1 rolling upgrades, legacy 'global' is equivalent to the active
-   network's root URI (e.g. 'devnet.bitecho.org'), while distinct explicit
-   network URIs ('devnet.bitecho.org' vs 'testnet.bitecho.org' vs 'mainnet.bitecho.org')
-   are NEVER equivalent."
+   BIP-024 §2.3.1 (Blocker 1): `devnet.bitecho.org` and `bitecho.org` are NEVER equivalent.
+   During n+1 migration, only `bitecho.org` <-> `mainnet.bitecho.org` are aliased when
+   active-network-uri is mainnet, and legacy `global` maps to the active network root."
   ([s1 s2]
    (equivalent-subnet-id? s1 s2 "devnet.bitecho.org"))
   ([s1 s2 active-network-uri]
@@ -114,8 +120,8 @@
          b (str (or s2 "global"))
          net-uri (str (or (resolve-network-uri active-network-uri) "devnet.bitecho.org"))
          active-roots (cond-> #{"global" net-uri}
-                        (contains? #{"devnet.bitecho.org" "bitecho.org"} net-uri)
-                        (into ["devnet.bitecho.org" "bitecho.org"]))]
+                        (contains? #{"bitecho.org" "mainnet.bitecho.org"} net-uri)
+                        (into ["bitecho.org" "mainnet.bitecho.org"]))]
      (or (= a "*")
          (= b "*")
          (= a b)
@@ -175,6 +181,13 @@
    :max-ancestor-sync-depth       16
    :max-propose-wire-bytes        32768
    :max-receipts-per-block        32
+   ;; BIP-024 Circles on Subnets defaults
+   :root-multisig-threshold       2
+   :validator-activation-lead-epochs 6
+   :max-dac-spend-per-epoch-bps   500
+   :max-vaults                    4096
+   :min-vault-balance-ech         1000
+   :human-anchor-sunset-epoch     20270630
    ;; TURN relay configuration (host, port, credentials, force-relay)
    :turn-config                  nil})
 
@@ -206,6 +219,7 @@
   (merge default-config
          {:network              :devnet
           :network-uri          "devnet.bitecho.org"
+          :strict-network-uri?  true
           :epoch-length-ms      10000
           :tick-interval-ms     10000
           :murmur-k             2
@@ -234,6 +248,7 @@
    (merge default-config
           {:network              :devnet
            :network-uri          "devnet.bitecho.org"
+           :strict-network-uri?  true
            :nodes                devnet-6-nodes
            :validator-count      6
            :quorum-threshold     4
@@ -259,6 +274,7 @@
          {:network                  :testnet
           :network-uri              "testnet.bitecho.org"
           :subnet-id                "testnet.bitecho.org"
+          :strict-network-uri?      true
           :settlement-take-bps      150
           :treasury-trailing-epochs 336
           :burn-floor               50}))

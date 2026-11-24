@@ -341,6 +341,8 @@
          treasury-sk (kp->sk treasury-kp)
          claimant-kp (crypto/generate-keypair (str "d32-p5-claimant-" cred-suffix))
          claimant-pk (kp->pk-hex claimant-kp)
+         hw-kp (crypto/generate-keypair (str "d32-p5-hw-" cred-suffix))
+         hw-pk (kp->pk-hex hw-kp)
          cred-hash (basalt/bytes->hex (crypto/sha256 (fressian/utf8->bytes (str "yubikey-cred-" cred-suffix))))
          net-uri "devnet.bitecho.org"
          st0 (faucet/init-faucet-state {:network-uri net-uri
@@ -349,23 +351,37 @@
                                         :drip-amount-ech 1000000})
          ch1 (faucet/issue-faucet-challenge st0 {:network-uri net-uri} now-ms)
          nonce1 (get-in ch1 [:challenge :nonce])
+         att1 (faucet/build-test-hardware-attestation
+               {:hw-privkey (kp->sk hw-kp)
+                :hw-pubkey hw-pk
+                :claimant-privkey (kp->sk claimant-kp)
+                :claimant-pubkey claimant-pk
+                :nonce nonce1
+                :network-uri net-uri})
          claim1 (faucet/reduce-faucet-claim
                  (:state ch1)
-                 {:nonce nonce1
-                  :credential-id-hash cred-hash
-                  :claimant-pubkey claimant-pk
-                  :network-uri net-uri
-                  :authenticator-verified? true}
+                 (assoc att1
+                        :nonce nonce1
+                        :credential-id-hash cred-hash
+                        :claimant-pubkey claimant-pk
+                        :network-uri net-uri)
                  (+ now-ms 1000))
          ch2 (faucet/issue-faucet-challenge (:state claim1) {:network-uri net-uri} (+ now-ms 2000))
          nonce2 (get-in ch2 [:challenge :nonce])
+         att2 (faucet/build-test-hardware-attestation
+               {:hw-privkey (kp->sk hw-kp)
+                :hw-pubkey hw-pk
+                :claimant-privkey (kp->sk claimant-kp)
+                :claimant-pubkey claimant-pk
+                :nonce nonce2
+                :network-uri net-uri})
          claim2 (faucet/reduce-faucet-claim
                  (:state ch2)
-                 {:nonce nonce2
-                  :credential-id-hash cred-hash
-                  :claimant-pubkey claimant-pk
-                  :network-uri net-uri
-                  :authenticator-verified? true}
+                 (assoc att2
+                        :nonce nonce2
+                        :credential-id-hash cred-hash
+                        :claimant-pubkey claimant-pk
+                        :network-uri net-uri)
                  (+ now-ms 3000))
          expected-path (str "faucet/" net-uri "/claims/" cred-hash)]
      (and (true? (:ok? claim1))
@@ -624,12 +640,25 @@
               ch-resp (.send client ch-req (HttpResponse$BodyHandlers/ofString))
               ch-json (json/read-str (.body ch-resp))
               nonce (get-in ch-json ["challenge" "nonce"])
-              ;; 2. Submit claim
+              ;; 2. Submit claim with verified hardware attestation (BIP-024 fail-closed)
+              hw-kp (crypto/generate-keypair "d32-s4-hw")
+              att1 (:attestation (faucet/build-test-hardware-attestation
+                                  {:hw-privkey (kp->sk hw-kp)
+                                   :hw-pubkey (kp->pk-hex hw-kp)
+                                   :claimant-privkey (kp->sk claimant-kp)
+                                   :claimant-pubkey claimant-pk
+                                   :nonce nonce
+                                   :network-uri "devnet.bitecho.org"}))
               claim-body (json/write-str {"nonce" nonce
                                           "credential_id_hash" cred-hash
                                           "claimant_pubkey" claimant-pk
                                           "network_uri" "devnet.bitecho.org"
-                                          "authenticator_verified" true})
+                                          "attestation" {"fmt" (:fmt att1)
+                                                         "aaguid" (:aaguid att1)
+                                                         "x5c" (:x5c att1)
+                                                         "hw_pubkey" (:hw-pubkey att1)
+                                                         "assertion_sig" (:assertion-sig att1)
+                                                         "claimant_pop_sig" (:claimant-pop-sig att1)}})
               cl-req (-> (HttpRequest/newBuilder (URI/create (str "http://127.0.0.1:" port "/faucet/v1/claim")))
                          (.header "Content-Type" "application/json")
                          (.POST (HttpRequest$BodyPublishers/ofString claim-body StandardCharsets/UTF_8))

@@ -4380,10 +4380,17 @@
                                       (when (and acct (seq (:deps acct))) (:deps acct))
                                       (when-let [prev (:last-transfer-hash state)] [prev])
                                       []))
+                        net-uri (or (get cmd-map "network_uri")
+                                    (:network-uri cmd-map)
+                                    (:network-uri state)
+                                    (get-in state [:bootstrap :network-uri])
+                                    (config/resolve-network-uri (:subnet-id state)))
                         res (build-transfer-gossip-envelope
                              (:pubkey state)
                              privkey-bytes
-                             {:receiver receiver :amount amount :seq seq-num :deps deps}
+                             (cond-> {:receiver receiver :amount amount :seq seq-num :deps deps}
+                               (and (string? net-uri) (not (str/blank? net-uri)))
+                               (assoc :network-uri net-uri))
                              burn-amt)
                         deliver-payload (mapv long (fressian/utf8->bytes (pr-str {:transfer (into {} (:transfer res))})))
                         deliver-env (wrap-agent-event
