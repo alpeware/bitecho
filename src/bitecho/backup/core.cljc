@@ -330,6 +330,44 @@
         (and k-norm (contains? tombstone-set k-norm))
         (and v-norm (contains? tombstone-set v-norm)))))
 
+(defn- lookup-sid-entry
+  "Looks up session-id `sid` in map `m`, accepting both string and keyword keys safely
+   (CLJS `sorted-map` safe via `safe-map-get`, handling `(js->clj opts :keywordize-keys true)`)."
+  [m sid]
+  (when (map? m)
+    (or (safe-map-get m sid)
+        (when (string? sid) (safe-map-get m (keyword sid)))
+        (when (keyword? sid) (safe-map-get m (name sid))))))
+
+(defn- extract-observed-tx-seq
+  "Extracts observed high-water tx-seq from an `observed-hwm` entry, accepting kebab-keyword,
+   snake_keyword, string keys, or a direct numeric high-water value."
+  [obs]
+  (cond
+    (number? obs) (long obs)
+    (map? obs)
+    (max (long (or (safe-map-get obs :observed-peer-high-seq)
+                   (safe-map-get obs :observed_peer_high_seq)
+                   (safe-map-get obs "observed-peer-high-seq")
+                   (safe-map-get obs "observed_peer_high_seq")
+                   0))
+         (long (or (safe-map-get obs :local-tx-seq)
+                   (safe-map-get obs :local_tx_seq)
+                   (safe-map-get obs "local-tx-seq")
+                   (safe-map-get obs "local_tx_seq")
+                   0))
+         (long (or (safe-map-get obs :tx-seq)
+                   (safe-map-get obs :tx_seq)
+                   (safe-map-get obs "tx-seq")
+                   (safe-map-get obs "tx_seq")
+                   0))
+         (long (or (safe-map-get obs :high-water)
+                   (safe-map-get obs :high_water)
+                   (safe-map-get obs "high-water")
+                   (safe-map-get obs "high_water")
+                   0)))
+    :else 0))
+
 (defn merge-restored-state
   "Pure restore reducer shared identically across Browser, Node.js, JVM, and Full Node (`A3`, Lumen `seq 7`).
    Enforces:
@@ -340,7 +378,13 @@
   [local-state restored-payload observed-hwm]
   (let [base-local (apply dissoc (or local-state {}) excluded-runtime-liveness-keys)
         payload (or restored-payload {})
-        obs-hwm (or observed-hwm {})
+        obs-hwm (let [raw (or observed-hwm {})]
+                  (or (when (map? raw)
+                        (or (safe-map-get raw :observed-hwm)
+                            (safe-map-get raw :observed_hwm)
+                            (safe-map-get raw "observed-hwm")
+                            (safe-map-get raw "observed_hwm")))
+                      raw))
 
         ;; 1. BIP-016 Grow-Only Tombstones
         merged-petname-tombs (merge-petname-tombstones
@@ -377,15 +421,14 @@
         {:keys [sessions session-hwm effects quarantined-ids healthy-ids]}
         (reduce
          (fn [acc sid]
-           (let [loc-s (safe-map-get local-sessions sid)
-                 res-s (safe-map-get restored-sessions sid)
-                 obs (safe-map-get obs-hwm sid)
-                 loc-h (safe-map-get local-hwm sid)
-                 pay-h (safe-map-get payload-hwm sid)
+           (let [loc-s (lookup-sid-entry local-sessions sid)
+                 res-s (lookup-sid-entry restored-sessions sid)
+                 obs (lookup-sid-entry obs-hwm sid)
+                 loc-h (lookup-sid-entry local-hwm sid)
+                 pay-h (lookup-sid-entry payload-hwm sid)
                  r-tx (long (or (safe-map-get res-s :tx-seq) 0))
                  l-tx (long (or (safe-map-get loc-s :tx-seq) 0))
-                 obs-tx (max (long (or (safe-map-get obs :observed-peer-high-seq) 0))
-                             (long (or (safe-map-get obs :local-tx-seq) 0))
+                 obs-tx (max (extract-observed-tx-seq obs)
                              (long (or (safe-map-get loc-h :tx-seq) 0))
                              l-tx)
                  merged-s (merge (or loc-s {}) (or res-s {}))

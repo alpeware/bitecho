@@ -695,3 +695,34 @@
         (is (= 1 (count (:self-owner-blobs (:state res-gc)))))
         (is (= 1 (count (get-in (:state res-gc) [:data :blobs :entries]))))
         (is (= 8 (get-in (:state res-gc) [:diagnostics :self-path-owner-blob-gc-evicted])))))))
+
+(deftest test-merge-restored-state-keywordized-js-observed-hwm-quarantine
+  (testing "Lumen seq 7 quarantine works identically when JS/JSON callers pass keywordized session-id keys and snake_case inner HWM keys"
+    (let [restored-payload {:seq 5
+                            :sessions {"sess-s1-healthy" {:tx-seq 10 :rx-high-seq 4}
+                                       "sess-s2-stale" {:tx-seq 3 :rx-high-seq 2}}}
+          ;; Matches (js->clj #js {"sess-s2-stale" #js {"observed_peer_high_seq" 12}} :keywordize-keys true)
+          js-keywordized-hwm {:sess-s2-stale {:observed_peer_high_seq 12}}
+          merged (backup/merge-restored-state {} restored-payload js-keywordized-hwm)
+          s1 (get-in merged [:state :sessions "sess-s1-healthy"])
+          s2 (get-in merged [:state :sessions "sess-s2-stale"])]
+      (is (= 1 (get-in merged [:summary :quarantined-sessions])))
+      (is (= 1 (get-in merged [:summary :healthy-sessions])))
+      (is (= ["sess-s2-stale"] (get-in merged [:summary :quarantined-session-ids])))
+      (is (true? (:quarantined? s2)))
+      (is (true? (:rekey-required? s2)))
+      (is (true? (:tx-tainted? s2)))
+      (is (= 12 (:tx-seq s2)))
+      (is (not (:quarantined? s1)))
+      (is (= 10 (:tx-seq s1)))
+      (is (some #(= :session-rollback-quarantined (:reason %)) (:effects merged))))
+    ;; Also verify string session-id + snake_case string inner keys (raw JSON parse without keywordization)
+    (let [restored-payload {:seq 5
+                            :sessions {"sess-s2-stale" {:tx-seq 3 :rx-high-seq 2}}}
+          raw-json-hwm {"sess-s2-stale" {"local_tx_seq" 9}}
+          merged (backup/merge-restored-state {} restored-payload raw-json-hwm)
+          s2 (get-in merged [:state :sessions "sess-s2-stale"])]
+      (is (= 1 (get-in merged [:summary :quarantined-sessions])))
+      (is (true? (:quarantined? s2)))
+      (is (true? (:rekey-required? s2)))
+      (is (= 9 (:tx-seq s2))))))
