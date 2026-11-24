@@ -726,3 +726,70 @@
       (is (true? (:quarantined? s2)))
       (is (true? (:rekey-required? s2)))
       (is (= 9 (:tx-seq s2))))))
+
+(deftest test-key-provider-async-sign-protocol-contract
+  (testing "F6b: IAsyncKeyProvider/sign-async is uniformly supported by memory and locked providers"
+    (let [seed #?(:clj (byte-array (map unchecked-byte (range 32)))
+                  :cljs (js/Uint8Array. (clj->js (vec (range 32)))))
+          mem-kp (kp/make-memory-key-provider seed :encrypted-keystore-0600)
+          locked-kp (kp/make-locked-key-provider (kp/public-key mem-kp))
+          msg (fressian/utf8->bytes "async-sign-test")]
+      (is (satisfies? kp/IAsyncKeyProvider mem-kp))
+      (is (satisfies? kp/IAsyncKeyProvider locked-kp))
+      #?(:clj
+         (do
+           (is (= 64 (alength ^bytes (kp/sign-async mem-kp msg))))
+           (is (= {:ok? false :error :hardware-unlock-required}
+                  (kp/sign-async locked-kp msg))))
+         :cljs
+         (do
+           (is (instance? js/Promise (kp/sign-async mem-kp msg)))
+           (is (instance? js/Promise (kp/sign-async locked-kp msg))))))))
+
+#?(:clj
+   (deftest test-jvm-corrupt-state-auto-restore-trigger
+     (testing "F3b: Corrupt local state.fressian triggers automatic backup-restore on startup with counted diagnostics"
+       (let [temp-dir (.toFile (Files/createTempDirectory "bitecho-stagec-autorestore-" (into-array FileAttribute [])))
+             state-file (.getAbsolutePath (io/file temp-dir "state.fressian"))
+             seed (byte-array (map unchecked-byte (range 10 42)))
+             provider (kp/make-memory-key-provider seed :encrypted-keystore-0600)
+             identity {:key-provider provider
+                       :pubkey-hex (kp/public-key provider)
+                       :privkey-bytes seed
+                       :keystore-security-tier :encrypted-keystore-0600}
+             orig-state {:pubkey (kp/public-key provider)
+                         :subnet-id "bitecho.org/infra"
+                         :petnames (sorted-map "alice" "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                         :backup-seq 2}
+             packed (backup/pack-encrypted-backup {:key-provider provider
+                                                   :state orig-state
+                                                   :subnet-id "bitecho.org/infra"
+                                                   :seq 3
+                                                   :node-role :jvm
+                                                   :now-ms 1700000009000})]
+         ;; 1. Auto-restore succeeds when backup is available -> restores petnames & emits :local-state-corrupt-auto-restored
+         (let [st-atom (atom {:pubkey (kp/public-key provider)
+                              :petnames (sorted-map)
+                              :pending-corrupt-auto-restore? true
+                              :diagnostics {:local-state-corrupt-fallback 1}})
+               res (shell-light/maybe-auto-restore-corrupt-state!
+                    st-atom identity state-file "http://127.0.0.1:9999"
+                    {:fetch-backup-fn (fn [_relay _path]
+                                        {:ok? true :blob (:blob packed) :pointer (:pointer packed)})})]
+           (is (true? (:ok? res)))
+           (is (= :local-state-corrupt-auto-restored (:reason res)))
+           (is (nil? (:pending-corrupt-auto-restore? @st-atom)))
+           (is (= 1 (get-in @st-atom [:diagnostics :local-state-corrupt-auto-restored])))
+           (is (= "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                  (get-in @st-atom [:petnames "alice"]))))
+         ;; 2. Auto-restore when no backup exists -> fails cleanly with counted :local-state-corrupt-no-backup
+         (let [st-atom2 (atom {:pubkey (kp/public-key provider)
+                               :pending-corrupt-auto-restore? true
+                               :diagnostics {:local-state-corrupt-fallback 1}})
+               res2 (shell-light/maybe-auto-restore-corrupt-state!
+                     st-atom2 identity nil "http://127.0.0.1:9999"
+                     {:fetch-backup-fn (fn [_relay _path] {:ok? false :error :backup-not-found})})]
+           (is (false? (:ok? res2)))
+           (is (= :local-state-corrupt-no-backup (:reason res2)))
+           (is (nil? (:pending-corrupt-auto-restore? @st-atom2)))
+           (is (= 1 (get-in @st-atom2 [:diagnostics :local-state-corrupt-no-backup]))))))))

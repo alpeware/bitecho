@@ -922,6 +922,7 @@
   [initial-state identity load-diags]
   (let [id-diags (vec (or (:diagnostics identity) []))
         all-diags (into id-diags (or load-diags []))
+        corrupt-fallback? (boolean (some #(= :local-state-corrupt-fallback (:reason %)) load-diags))
         st-with-diags (reduce (fn [acc d]
                                 (if-let [r (:reason d)]
                                   (update-in acc [:diagnostics r] (fnil inc 0))
@@ -933,11 +934,72 @@
         (println (json/write-str {"event" "diagnostic"
                                   "reason" (name (or (:reason d) :unknown))
                                   "detail" (or (:detail d) (:path d) "")}))))
-    (assoc st-with-diags
-           :keystore-security-tier
-           (or (:keystore-security-tier identity)
-               (:keystore-security-tier st-with-diags)
-               :legacy-file-0600))))
+    (cond-> (assoc st-with-diags
+                   :keystore-security-tier
+                   (or (:keystore-security-tier identity)
+                       (:keystore-security-tier st-with-diags)
+                       :legacy-file-0600))
+      corrupt-fallback? (assoc :pending-corrupt-auto-restore? true))))
+
+(defn maybe-auto-restore-corrupt-state!
+  "BIP-022 Stage C §3.2.2 (F3b): when `state-atom` has `:pending-corrupt-auto-restore? true`
+   after a corrupt `state.fressian` fallback, automatically attempts on-network `backup-restore`
+   for `storage/<64-hex-pubkey>/state-backup-v1`. Emits counted `:local-state-corrupt-auto-restored`,
+   `:local-state-corrupt-no-backup`, or `:local-state-corrupt-auto-restore-failed` loudly (Rule 5)
+   without ever crashing startup."
+  [state-atom identity state-file relay-url opts]
+  (when (:pending-corrupt-auto-restore? @state-atom)
+    (let [state @state-atom
+          kp (or (:key-provider identity)
+                 (when (:privkey-bytes identity)
+                   (kp/make-memory-key-provider
+                    (:privkey-bytes identity)
+                    (or (:keystore-security-tier identity) :legacy-file-0600))))
+          slot (or (:slot opts) "state-backup-v1")
+          fetch-fn (or (:fetch-backup-fn opts) default-http-fetch-backup-pointer-and-blob!)
+          emit-diag! (fn [reason detail]
+                       (binding [*out* *err*]
+                         (println (json/write-str {"event" "diagnose"
+                                                   "reason" (name reason)
+                                                   "detail" (str (or detail ""))}))))]
+      (if (or (nil? kp) (str/blank? (str relay-url)))
+        (do
+          (swap! state-atom #(-> (dissoc % :pending-corrupt-auto-restore?)
+                                 (update-in [:diagnostics :local-state-corrupt-auto-restore-failed] (fnil inc 0))))
+          (emit-diag! :local-state-corrupt-auto-restore-failed "missing-relay-or-key-provider")
+          {:ok? false :reason :local-state-corrupt-auto-restore-failed})
+        (let [own-pk (kp/public-key kp)
+              backup-path (backup/backup-pointer-path own-pk slot)
+              fetched (try (fetch-fn relay-url backup-path)
+                           (catch Exception e
+                             {:ok? false :error :backup-fetch-failed :detail (.getMessage e)}))]
+          (if-not (:ok? fetched)
+            (let [reason (if (= :backup-not-found (:error fetched))
+                           :local-state-corrupt-no-backup
+                           :local-state-corrupt-auto-restore-failed)]
+              (swap! state-atom #(-> (dissoc % :pending-corrupt-auto-restore?)
+                                     (update-in [:diagnostics reason] (fnil inc 0))))
+              (emit-diag! reason (or (:detail fetched) (name (or (:error fetched) :backup-fetch-failed))))
+              {:ok? false :reason reason})
+            (let [res (restore-encrypted-backup! {:key-provider kp
+                                                  :local-state (dissoc state :pending-corrupt-auto-restore?)
+                                                  :blob (:blob fetched)
+                                                  :pointer (:pointer fetched)
+                                                  :slot slot})]
+              (if (:ok? res)
+                (let [st' (-> (:state res)
+                              (dissoc :pending-corrupt-auto-restore?)
+                              (update-in [:diagnostics :local-state-corrupt-auto-restored] (fnil inc 0)))]
+                  (reset! state-atom st')
+                  (when state-file
+                    (try (save-light-state! state-file st') (catch Exception _ nil)))
+                  (emit-diag! :local-state-corrupt-auto-restored (:cid res))
+                  {:ok? true :reason :local-state-corrupt-auto-restored :seq (:seq res) :cid (:cid res) :summary (:summary res)})
+                (do
+                  (swap! state-atom #(-> (dissoc % :pending-corrupt-auto-restore?)
+                                         (update-in [:diagnostics :local-state-corrupt-auto-restore-failed] (fnil inc 0))))
+                  (emit-diag! :local-state-corrupt-auto-restore-failed (name (or (:error res) :backup-restore-failed)))
+                  {:ok? false :reason :local-state-corrupt-auto-restore-failed :error (:error res)})))))))))
 
 ;; -----------------------------------------------------------------------------
 ;; Validator Connection Manager
@@ -4093,6 +4155,13 @@
                         (seq (:effects dac-rec)))
                 (try (save-light-state! state-file initial-state) (catch Exception _ nil)))
             state-atom (atom initial-state)
+            _ (when (and (:pending-corrupt-auto-restore? @state-atom)
+                         (not= (:connect? opts) false))
+                (let [auto-relay (or (:relay-url opts)
+                                     (:relay_url opts)
+                                     (infer-bootstrap-relay-url bootstrap opts)
+                                     (when (= "bitecho.org" (:domain bootstrap)) "https://ns1.bitecho.org"))]
+                  (maybe-auto-restore-corrupt-state! state-atom identity state-file auto-relay opts)))
             conn-atom (atom (init-conn-state))
             event-out (fn [ev] (emit-json-line! out-writer ev events-out))
             serve-cmd-lock (Object.)

@@ -123,6 +123,14 @@
   (security-tier [this]
     "Returns one of `security-tiers` keywords for startup echo and `bitecho.status/v1`."))
 
+(defprotocol IAsyncKeyProvider
+  "Optional async signing boundary for non-extractable Browser WebCrypto / WebAuthn PRF
+   `CryptoKey` providers (BIP-022 Stage C §3.1, F6b). On CLJS returns a `js/Promise` resolving
+   to a 64-byte `Uint8Array` signature (or `{:ok? false :error ...}` when locked); on CLJ
+   returns the synchronous result directly."
+  (sign-async [this message-bytes]
+    "Asynchronously signs `message-bytes` with Ed25519 without exposing private key material."))
+
 ;; =============================================================================
 ;; PBKDF2-HMAC-SHA256 & Keystore Seal / Open (`bitecho.keystore/v1`)
 ;; =============================================================================
@@ -259,7 +267,8 @@
          pub-hex (str/lower-case (fressian/bytes->hex pub-raw))
          pkcs8 (seed->pkcs8-bytes seed)
          x-kp (sealed/x25519-keypair-from-seed seed)]
-     (reify IKeyProvider
+     (reify
+       IKeyProvider
        (public-key [_] pub-hex)
        (public-key-bytes [_] pub-raw)
        (sign [_ message-bytes]
@@ -271,7 +280,11 @@
                              seed
                              (fressian/utf8->bytes (str (or domain-context "default")))
                              32))
-       (security-tier [_] eff-tier)))))
+       (security-tier [_] eff-tier)
+       IAsyncKeyProvider
+       (sign-async [_ message-bytes]
+         #?(:clj (crypto/sign pkcs8 message-bytes)
+            :cljs (js/Promise.resolve (crypto/sign pkcs8 message-bytes))))))))
 
 (defn make-locked-key-provider
   "Pure `.cljc` `IKeyProvider` representing a locked hardware/WebAuthn identity: exposes
@@ -281,7 +294,8 @@
   (let [norm-pub (normalize-pubkey-hex pubkey-hex)
         pub-raw (when (and (string? norm-pub) (= 64 (count norm-pub)))
                   (fressian/hex->bytes norm-pub))]
-    (reify IKeyProvider
+    (reify
+      IKeyProvider
       (public-key [_] norm-pub)
       (public-key-bytes [_] pub-raw)
       (sign [_ _message-bytes]
@@ -290,4 +304,8 @@
         {:ok? false :error :hardware-unlock-required})
       (derive-domain-key [_ _domain-context]
         {:ok? false :error :hardware-unlock-required})
-      (security-tier [_] :webauthn-locked))))
+      (security-tier [_] :webauthn-locked)
+      IAsyncKeyProvider
+      (sign-async [_ _message-bytes]
+        #?(:clj {:ok? false :error :hardware-unlock-required}
+           :cljs (js/Promise.resolve {:ok? false :error :hardware-unlock-required}))))))

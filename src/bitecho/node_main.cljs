@@ -1456,20 +1456,24 @@
 
 (defn- apply-startup-identity-and-load-diagnostics!
   "Propagates live identity `:keystore-security-tier`, merges identity + corrupt-state-load
-   diagnostics into `[:diagnostics]`, and emits structured JSON `:diagnose` lines on stderr."
+   diagnostics into `[:diagnostics]`, marks `:pending-corrupt-auto-restore? true` on corrupt
+   `state.fressian` fallback (F3b), and emits structured JSON `:diagnose` lines on stderr."
   [state identity]
   (let [load-diags @last-load-diagnostics-atom
         _ (reset! last-load-diagnostics-atom [])
+        corrupt-fallback? (boolean (some #(= :local-state-corrupt-fallback (:reason %)) load-diags))
         all-diags (into (vec (or (:diagnostics identity) [])) load-diags)
-        tier (or (:keystore-security-tier identity) (:keystore-security-tier state) :legacy-file-0600)]
+        tier (or (:keystore-security-tier identity) (:keystore-security-tier state) :legacy-file-0600)
+        st-with-diags (reduce (fn [st d]
+                                (if-let [r (:reason d)]
+                                  (update-in st [:diagnostics r] (fnil inc 0))
+                                  st))
+                              (assoc state :keystore-security-tier tier)
+                              all-diags)]
     (doseq [d all-diags]
       (emit-stderr-diagnose! d))
-    (reduce (fn [st d]
-              (if-let [r (:reason d)]
-                (update-in st [:diagnostics r] (fnil inc 0))
-                st))
-            (assoc state :keystore-security-tier tier)
-            all-diags)))
+    (cond-> st-with-diags
+      corrupt-fallback? (assoc :pending-corrupt-auto-restore? true))))
 
 (defn load-light-state!
   "Loads persisted light-node state from `state.fressian`, returning nil if absent or corrupt.
@@ -5170,6 +5174,36 @@
                                (seq (:effects dac-rec)))
                        (try (save-light-state! state-file initial-state) (catch :default _ nil)))
                    state-atom (atom initial-state)
+                   _ (when (and (:pending-corrupt-auto-restore? @state-atom)
+                                (not= (:connect? opts) false))
+                       (let [auto-relay (or (:relay-url opts)
+                                            (:relay_url opts)
+                                            (:relay-url bootstrap)
+                                            (when (= "bitecho.org" (:domain bootstrap)) "https://ns1.bitecho.org"))]
+                         (if (str/blank? (str auto-relay))
+                           (do
+                             (swap! state-atom #(-> (dissoc % :pending-corrupt-auto-restore?)
+                                                    (update-in [:diagnostics :local-state-corrupt-auto-restore-failed] (fnil inc 0))))
+                             (emit-stderr-diagnose! {:reason :local-state-corrupt-auto-restore-failed :detail "no-relay-url"}))
+                           (handle-node-stage-c-verb!
+                            "backup-restore"
+                            {"cmd" "backup-restore" "relay_url" auto-relay}
+                            state-atom identity state-dir state-file auto-relay opts
+                            (fn [res]
+                              (if (:ok? res)
+                                (do
+                                  (swap! state-atom #(-> (dissoc % :pending-corrupt-auto-restore?)
+                                                         (update-in [:diagnostics :local-state-corrupt-auto-restored] (fnil inc 0))))
+                                  (try (save-light-state! state-file @state-atom) (catch :default _ nil))
+                                  (emit-stderr-diagnose! {:reason :local-state-corrupt-auto-restored
+                                                          :detail (get-in res [:response "cid"] "restored")}))
+                                (let [err-str (get-in res [:response "error"] "backup-restore-failed")
+                                      reason (if (= "backup-not-found" err-str)
+                                               :local-state-corrupt-no-backup
+                                               :local-state-corrupt-auto-restore-failed)]
+                                  (swap! state-atom #(-> (dissoc % :pending-corrupt-auto-restore?)
+                                                         (update-in [:diagnostics reason] (fnil inc 0))))
+                                  (emit-stderr-diagnose! {:reason reason :detail err-str}))))))))
                    conn-atom (atom (init-conn-state))
                    event-out (fn [ev] (emit-json-line! ev events-out))
                    conn-opts-atom (atom nil)

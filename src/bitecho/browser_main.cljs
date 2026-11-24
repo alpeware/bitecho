@@ -878,6 +878,142 @@
     :else
     :ephemeral-memory))
 
+(defn- make-browser-webcrypto-key-provider
+  "Constructs a Closure `:advanced`-safe non-extractable WebCrypto / WebAuthn PRF `IKeyProvider` +
+   `IAsyncKeyProvider` (F6b). Never extracts raw private-key bytes; `sign-async` delegates directly
+   to `crypto.subtle.sign(\"Ed25519\", cryptoPrivKey, msg)` via `gobj/get`."
+  [pub-bytes crypto-priv-key domain-secret tier]
+  (let [pub-u8 (if (instance? js/Uint8Array pub-bytes) pub-bytes (js/Uint8Array. pub-bytes))
+        pub-hex (str/lower-case (fressian/bytes->hex pub-u8))
+        eff-tier (if (contains? kp/security-tiers tier) tier :webcrypto-non-extractable)]
+    (reify
+      kp/IKeyProvider
+      (public-key [_] pub-hex)
+      (public-key-bytes [_] pub-u8)
+      (sign [_ _message-bytes]
+        {:ok? false
+         :error :async-sign-required
+         :hint "Non-extractable WebCrypto key requires kp/sign-async"})
+      (x25519-agree [_ _peer-x25519-pubkey-bytes]
+        {:ok? false
+         :error :x25519-unavailable-on-ed25519-webcrypto})
+      (derive-domain-key [_ domain-context]
+        (if (and (some? domain-secret) (fressian/bytes? domain-secret))
+          (sealed/hkdf-sha256 (fressian/utf8->bytes "bitecho-webcrypto-provider-v1")
+                              domain-secret
+                              (fressian/utf8->bytes (str (or domain-context "default")))
+                              32)
+          {:ok? false :error :hardware-unlock-required}))
+      (security-tier [_] eff-tier)
+      kp/IAsyncKeyProvider
+      (sign-async [_ message-bytes]
+        (let [gt js/globalThis
+              c (when gt (gobj/get gt "crypto"))
+              subtle (when c (gobj/get c "subtle"))
+              sign-fn (when subtle (gobj/get subtle "sign"))
+              msg-u8 (if (instance? js/Uint8Array message-bytes)
+                       message-bytes
+                       (if (string? message-bytes)
+                         (fressian/utf8->bytes message-bytes)
+                         (js/Uint8Array. message-bytes)))]
+          (if-not (and (fn? sign-fn) (some? crypto-priv-key))
+            (js/Promise.resolve {:ok? false :error :webcrypto-sign-unavailable})
+            (-> (.call sign-fn subtle "Ed25519" crypto-priv-key msg-u8)
+                (.then (fn [ab] (js/Uint8Array. ab)))
+                (.catch (fn [e]
+                          {:ok? false
+                           :error :webcrypto-sign-failed
+                           :detail (or (when e (gobj/get e "message")) (str e))})))))))))
+
+(defn- make-webauthn-prf-key-provider
+  "Constructs a `:webauthn-prf-non-extractable` `IKeyProvider` + `IAsyncKeyProvider` ONLY when an
+   enrolled WebAuthn PRF credential (`credential-id`) and active PRF secret / non-extractable
+   WebCrypto `CryptoKey` are genuinely present (F6 + F6b)."
+  [credential-id pub-bytes crypto-priv-key prf-secret]
+  (when (and (some? credential-id)
+             (some? crypto-priv-key)
+             (some? prf-secret))
+    (make-browser-webcrypto-key-provider pub-bytes crypto-priv-key prf-secret :webauthn-prf-non-extractable)))
+
+(defn- persist-webcrypto-keypair-idb!
+  "Best-effort stores a non-extractable WebCrypto `CryptoKey` handle in IndexedDB (`bitecho-keystore`)."
+  [pub-hex crypto-priv-key]
+  (let [gt js/globalThis
+        idb (when gt (gobj/get gt "indexedDB"))]
+    (if-not (and idb (fn? (gobj/get idb "open")))
+      (js/Promise.resolve false)
+      (js/Promise.
+       (fn [resolve _]
+         (try
+           (let [req (.call (gobj/get idb "open") idb "bitecho-keystore" 1)]
+             (gobj/set req "onupgradeneeded"
+                       (fn [ev]
+                         (let [db (gobj/get (gobj/get ev "target") "result")]
+                           (when (and db (not (.contains (gobj/get db "objectStoreNames") "keys")))
+                             (.call (gobj/get db "createObjectStore") db "keys")))))
+             (gobj/set req "onsuccess"
+                       (fn [ev]
+                         (try
+                           (let [db (gobj/get (gobj/get ev "target") "result")
+                                 tx (.call (gobj/get db "transaction") db "keys" "readwrite")
+                                 store (.call (gobj/get tx "objectStore") tx "keys")]
+                             (.call (gobj/get store "put") store #js {"pubkey" pub-hex "privateKey" crypto-priv-key} "primary")
+                             (gobj/set tx "oncomplete" (fn [_] (resolve true)))
+                             (gobj/set tx "onerror" (fn [_] (resolve false))))
+                           (catch :default _ (resolve false)))))
+             (gobj/set req "onerror" (fn [_] (resolve false))))
+           (catch :default _ (resolve false))))))))
+
+(defn- create-browser-webcrypto-key-provider!
+  "Asynchronously creates a non-extractable Ed25519 WebCrypto `BrowserWebCryptoKeyProvider`
+   (persisted to IndexedDB when available). Falls back cleanly to `make-memory-key-provider`
+   (`:ephemeral-memory`) with a `:webcrypto-ed25519-unavailable` diagnostic when unsupported."
+  [node-atom]
+  (let [gt js/globalThis
+        c (when gt (gobj/get gt "crypto"))
+        subtle (when c (gobj/get c "subtle"))
+        gen-fn (when subtle (gobj/get subtle "generateKey"))
+        exp-fn (when subtle (gobj/get subtle "exportKey"))]
+    (if-not (and (fn? gen-fn) (fn? exp-fn))
+      (do
+        (when node-atom
+          (swap! node-atom update-in [:light-state :diagnostics :webcrypto-ed25519-unavailable] (fnil inc 0)))
+        (js/Promise.resolve {:ok? false :error :webcrypto-ed25519-unavailable :tier :ephemeral-memory}))
+      (-> (.call gen-fn subtle #js {:name "Ed25519"} false #js ["sign" "verify"])
+          (.then (fn [kp-js]
+                   (let [pub-k (gobj/get kp-js "publicKey")
+                         priv-k (gobj/get kp-js "privateKey")]
+                     (-> (.call exp-fn subtle "raw" pub-k)
+                         (.then (fn [pub-ab]
+                                  (let [pub-u8 (js/Uint8Array. pub-ab)
+                                        pub-hex (str/lower-case (fressian/bytes->hex pub-u8))
+                                        domain-sec (let [grv (when c (gobj/get c "getRandomValues"))]
+                                                     (when (fn? grv)
+                                                       (let [buf (js/Uint8Array. 32)]
+                                                         (.call grv c buf)
+                                                         buf)))
+                                        provider (make-browser-webcrypto-key-provider pub-u8 priv-k domain-sec :webcrypto-non-extractable)]
+                                    (-> (persist-webcrypto-keypair-idb! pub-hex priv-k)
+                                        (.then (fn [persisted?]
+                                                 (when node-atom
+                                                   (swap! node-atom assoc
+                                                          :key-provider provider
+                                                          :webcrypto-non-extractable? true
+                                                          :webcrypto-key priv-k
+                                                          :keystore-security-tier :webcrypto-non-extractable))
+                                                 {:ok? true
+                                                  :provider provider
+                                                  :pubkey pub-hex
+                                                  :tier :webcrypto-non-extractable
+                                                  :persisted-idb? persisted?}))))))))))
+          (.catch (fn [e]
+                    (when node-atom
+                      (swap! node-atom update-in [:light-state :diagnostics :webcrypto-ed25519-unavailable] (fnil inc 0)))
+                    {:ok? false
+                     :error :webcrypto-ed25519-unavailable
+                     :detail (or (when e (gobj/get e "message")) (str e))
+                     :tier :ephemeral-memory}))))))
+
 (defn- active-browser-key-provider
   "Returns the active `IKeyProvider` for `node` (never exposing raw private-key bytes to callers).
    Returns a locked provider (`:webauthn-locked`) when unlocked key material is absent."
@@ -889,6 +1025,16 @@
     (cond
       (:key-provider node)
       (:key-provider node)
+
+      (and (true? (get-in node [:webauthn :prf-active?]))
+           (some? (get-in node [:webauthn :credential-id]))
+           (some? (:webcrypto-key node))
+           (some? (get-in node [:webauthn :prf-secret])))
+      (make-webauthn-prf-key-provider
+       (get-in node [:webauthn :credential-id])
+       (get-in node [:keypair :public-key])
+       (:webcrypto-key node)
+       (get-in node [:webauthn :prf-secret]))
 
       (some? priv)
       (kp/make-memory-key-provider priv (detect-browser-keystore-tier node))
@@ -4569,6 +4715,52 @@
     (gobj/set obj "backupPut" browser-backup-put-v1)
     (gobj/set obj "backupRestore" browser-backup-restore-v1)
     (gobj/set obj "backupStatus" browser-backup-status-v1)
+    (gobj/set obj "keyProviderStatus"
+              (fn []
+                (let [na @active-node-atom]
+                  (if-not na
+                    (js/Promise.resolve (clj->js {"ok" false "error" "node-not-initialized"}))
+                    (let [node @na
+                          provider (active-browser-key-provider node)
+                          tier (kp/security-tier provider)]
+                      (js/Promise.resolve
+                       (clj->js {"ok" true
+                                 "pubkey" (kp/public-key provider)
+                                 "keystore_security_tier" (name tier)
+                                 "non_extractable" (boolean (contains? #{:webcrypto-non-extractable :webauthn-prf-non-extractable} tier))
+                                 "webcrypto_available" (browser-webcrypto-available?)
+                                 "webauthn_available" (browser-webauthn-available?)
+                                 "async_sign_supported" (boolean (satisfies? kp/IAsyncKeyProvider provider))})))))))
+    (gobj/set obj "initWebCryptoKeyProvider"
+              (fn []
+                (let [na @active-node-atom]
+                  (if-not na
+                    (js/Promise.resolve (clj->js {"ok" false "error" "node-not-initialized"}))
+                    (-> (create-browser-webcrypto-key-provider! na)
+                        (.then (fn [res]
+                                 (clj->js {"ok" (boolean (:ok? res))
+                                           "pubkey" (:pubkey res)
+                                           "keystore_security_tier" (name (or (:tier res) :ephemeral-memory))
+                                           "persisted_idb" (boolean (:persisted-idb? res))
+                                           "error" (when (:error res) (name (:error res)))}))))))))
+    (gobj/set obj "signAsync"
+              (fn [msg]
+                (let [na @active-node-atom]
+                  (if-not na
+                    (js/Promise.resolve (clj->js {"ok" false "error" "node-not-initialized"}))
+                    (let [provider (active-browser-key-provider @na)
+                          msg-u8 (cond
+                                   (instance? js/Uint8Array msg) msg
+                                   (string? msg) (fressian/utf8->bytes msg)
+                                   :else (fressian/utf8->bytes (str (or msg ""))))]
+                      (-> (kp/sign-async provider msg-u8)
+                          (.then (fn [sig-or-err]
+                                   (if (and (map? sig-or-err) (false? (:ok? sig-or-err)))
+                                     (clj->js {"ok" false "error" (name (or (:error sig-or-err) :sign-failed))})
+                                     (clj->js {"ok" true
+                                               "pubkey" (kp/public-key provider)
+                                               "keystore_security_tier" (name (kp/security-tier provider))
+                                               "signature_hex" (fressian/bytes->hex sig-or-err)}))))))))))
     obj))
 
 (def light-node-api
@@ -4584,6 +4776,9 @@
 (gobj/set api "backupPut" browser-backup-put-v1)
 (gobj/set api "backupRestore" browser-backup-restore-v1)
 (gobj/set api "backupStatus" browser-backup-status-v1)
+(gobj/set api "keyProviderStatus" (gobj/get light-node-api "keyProviderStatus"))
+(gobj/set api "initWebCryptoKeyProvider" (gobj/get light-node-api "initWebCryptoKeyProvider"))
+(gobj/set api "signAsync" (gobj/get light-node-api "signAsync"))
 
 (when (exists? js/goog)
   (.exportSymbol js/goog "BitechoBrowser" api)
