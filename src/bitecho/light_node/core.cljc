@@ -7,7 +7,6 @@
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.bech32m :as bech32m]
             [bitecho.config :as config]
-            [bitecho.config.flags :as flags]
             [bitecho.core.data :as data]
             [bitecho.core.storage :as storage]
             [bitecho.core.subnet :as core-subnet]
@@ -24,6 +23,7 @@
             [bitecho.governance.core :as gov]
             [bitecho.light-node.cli :as cli]
             [bitecho.rendezvous.core :as rendezvous]
+            [bitecho.status.core :as status-core]
             [clojure.edn :as edn]
             [clojure.string :as str]
             [datachannel.mdns :as mdns]
@@ -106,7 +106,7 @@
                                     [sid cleaned])))]
     (-> invalidated
         (assoc :sessions clean-sessions)
-        (dissoc :connected? :connection-error :conn-diagnostics))))
+        (dissoc :connected? :connection-error :conn-diagnostics :runtime-ctx))))
 
 (defn encode-light-state
   "Serializes sanitized light-node state into cross-platform Fressian bytes (`state.fressian`)."
@@ -5046,10 +5046,12 @@
              (or m {})))
 
 (defn exec-status
-  "Pure status query returning balances, inbox counts, sessions, merged diagnostics,
-   and BIP-020 Pillars 1-3 delivery telemetry."
-  ([state] (exec-status state nil))
-  ([state now-ms]
+  "Pure status query returning canonical `bitecho.status/v1` fields via `bitecho.status.core/render-status`
+   plus backwards-compatible light-node fields (balances, inbox counts, sessions, merged diagnostics,
+   and BIP-020 Pillars 1-3 delivery telemetry)."
+  ([state] (exec-status state nil nil))
+  ([state now-ms] (exec-status state now-ms nil))
+  ([state now-ms runtime-ctx]
    (let [inbox-items (or (:inbox state) [])
          inbox-direct (count (filter (fn [m] (= (or (:type m) (get m "type")) :direct)) inbox-items))
          inbox-broadcast-items (filter (fn [m] (or (= (or (:type m) (get m "type")) :broadcast)
@@ -5062,30 +5064,6 @@
                                      acc))
                                  {}
                                  inbox-broadcast-items)
-         sessions-summary (vec (for [[_ s] (:sessions state)
-                                     :let [pname (pubkey->petname state (:peer s))]]
-                                 (cond-> (select-keys s [:session-id :peer :role :state :tx-seq :epoch :acked-seq :rx-high-seq :replays-deduped :outbox-evicted])
-                                   true (assoc :unacked-count (count (:outbox s)))
-                                   pname (assoc :peer-petname pname :peer_petname pname))))
-         sessions-detail (vec (for [[sid s] (:sessions state)
-                                    :let [p2p (get s :p2p {})
-                                          connected? (boolean (or (:connected? p2p) false))
-                                          transport (or (:transport p2p) (:remote-transport p2p) (get-in s [:p2p-meta :preferred-transport]) "mesh")]]
-                                {"session_id" sid
-                                 "peer" (:peer s)
-                                 "subnet_id" (or (:subnet-id s) (:subnet-id state) "global")
-                                 "status" (:state s)
-                                 "p2p_connected" connected?
-                                 "p2p_transport" transport
-                                 "acked_seq" (long (or (:acked-seq s) 0))
-                                 "unacked_count" (count (:outbox s {}))
-                                 "outbox_evicted" (long (or (:outbox-evicted s) 0))
-                                 "tx_tainted" (boolean (:tx-tainted? s false))
-                                 "rekey_required" (boolean (:rekey-required? s false))
-                                 "reoffer_recommended" (boolean (:reoffer-recommended? s false))}))
-         stalled? (boolean (get-in state [:auto-sync-stall-tracker :stalled?] false))
-         stall-duration-ms (long (or (get-in state [:auto-sync-stall-tracker :stall-duration-ms]) 0))
-         stalled-count (long (or (get-in state [:diagnostics :finalized-epoch-stalled]) 0))
          merged-diags (merge (or (:diagnostics state) {})
                              (or (:conn-diagnostics state) {}))
          dt (merge initial-delivery-telemetry (or (:delivery-telemetry state) {}))
@@ -5107,72 +5085,45 @@
                                   "fanout" (kw-map->snake-str-map fanout)
                                   "ring_buffer_count" (count ring-buf)
                                   "ring_buffer_max" delivery-ring-max-entries}
-         resp (cond-> {"ok" true
-                       "version" config/version
-                       "connected" (boolean (:connected? state false))
-                       "connection_error" (:connection-error state)
-                       "auto_sync_last_error" (or (:auto-sync-last-error state)
-                                                  (get-in state [:diagnostics :auto-sync-last-error])
-                                                  (get-in state [:conn-diagnostics :auto-sync-last-error]))
-                       "stalled" stalled?
-                       "stall_duration_ms" stall-duration-ms
-                       "finalized_epoch_stalled_count" stalled-count
-                       "transport_healthy" (if (contains? state :transport-healthy?)
-                                             (boolean (:transport-healthy? state))
-                                             (and (boolean (:connected? state false))
-                                                  (nil? (:connection-error state))))
-                       "mesh_open_peers" (long (or (:mesh-open-peers state) 0))
-                       "relay_fallback_active" (boolean (:relay-fallback-active? state false))
-                       "pubkey" (:pubkey state)
-                       "subnet_id" (or (:subnet-id state) "global")
-                       "subscribed_subnets" (vec (sort (or (:subscribed-subnets state) #{})))
-                       "autonomous" (:autonomous? state)
-                       "epoch" (:epoch state)
-                       "finalized_epoch" (long (or (get-in state [:account :finalized-epoch]) (:epoch state) 0))
-                       "balance" (long (or (get-in state [:account :balance]) 0))
-                       "spendable" (long (or (get-in state [:account :spendable]) (get-in state [:account :balance]) 0))
-                       "unread_events" (count (:event-queue state []))
-                       "sessions" sessions-summary
-                       "sessions_detail" sessions-detail
-                       "pending_offers_count" (count (:pending-offers state))
-                       "pending_rendezvous_count" (count (:pending-rendezvous state {}))
-                       "rendezvous_policy" (:rendezvous-policy state)
-                       "inbox_count" (count inbox-items)
-                       "inbox_direct_count" inbox-direct
-                       "inbox_broadcast_count" inbox-broadcast
-                       "inbox_by_subnet" inbox-by-subnet
-                       "account" (:account state)
-                       "petnames" (into (sorted-map) (:petnames state {}))
-                       "petnames_count" (count (:petnames state {}))
-                       "dac" (dac-summary (:dac state))
-                       "revoked_dacs_count" (count (:revoked-dacs state #{}))
-                       "directory_cache_count" (count (:directory-cache state {}))
-                       "escrows_count" (count (:escrows state {}))
-                       "delivery_telemetry" delivery-telemetry-resp
-                       "security_flags" (flags/security-flags->wire
-                                         (flags/build-security-flags-echo
-                                          {:subnet-id (or (:subnet-id state) "global")
-                                           :subnet-id-overridden? (boolean (:subnet-id-overridden? state false))
-                                           :trusted-dac-anchors (:trusted-dac-anchors state)
-                                           :trusted-dac-anchors-provenance (:trusted-dac-anchors-provenance state)
-                                           :trusted-deploy-authorities (:trusted-deploy-authorities state)
-                                           :pin-version (:pin-version state)
-                                           :auto-update-pointer (:auto-update-pointer state)
-                                           :keystore-security-tier (or (:keystore-security-tier state) :legacy-file-0600)}))
-                       "accounting" {"scope" "local-non-consensus"
-                                     "note" "Locally computed devnet totals; never consensus finalized"
-                                     "burned_ech" (get-in state [:local-accounting :burned-ech] 0)
-                                     "vouchers_count" (count (:vouchers state []))}
-                       "wire_protocol" {"version" current-wire-version
-                                        "min_supported" min-supported-wire-version
-                                        "max_supported" max-supported-wire-version
-                                        "unsupported_dropped" (get-in state [:wire-version-diagnostics :unsupported-dropped] 0)
-                                        "last_unsupported_version" (get-in state [:wire-version-diagnostics :last-unsupported-version])
-                                        "wire_format" current-wire-format
-                                        "supported_formats" ["fressian-v1" "legacy-nippy"]
-                                        "unsupported_format_dropped" (get-in state [:wire-version-diagnostics :unsupported-format-dropped] 0)
-                                        "last_unsupported_format" (get-in state [:wire-version-diagnostics :last-unsupported-format])}}
-                (seq merged-diags) (assoc "diagnostics" merged-diags)
+         wire-proto {"version" current-wire-version
+                     "min_supported" min-supported-wire-version
+                     "max_supported" max-supported-wire-version
+                     "unsupported_dropped" (get-in state [:wire-version-diagnostics :unsupported-dropped] 0)
+                     "last_unsupported_version" (get-in state [:wire-version-diagnostics :last-unsupported-version])
+                     "wire_format" current-wire-format
+                     "supported_formats" ["fressian-v1" "legacy-nippy"]
+                     "unsupported_format_dropped" (get-in state [:wire-version-diagnostics :unsupported-format-dropped] 0)
+                     "last_unsupported_format" (get-in state [:wire-version-diagnostics :last-unsupported-format])}
+         eff-rctx (merge {:runtime #?(:clj :jvm :cljs :nodejs)
+                          :now-ms eff-now
+                          :version config/version
+                          :wire-protocol wire-proto}
+                         (:runtime-ctx state)
+                         runtime-ctx)
+         canonical (status-core/render-status state eff-rctx)
+         stalled? (boolean (get canonical "stalled"))
+         stall-duration-ms (long (or (get canonical "stall_duration_ms") 0))
+         combined-diags (merge merged-diags (get canonical "diagnostics"))
+         resp (cond-> (merge canonical
+                             {"delivery_telemetry" delivery-telemetry-resp
+                              "diagnostics" combined-diags
+                              "autonomous" (:autonomous? state)
+                              "pending_offers_count" (count (:pending-offers state))
+                              "pending_rendezvous_count" (count (:pending-rendezvous state {}))
+                              "rendezvous_policy" (:rendezvous-policy state)
+                              "inbox_direct_count" inbox-direct
+                              "inbox_broadcast_count" inbox-broadcast
+                              "inbox_by_subnet" inbox-by-subnet
+                              "account" (:account state)
+                              "dac" (dac-summary (:dac state))
+                              "revoked_dacs_count" (count (:revoked-dacs state #{}))
+                              "directory_cache_count" (count (:directory-cache state {}))
+                              "escrows_count" (count (:escrows state {}))
+                              "accounting" {"scope" "local-non-consensus"
+                                            "note" "Locally computed devnet totals; never consensus finalized"
+                                            "burned_ech" (get-in state [:local-accounting :burned-ech] 0)
+                                            "vouchers_count" (count (:vouchers state []))}
+                              "wire_protocol" wire-proto})
                 (contains? state :events-out) (assoc "events_out" (:events-out state))
                 (:mdns-hostname state) (assoc "mdns_hostname" (:mdns-hostname state))
                 (:lan-ip state) (assoc "lan_ip" (:lan-ip state))

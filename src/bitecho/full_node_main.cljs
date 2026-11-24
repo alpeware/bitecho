@@ -28,14 +28,17 @@
             [bitecho.deploy.core :as deploy]
             [bitecho.economy.account :as account]
             [bitecho.economy.spend-dac :as spend-dac]
+            [bitecho.errors.core :as errors]
             [bitecho.fressian :as fressian]
             [bitecho.governance.core :as gov]
             [bitecho.host.core :as host]
+            [bitecho.lifecycle.lock-core :as lock-core]
             [bitecho.light-node.core :as light-core]
             [bitecho.observability.core :as obs]
             [bitecho.ops.incident :as incident]
             [bitecho.snapshot.core :as snap]
             [bitecho.state-machine :as sm]
+            [bitecho.status.core :as status-core]
             [bitecho.storage.app-release :as app-release]
             [bitecho.storage.chunk-constants :as chunk-const]
             [cljs.reader :as edn]
@@ -1086,39 +1089,43 @@
                      :array-buffers-bytes (.-arrayBuffers m)})
                   (catch :default _ nil))
         memory (core-infra/normalize-memory-telemetry mem-raw)
-        pt-reg @passthrough-registry-atom]
-    {:ok true
-     :runtime "nodejs"
-     :version full-node-version
-     :node_id (name (or (:node-id rt) :ns3))
-     :role (name (or (:role le) :standalone))
-     :leader (str (or (:leader-id le) :none))
-     :term (long (or (:term le) 0))
-     :epoch fin-ep
-     :finalized_epoch fin-ep
-     :healthy (count (or (:healthy-nodes le) #{}))
-     :egress_bytes egress
-     :pointer_count (count (get-in sub [:data :pointers]))
-     :memory memory
-     :passthrough {:active_pairs (count (:active-pairs pt-reg))
-                   :draining_pairs (count (:draining-order pt-reg))
-                   :active_drain_timers (long (:active-timers pt-reg 0))
-                   :tcp_socket_wraps (count-tcp-socket-wraps)
-                   :open_fds (count-proc-self-fds)}
-     :security_flags (flags/security-flags->wire
-                      (flags/build-security-flags-echo
-                       {:subnet-id (or (:subnet-id rt) (:subnet-id sub) "devnet.bitecho.org")
-                        :subnet-id-overridden? false
-                        :trusted-dac-anchors (:trusted-dac-anchors rt)
-                        :trusted-dac-anchors-provenance (if (seq (:trusted-dac-anchors rt)) :config :default)
-                        :trusted-deploy-authorities (:trusted-deploy-authorities rt)
-                        :pin-version (:pin-version rt)
-                        :auto-update-pointer (:auto-update-pointer rt)
-                        :keystore-security-tier :legacy-file-0600}))
-     :diagnostics {:runtime (core-infra/shell-status-summary @(:shell-atom rt))
-                   :http (when http-shell-atom (core-infra/shell-status-summary @http-shell-atom))
-                   :dns (when dns-shell-atom (core-infra/shell-status-summary @dns-shell-atom))
-                   :smtp (when smtp-shell-atom (core-infra/shell-status-summary @smtp-shell-atom))}}))
+        pt-reg @passthrough-registry-atom
+        base {:ok true
+              :runtime "nodejs"
+              :version full-node-version
+              :node_id (name (or (:node-id rt) :ns3))
+              :role (name (or (:role le) :standalone))
+              :leader (str (or (:leader-id le) :none))
+              :term (long (or (:term le) 0))
+              :epoch fin-ep
+              :finalized_epoch fin-ep
+              :healthy (count (or (:healthy-nodes le) #{}))
+              :egress_bytes egress
+              :pointer_count (count (get-in sub [:data :pointers]))
+              :memory memory
+              :passthrough {:active_pairs (count (:active-pairs pt-reg))
+                            :draining_pairs (count (:draining-order pt-reg))
+                            :active_drain_timers (long (:active-timers pt-reg 0))
+                            :tcp_socket_wraps (count-tcp-socket-wraps)
+                            :open_fds (count-proc-self-fds)}
+              :security_flags (flags/security-flags->wire
+                               (flags/build-security-flags-echo
+                                {:subnet-id (or (:subnet-id rt) (:subnet-id sub) "devnet.bitecho.org")
+                                 :subnet-id-overridden? false
+                                 :trusted-dac-anchors (:trusted-dac-anchors rt)
+                                 :trusted-dac-anchors-provenance (if (seq (:trusted-dac-anchors rt)) :config :default)
+                                 :trusted-deploy-authorities (:trusted-deploy-authorities rt)
+                                 :pin-version (:pin-version rt)
+                                 :auto-update-pointer (:auto-update-pointer rt)
+                                 :keystore-security-tier :legacy-file-0600}))
+              :diagnostics {:runtime (core-infra/shell-status-summary @(:shell-atom rt))
+                            :http (when http-shell-atom (core-infra/shell-status-summary @http-shell-atom))
+                            :dns (when dns-shell-atom (core-infra/shell-status-summary @dns-shell-atom))
+                            :smtp (when smtp-shell-atom (core-infra/shell-status-summary @smtp-shell-atom))}}]
+    (status-core/merge-full-node-statusz-contract
+     base
+     {:runtime :full-node
+      :lock-state (:lock-state rt)})))
 
 (defn- resolve-safe-content-root-async!
   "Zero-Sync-IO async static content-root file resolver via `fs.promises`, invoking `(cb result-map)`."
@@ -4324,318 +4331,473 @@
                  (catch :default _ nil)))))
          hb-ms)))))
 
+(defn- full-node-pid-alive?
+  [pid]
+  (if (and (number? pid) (pos? pid))
+    (try
+      (.kill js/process (int pid) 0)
+      true
+      (catch :default e
+        (= "EPERM" (.-code e))))
+    false))
+
+(defn- full-node-write-lock-exclusive!
+  [lock-path payload-map]
+  (let [consts (.-constants ^js node-fs)
+        flags (bit-or (.-O_CREAT ^js consts)
+                      (.-O_EXCL ^js consts)
+                      (.-O_WRONLY ^js consts))
+        data (pr-str payload-map)]
+    (try
+      (let [fd (.openSync ^js node-fs lock-path flags 0600)]
+        (try
+          (.writeSync ^js node-fs fd data nil "utf8")
+          (.fsyncSync ^js node-fs fd)
+          (finally
+            (.closeSync ^js node-fs fd))))
+      :created
+      (catch :default e
+        (if (= "EEXIST" (.-code e))
+          :exists
+          (throw e))))))
+
+(defn- acquire-full-node-lock!
+  "OS-atomic `serve.lock` guard for Full Node startup (BIP-022 Stage B Row 10)."
+  [state-dir]
+  (let [dir (or state-dir ".")
+        _ (when-not (.existsSync ^js node-fs dir)
+            (.mkdirSync ^js node-fs dir #js {:recursive true}))
+        lock-path (.join ^js node-path dir "serve.lock")
+        my-pid (long (.-pid js/process))
+        my-tok (try (.toString (.randomBytes ^js node-crypto 8) "hex")
+                    (catch :default _ (str (.now js/Date) "-" my-pid)))
+        now-ms (.now js/Date)
+        init-st (lock-core/init-lock-state {:mode :pid-file
+                                            :lock-id lock-path
+                                            :self-id my-pid
+                                            :token my-tok
+                                            :runtime "full-node"
+                                            :generation 1})
+        [st0 effs0] (lock-core/transition-lock init-st {:type :acquire-requested :now-ms now-ms})]
+    (loop [cur-st st0
+           effs effs0
+           all-diags []]
+      (let [diag-effs (filterv #(= :diagnose (:effect %)) effs)
+            next-diags (into all-diags diag-effs)
+            action-eff (first (remove #(= :diagnose (:effect %)) effs))]
+        (case (:effect action-eff)
+          :fs-create-exclusive
+          (if (= :created (full-node-write-lock-exclusive! lock-path (:payload action-eff)))
+            (let [[st' effs'] (lock-core/transition-lock cur-st {:type :create-exclusive-ok
+                                                                 :generation (:generation action-eff)
+                                                                 :now-ms now-ms})]
+              (recur st' effs' next-diags))
+            (let [holder (when (.existsSync ^js node-fs lock-path)
+                           (try (edn/read-string (.readFileSync ^js node-fs lock-path "utf8"))
+                                (catch :default _ nil)))
+                  h-pid (when (map? holder) (:pid holder))
+                  alive? (boolean (and h-pid (not= h-pid my-pid) (full-node-pid-alive? h-pid)))
+                  [st' effs'] (lock-core/transition-lock cur-st {:type :create-exclusive-exists
+                                                                 :generation (:generation action-eff)
+                                                                 :existing-holder (when (map? holder) holder)
+                                                                 :holder-alive? alive?
+                                                                 :now-ms now-ms})]
+              (recur st' effs' next-diags)))
+
+          :fs-reclaim-stale
+          (do
+            (when (.existsSync ^js node-fs lock-path)
+              (try (.unlinkSync ^js node-fs lock-path) (catch :default _ nil)))
+            (if (= :created (full-node-write-lock-exclusive! lock-path (:payload action-eff)))
+              (let [[st' effs'] (lock-core/transition-lock cur-st {:type :stale-reclaim-ok
+                                                                   :generation (:generation action-eff)
+                                                                   :stale-pid (:expected-stale-pid action-eff)
+                                                                   :now-ms now-ms})]
+                (recur st' effs' next-diags))
+              (let [[st' effs'] (lock-core/transition-lock cur-st {:type :stale-reclaim-race
+                                                                   :generation (:generation action-eff)
+                                                                   :now-ms now-ms})]
+                (recur st' effs' next-diags))))
+
+          :activate-leader
+          {:ok? true
+           :locked-pid my-pid
+           :token my-tok
+           :lock-file lock-path
+           :reclaimed-stale-lock? (boolean (:reclaimed-stale-lock? cur-st))
+           :stale-pid (:stale-pid cur-st)
+           :lock-state cur-st
+           :effects next-diags}
+
+          :reject-duplicate
+          {:ok? false
+           :error "duplicate-instance"
+           :canonical-error (:error action-eff)
+           :locked-pid (:holder-pid cur-st)
+           :attempted-pid my-pid
+           :lock-state cur-st
+           :effects next-diags}
+
+          {:ok? false
+           :error "lock-acquisition-failed"
+           :lock-state cur-st
+           :effects next-diags})))))
+
+(defn- release-full-node-lock!
+  [state-dir expected-pid expected-token]
+  (when state-dir
+    (let [lock-path (.join ^js node-path state-dir "serve.lock")]
+      (when (.existsSync ^js node-fs lock-path)
+        (let [info (try (edn/read-string (.readFileSync ^js node-fs lock-path "utf8"))
+                        (catch :default _ nil))
+              owner-pid (when (map? info) (:pid info))
+              owner-tok (when (map? info) (:token info))]
+          (when (and (or (nil? expected-pid) (nil? owner-pid) (= (long expected-pid) (long owner-pid)))
+                     (or (nil? expected-token) (nil? owner-tok) (= (str expected-token) (str owner-tok))))
+            (try (.unlinkSync ^js node-fs lock-path) (catch :default _ false))))))))
+
 (defn start-infra-node!
-  "Starts the complete Node.js infra-node stack (`runtime`, `dns`, `http`, `https`+`CONNECT`, `smtp`, `diag`, `heartbeat`)."
+  "Starts the complete Node.js infra-node stack (`runtime`, `dns`, `http`, `https`+`CONNECT`, `smtp`, `diag`, `heartbeat`).
+   Enforces OS-atomic `serve.lock` single-instance guard (BIP-022 Stage B Row 10)."
   [config]
   (let [state-dir (or (:state-dir config) ".bitecho-node-infra")
         _ (when-not (.existsSync node-fs state-dir)
             (.mkdirSync node-fs state-dir #js {:recursive true}))
-        node-id (let [nid (or (:node/id config) (:node-id config) :ns3)]
-                  (if (keyword? nid) nid (keyword (str nid))))
-        rt-shell-atom (atom (core-infra/init-shell-state :subnet-runtime))
-        _ (apply-shell-event! rt-shell-atom {:type :start})
-        rt-gen (:generation @rt-shell-atom)
-        ident (load-or-create-node-identity! state-dir node-id rt-shell-atom)
-        pk (:pubkey-hex ident)
-        sk (:privkey-bytes ident)
-        cluster-nodes (get-in config [:cluster :nodes] {})
-        all-nodes (if (seq cluster-nodes) (set (keys cluster-nodes)) #{node-id})
-        trust-anchors (into #{pk} (keep :pubkey (vals cluster-nodes)))
-        default-pol (core-infra/default-infra-policy {:trust-anchors trust-anchors
-                                                      :cold-pubkey (:cold-pubkey config)
-                                                      :threshold (max 1 (min 2 (count trust-anchors)))})
-        init-res (subnet/init-subnet-instance
-                  default-pol
-                  {:node-id node-id
-                   :all-nodes all-nodes
-                   :max-hot-bytes (or (get-in config [:http :max-hot-bytes])
-                                      (* 16 1024 1024))
-                   :max-hot-blob-bytes (or (get-in config [:http :max-hot-blob-bytes])
-                                           data/default-infra-max-hot-blob-bytes)
-                   :max-pinned-app-bytes (or (get-in config [:http :max-pinned-app-bytes])
-                                             data/default-pinned-app-max-bytes)})
-        snap (load-pointers-snapshot state-dir rt-shell-atom)
-        inst0 (if (and snap (= (:subnet-id (:instance init-res)) (:subnet-id snap)))
-                (reduce (fn [acc [k ptr]]
-                          (-> acc
-                              (assoc-in [:data :pointers k] ptr)
-                              (update-in [:data :blobs] #(if (:pointer/target ptr)
-                                                           (data/pin-blob % (:pointer/target ptr))
-                                                           %))))
-                        (cond-> (:instance init-res)
-                          (:policy snap) (assoc :policy (core-infra/merge-upgraded-policy default-pol (:policy snap))))
-                        (:pointers snap))
-                (:instance init-res))
-        tls-secret (resolve-tls-secret config)
-        tls-ctx-atom (atom nil)
-        tls-pem-atom (atom nil)
-        raw-val-cfg (or (:validator config) (when (:enable-validator? config) {}))
-        has-embedded-val? (and (map? raw-val-cfg)
-                               (or (seq (:cluster raw-val-cfg))
-                                   (seq (:genesis-ledger raw-val-cfg))
-                                   (seq (:validators raw-val-cfg))
-                                   (:enable-validator? config)))
-        rt-atom (atom nil)
-        rt {:config config
-            :node-id node-id
-            :state-dir state-dir
-            :shell-atom rt-shell-atom
-            :subnet-atom (atom inst0)
-            :app-release-atom (atom (app-release/init-release-state
-                                     {:genesis-anchor-cid (or (:genesis-anchor-cid config)
-                                                              (get-in inst0 [:policy :subnet/genesis-policy-cid]))
-                                      :trusted-signers (or (:release-signers config)
-                                                           (get-in inst0 [:policy :subnet/gate :gate/trust-anchors]))
-                                      :threshold (or (:release-threshold config) 2)
-                                      :max-bytes (:app-release-max-bytes config)}))
-            :epoch-atom (atom 1)
-            :default-sender pk
-            :node-privkey sk
-            :tls-secret tls-secret
-            :tls-ctx-atom tls-ctx-atom
-            :tls-pem-atom tls-pem-atom}
-        _ (reset! rt-atom rt)
-        _ (when-let [{:keys [cert-pem key-pem]} (load-tls-cert-key-from-disk-or-subnet! rt)]
-            (try
-              (reset! tls-ctx-atom (.createSecureContext node-tls #js {:cert cert-pem :key key-pem}))
-              (reset! tls-pem-atom {:cert-pem cert-pem :key-pem key-pem})
-              (catch :default e
-                (apply-shell-event! rt-shell-atom {:type :diagnose :reason :tls-init-failed :detail (.-message e)}))))
-        _ (apply-shell-event! rt-shell-atom {:type :started :generation rt-gen :resources {:state-dir state-dir}})
-        relay-atom (atom (relay/init-relay-state (get-in config [:http :relay])))
-        waiters-atom (atom {})
-        faucet-atom (atom (faucet/init-faucet-state (or (:faucet config) {})))
-        limiter-atom (atom (dns-proto/init-limiter {:capacity 100.0
-                                                    :refill-per-sec 20.0
-                                                    :monthly-egress-limit-bytes (get-in config [:http :monthly-egress-limit-bytes] 900000000)}))
-        http-shell-atom (atom (core-infra/init-shell-state :http-shell))
-        _ (apply-shell-event! http-shell-atom {:type :start})
-        http-gen (:generation @http-shell-atom)
-        dns-handle-atom (atom nil)
-        smtp-handle-atom (atom nil)
-        ports-atom (atom {:http-port 0 :https-port 0 :dns-udp-port 0 :smtp-port 0 :diag-port 0})
-        pending-atom (atom 0)
-        stop-fns (atom [])
-        maybe-emit-ready! (fn []
-                            (when (zero? (swap! pending-atom dec))
-                              (let [ps @ports-atom]
-                                (println (js/JSON.stringify
-                                          (clj->js {:event "infra-node-ready"
-                                                    :ok true
-                                                    :runtime "nodejs"
-                                                    :version full-node-version
-                                                    :node_id (name node-id)
-                                                    :http_port (:http-port ps)
-                                                    :https_port (:https-port ps)
-                                                    :dns_udp_port (:dns-udp-port ps)
-                                                    :smtp_port (:smtp-port ps)
-                                                    :diag_port (:diag-port ps)
-                                                    :tls_loaded (some? @tls-ctx-atom)}))))))
-        http-enabled? (get-in config [:http :enabled?] true)
-        https-enabled? (and http-enabled? (some? @tls-ctx-atom))
-        dns-enabled? (get-in config [:dns :enabled?] false)
-        smtp-enabled? (get-in config [:smtp :enabled?] false)
-        diag-enabled? (boolean (get-in config [:validator :http :enabled?] false))
-        bind-ip (get-in config [:http :bind-ip] "0.0.0.0")
-        http-port (long (get-in config [:http :http-port] 80))
-        https-port (long (get-in config [:http :https-port] 443))
-        total-listeners (+ (if http-enabled? 1 0)
-                           (if https-enabled? 1 0)
-                           (if dns-enabled? 1 0)
-                           (if smtp-enabled? 1 0)
-                           (if diag-enabled? 1 0))]
-    (reset! pending-atom (max 1 total-listeners))
+        lock-res (if (:skip-single-instance-lock? config)
+                   {:ok? true
+                    :locked-pid (.-pid js/process)
+                    :lock-state (assoc (lock-core/init-lock-state {:mode :pid-file
+                                                                   :lock-id (.join ^js node-path state-dir "serve.lock")
+                                                                   :self-id (.-pid js/process)
+                                                                   :runtime "full-node"})
+                                       :role :single
+                                       :holder-pid (.-pid js/process))}
+                   (acquire-full-node-lock! state-dir))]
+    (if-not (:ok? lock-res)
+      (do
+        (println (js/JSON.stringify
+                  (clj->js (merge (errors/canonical-error->wire
+                                   (or (:canonical-error lock-res)
+                                       (errors/canonical-error :duplicate-instance
+                                                               {:locked-pid (:locked-pid lock-res)
+                                                                :attempted-pid (:attempted-pid lock-res)
+                                                                :lock-file (.join ^js node-path state-dir "serve.lock")})))
+                                  {"event" "duplicate-serve-rejected"
+                                   "locked_pid" (:locked-pid lock-res)
+                                   "diagnose" "duplicate-serve-instance-rejected"}))))
+        (.exit js/process 1))
+      (let [my-lock-pid (:locked-pid lock-res)
+            my-lock-token (:token lock-res)
+            lock-state (:lock-state lock-res)
+            node-id (let [nid (or (:node/id config) (:node-id config) :ns3)]
+                      (if (keyword? nid) nid (keyword (str nid))))
+            rt-shell-atom (atom (core-infra/init-shell-state :subnet-runtime))
+            _ (apply-shell-event! rt-shell-atom {:type :start})
+            rt-gen (:generation @rt-shell-atom)
+            ident (load-or-create-node-identity! state-dir node-id rt-shell-atom)
+            pk (:pubkey-hex ident)
+            sk (:privkey-bytes ident)
+            cluster-nodes (get-in config [:cluster :nodes] {})
+            all-nodes (if (seq cluster-nodes) (set (keys cluster-nodes)) #{node-id})
+            trust-anchors (into #{pk} (keep :pubkey (vals cluster-nodes)))
+            default-pol (core-infra/default-infra-policy {:trust-anchors trust-anchors
+                                                          :cold-pubkey (:cold-pubkey config)
+                                                          :threshold (max 1 (min 2 (count trust-anchors)))})
+            init-res (subnet/init-subnet-instance
+                      default-pol
+                      {:node-id node-id
+                       :all-nodes all-nodes
+                       :max-hot-bytes (or (get-in config [:http :max-hot-bytes])
+                                          (* 16 1024 1024))
+                       :max-hot-blob-bytes (or (get-in config [:http :max-hot-blob-bytes])
+                                               data/default-infra-max-hot-blob-bytes)
+                       :max-pinned-app-bytes (or (get-in config [:http :max-pinned-app-bytes])
+                                                 data/default-pinned-app-max-bytes)})
+            snap (load-pointers-snapshot state-dir rt-shell-atom)
+            inst0 (if (and snap (= (:subnet-id (:instance init-res)) (:subnet-id snap)))
+                    (reduce (fn [acc [k ptr]]
+                              (-> acc
+                                  (assoc-in [:data :pointers k] ptr)
+                                  (update-in [:data :blobs] #(if (:pointer/target ptr)
+                                                               (data/pin-blob % (:pointer/target ptr))
+                                                               %))))
+                            (cond-> (:instance init-res)
+                              (:policy snap) (assoc :policy (core-infra/merge-upgraded-policy default-pol (:policy snap))))
+                            (:pointers snap))
+                    (:instance init-res))
+            tls-secret (resolve-tls-secret config)
+            tls-ctx-atom (atom nil)
+            tls-pem-atom (atom nil)
+            raw-val-cfg (or (:validator config) (when (:enable-validator? config) {}))
+            has-embedded-val? (and (map? raw-val-cfg)
+                                   (or (seq (:cluster raw-val-cfg))
+                                       (seq (:genesis-ledger raw-val-cfg))
+                                       (seq (:validators raw-val-cfg))
+                                       (:enable-validator? config)))
+            rt-atom (atom nil)
+            rt {:config config
+                :node-id node-id
+                :state-dir state-dir
+                :lock-state lock-state
+                :shell-atom rt-shell-atom
+                :subnet-atom (atom inst0)
+                :app-release-atom (atom (app-release/init-release-state
+                                         {:genesis-anchor-cid (or (:genesis-anchor-cid config)
+                                                                  (get-in inst0 [:policy :subnet/genesis-policy-cid]))
+                                          :trusted-signers (or (:release-signers config)
+                                                               (get-in inst0 [:policy :subnet/gate :gate/trust-anchors]))
+                                          :threshold (or (:release-threshold config) 2)
+                                          :max-bytes (:app-release-max-bytes config)}))
+                :epoch-atom (atom 1)
+                :default-sender pk
+                :node-privkey sk
+                :tls-secret tls-secret
+                :tls-ctx-atom tls-ctx-atom
+                :tls-pem-atom tls-pem-atom}
+            _ (reset! rt-atom rt)
+            _ (when-let [{:keys [cert-pem key-pem]} (load-tls-cert-key-from-disk-or-subnet! rt)]
+                (try
+                  (reset! tls-ctx-atom (.createSecureContext node-tls #js {:cert cert-pem :key key-pem}))
+                  (reset! tls-pem-atom {:cert-pem cert-pem :key-pem key-pem})
+                  (catch :default e
+                    (apply-shell-event! rt-shell-atom {:type :diagnose :reason :tls-init-failed :detail (.-message e)}))))
+            _ (apply-shell-event! rt-shell-atom {:type :started :generation rt-gen :resources {:state-dir state-dir}})
+            relay-atom (atom (relay/init-relay-state (get-in config [:http :relay])))
+            waiters-atom (atom {})
+            faucet-atom (atom (faucet/init-faucet-state (or (:faucet config) {})))
+            limiter-atom (atom (dns-proto/init-limiter {:capacity 100.0
+                                                        :refill-per-sec 20.0
+                                                        :monthly-egress-limit-bytes (get-in config [:http :monthly-egress-limit-bytes] 900000000)}))
+            http-shell-atom (atom (core-infra/init-shell-state :http-shell))
+            _ (apply-shell-event! http-shell-atom {:type :start})
+            http-gen (:generation @http-shell-atom)
+            dns-handle-atom (atom nil)
+            smtp-handle-atom (atom nil)
+            ports-atom (atom {:http-port 0 :https-port 0 :dns-udp-port 0 :smtp-port 0 :diag-port 0})
+            pending-atom (atom 0)
+            stop-fns (atom [])
+            maybe-emit-ready! (fn []
+                                (when (zero? (swap! pending-atom dec))
+                                  (let [ps @ports-atom]
+                                    (println (js/JSON.stringify
+                                              (clj->js {:event "infra-node-ready"
+                                                        :ok true
+                                                        :runtime "nodejs"
+                                                        :version full-node-version
+                                                        :node_id (name node-id)
+                                                        :http_port (:http-port ps)
+                                                        :https_port (:https-port ps)
+                                                        :dns_udp_port (:dns-udp-port ps)
+                                                        :smtp_port (:smtp-port ps)
+                                                        :diag_port (:diag-port ps)
+                                                        :tls_loaded (some? @tls-ctx-atom)}))))))
+            http-enabled? (get-in config [:http :enabled?] true)
+            https-enabled? (and http-enabled? (some? @tls-ctx-atom))
+            dns-enabled? (get-in config [:dns :enabled?] false)
+            smtp-enabled? (get-in config [:smtp :enabled?] false)
+            diag-enabled? (boolean (get-in config [:validator :http :enabled?] false))
+            bind-ip (get-in config [:http :bind-ip] "0.0.0.0")
+            http-port (long (get-in config [:http :http-port] 80))
+            https-port (long (get-in config [:http :https-port] 443))
+            total-listeners (+ (if http-enabled? 1 0)
+                               (if https-enabled? 1 0)
+                               (if dns-enabled? 1 0)
+                               (if smtp-enabled? 1 0)
+                               (if diag-enabled? 1 0))]
+        (reset! pending-atom (max 1 total-listeners))
     ;; Co-located Validator Mesh Engine (when :validator is configured) + bi-directional Relay<->Validator bridge
-    (when has-embedded-val?
-      (let [val-cfg (assoc raw-val-cfg
-                           :node/id (or (:node/id raw-val-cfg) (:node-id raw-val-cfg) node-id)
-                           :node-id (or (:node-id raw-val-cfg) (:node/id raw-val-cfg) node-id)
-                           :state-dir (or (:state-dir raw-val-cfg) state-dir)
-                           :http (merge {:enabled? diag-enabled? :host "127.0.0.1" :port 8080}
-                                        (:http raw-val-cfg)))
-            vnode (start-validator-mesh-node!
-                   val-cfg
-                   {:identity ident
-                    :embedded? true
-                    :on-ready (fn [{:keys [http-port]}]
-                                (when diag-enabled?
-                                  (swap! ports-atom assoc :diag-port (or http-port 0))
-                                  (maybe-emit-ready!)))})
-            on-bridge-msg (fn [payload]
-                            (try
-                              (let [now-ms (.now js/Date)
-                                    cur-rt @rt-atom]
-                                (maybe-ingest-artifact-envelope! cur-rt payload now-ms)
-                                (let [res-box (atom nil)
-                                      _ (swap! relay-atom
-                                               (fn [st]
-                                                 (let [r (relay/reduce-relay st {:type :relay-submit
-                                                                                 :envelope payload
-                                                                                 :from-validator? true
-                                                                                 :now-ms now-ms})]
-                                                   (reset! res-box r)
-                                                   (:state r))))
-                                      res @res-box]
-                                  (when (:ok? res)
-                                    (let [recip (or (get-in res [:response "recipient"])
-                                                    (get-in res [:response "pubkey"]))
-                                          broadcast? (boolean (get-in res [:response "broadcast"]))]
-                                      (when (relay/should-replicate-to-peers? res {:replicated? false :from-validator? true})
-                                        (try
-                                          (let [payload-bytes (if (fressian/bytes? payload) payload (fressian/encode-wire payload))
-                                                wire-hex (basalt/bytes->hex payload-bytes)
-                                                body-buf (.from js/Buffer (js/JSON.stringify #js {:envelope_hex wire-hex}) "utf8")]
-                                            (replicate-relay-to-peers! cur-rt "/relay/v1/send" body-buf))
-                                          (catch :default _ nil)))
-                                      (when (or recip broadcast?)
-                                        (wake-relay-waiters! waiters-atom recip broadcast?))))))
-                              (catch :default _ nil)))
-            bridge-key (keyword (str "colocated-bridge-" (name node-id)))]
-        (when-let [acs (:agent-conns vnode)]
-          (swap! acs assoc bridge-key {:channel-id 0
-                                       :phase :open
-                                       :ok? true
-                                       :on-message on-bridge-msg
-                                       :node nil
-                                       :generation 1
-                                       :sent-msg-ids #{}
-                                       :sent-msg-order []}))
-        (swap! rt-atom assoc :validator-node vnode)
-        (swap! stop-fns conj (:stop! vnode))))
-    (let [rt @rt-atom]
+        (when has-embedded-val?
+          (let [val-cfg (assoc raw-val-cfg
+                               :node/id (or (:node/id raw-val-cfg) (:node-id raw-val-cfg) node-id)
+                               :node-id (or (:node-id raw-val-cfg) (:node/id raw-val-cfg) node-id)
+                               :state-dir (or (:state-dir raw-val-cfg) state-dir)
+                               :http (merge {:enabled? diag-enabled? :host "127.0.0.1" :port 8080}
+                                            (:http raw-val-cfg)))
+                vnode (start-validator-mesh-node!
+                       val-cfg
+                       {:identity ident
+                        :embedded? true
+                        :on-ready (fn [{:keys [http-port]}]
+                                    (when diag-enabled?
+                                      (swap! ports-atom assoc :diag-port (or http-port 0))
+                                      (maybe-emit-ready!)))})
+                on-bridge-msg (fn [payload]
+                                (try
+                                  (let [now-ms (.now js/Date)
+                                        cur-rt @rt-atom]
+                                    (maybe-ingest-artifact-envelope! cur-rt payload now-ms)
+                                    (let [res-box (atom nil)
+                                          _ (swap! relay-atom
+                                                   (fn [st]
+                                                     (let [r (relay/reduce-relay st {:type :relay-submit
+                                                                                     :envelope payload
+                                                                                     :from-validator? true
+                                                                                     :now-ms now-ms})]
+                                                       (reset! res-box r)
+                                                       (:state r))))
+                                          res @res-box]
+                                      (when (:ok? res)
+                                        (let [recip (or (get-in res [:response "recipient"])
+                                                        (get-in res [:response "pubkey"]))
+                                              broadcast? (boolean (get-in res [:response "broadcast"]))]
+                                          (when (relay/should-replicate-to-peers? res {:replicated? false :from-validator? true})
+                                            (try
+                                              (let [payload-bytes (if (fressian/bytes? payload) payload (fressian/encode-wire payload))
+                                                    wire-hex (basalt/bytes->hex payload-bytes)
+                                                    body-buf (.from js/Buffer (js/JSON.stringify #js {:envelope_hex wire-hex}) "utf8")]
+                                                (replicate-relay-to-peers! cur-rt "/relay/v1/send" body-buf))
+                                              (catch :default _ nil)))
+                                          (when (or recip broadcast?)
+                                            (wake-relay-waiters! waiters-atom recip broadcast?))))))
+                                  (catch :default _ nil)))
+                bridge-key (keyword (str "colocated-bridge-" (name node-id)))]
+            (when-let [acs (:agent-conns vnode)]
+              (swap! acs assoc bridge-key {:channel-id 0
+                                           :phase :open
+                                           :ok? true
+                                           :on-message on-bridge-msg
+                                           :node nil
+                                           :generation 1
+                                           :sent-msg-ids #{}
+                                           :sent-msg-order []}))
+            (swap! rt-atom assoc :validator-node vnode)
+            (swap! stop-fns conj (:stop! vnode))))
+        (let [rt @rt-atom]
       ;; Heartbeat loop
-      (when-let [hb-timer (start-peer-heartbeat-loop! config rt)]
-        (swap! stop-fns conj #(js/clearInterval hb-timer)))
+          (when-let [hb-timer (start-peer-heartbeat-loop! config rt)]
+            (swap! stop-fns conj #(js/clearInterval hb-timer)))
 
       ;; P-OBS-4 / D38.1 / D39.5: 60s signed observability digest & rolling SLA publisher
-      (when-not (false? (:publish-telemetry? config))
-        (swap! stop-fns conj (start-infra-telemetry-publisher! node-id rt waiters-atom)))
+          (when-not (false? (:publish-telemetry? config))
+            (swap! stop-fns conj (start-infra-telemetry-publisher! node-id rt waiters-atom)))
 
       ;; BIP-018-SOAK-F1: 30s throttled off-heap ArrayBuffer GC monitor (active when --expose-gc is enabled)
-      (swap! stop-fns conj (start-offheap-gc-monitor! (:shell-atom rt)))
+          (swap! stop-fns conj (start-offheap-gc-monitor! (:shell-atom rt)))
 
       ;; P-UPD-1 / D40.1: Optional pointer-driven self-update loop for infra nodes
-      (when (:auto-update-pointer config)
-        (when-let [stop-upd (start-full-node-auto-updater!
-                             node-id config
-                             #(doseq [f @stop-fns] (try (f) (catch :default _ nil))))]
-          (swap! stop-fns conj stop-upd)))
+          (when (:auto-update-pointer config)
+            (when-let [stop-upd (start-full-node-auto-updater!
+                                 node-id config
+                                 #(doseq [f @stop-fns] (try (f) (catch :default _ nil))))]
+              (swap! stop-fns conj stop-upd)))
 
       ;; 1. DNS (:53)
-      (when dns-enabled?
-        (start-dns-server! config rt
-                           (fn [h]
-                             (reset! dns-handle-atom h)
-                             (swap! ports-atom assoc :dns-udp-port (:udp-port h))
-                             (swap! stop-fns conj (:stop-fn h))
-                             (maybe-emit-ready!))))
+          (when dns-enabled?
+            (start-dns-server! config rt
+                               (fn [h]
+                                 (reset! dns-handle-atom h)
+                                 (swap! ports-atom assoc :dns-udp-port (:udp-port h))
+                                 (swap! stop-fns conj (:stop-fn h))
+                                 (maybe-emit-ready!))))
 
       ;; 2. SMTP (:25)
-      (when smtp-enabled?
-        (start-smtp-server! config rt
-                            (fn [h]
-                              (reset! smtp-handle-atom h)
-                              (swap! ports-atom assoc :smtp-port (:port h))
-                              (swap! stop-fns conj (:stop-fn h))
-                              (maybe-emit-ready!))))
+          (when smtp-enabled?
+            (start-smtp-server! config rt
+                                (fn [h]
+                                  (reset! smtp-handle-atom h)
+                                  (swap! ports-atom assoc :smtp-port (:port h))
+                                  (swap! stop-fns conj (:stop-fn h))
+                                  (maybe-emit-ready!))))
 
       ;; 3. HTTPS (:443) internal TLS server + Port 443 Passthrough Multiplexer
-      (when https-enabled?
-        (let [https-srv (.createServer
-                         node-https
-                         #js {:SNICallback (fn [_servername cb] (cb nil @tls-ctx-atom))
-                              :cert (:cert-pem @tls-pem-atom)
-                              :key (:key-pem @tls-pem-atom)
-                              :requestCert true
-                              :rejectUnauthorized false}
-                         (fn [req res]
-                           (handle-web-or-api-request!
-                            req res
-                            {:config config :rt rt :relay-atom relay-atom :waiters-atom waiters-atom
-                             :faucet-atom faucet-atom
-                             :limiter-atom limiter-atom :http-shell-atom http-shell-atom
-                             :dns-shell-atom (:shell-atom @dns-handle-atom)
-                             :smtp-shell-atom (:shell-atom @smtp-handle-atom)
-                             :https? true :bound-https-port (:https-port @ports-atom)})))]
-          (.listen https-srv 0 "127.0.0.1"
-                   (fn []
-                     (let [internal-port (.-port (.address https-srv))
-                           front-srv (.createServer
-                                      node-net
-                                      #js {:allowHalfOpen true}
-                                      (fn [^js sock]
-                                        (handle-passthrough-socket!
-                                         sock
-                                         {:domain (or (:domain config) "bitecho.org")
-                                          :internal-https-port internal-port
-                                          :ingress-target (get-in config [:http :ingress-target])
-                                          :connect-targets (get-in config [:http :connect-targets])
-                                          :connect-routes (get-in config [:http :connect-routes])
-                                          :peek-timeout-ms (get-in config [:http :peek-timeout-ms] 2000)
-                                          :shell-atom http-shell-atom})))]
-                       (.listen front-srv https-port bind-ip
-                                (fn []
-                                  (let [bp (.-port (.address front-srv))]
-                                    (swap! ports-atom assoc :https-port bp)
-                                    (swap! stop-fns conj #(do (.close front-srv) (.close https-srv)))
-                                    (maybe-emit-ready!)))))))))
+          (when https-enabled?
+            (let [https-srv (.createServer
+                             node-https
+                             #js {:SNICallback (fn [_servername cb] (cb nil @tls-ctx-atom))
+                                  :cert (:cert-pem @tls-pem-atom)
+                                  :key (:key-pem @tls-pem-atom)
+                                  :requestCert true
+                                  :rejectUnauthorized false}
+                             (fn [req res]
+                               (handle-web-or-api-request!
+                                req res
+                                {:config config :rt rt :relay-atom relay-atom :waiters-atom waiters-atom
+                                 :faucet-atom faucet-atom
+                                 :limiter-atom limiter-atom :http-shell-atom http-shell-atom
+                                 :dns-shell-atom (:shell-atom @dns-handle-atom)
+                                 :smtp-shell-atom (:shell-atom @smtp-handle-atom)
+                                 :https? true :bound-https-port (:https-port @ports-atom)})))]
+              (.listen https-srv 0 "127.0.0.1"
+                       (fn []
+                         (let [internal-port (.-port (.address https-srv))
+                               front-srv (.createServer
+                                          node-net
+                                          #js {:allowHalfOpen true}
+                                          (fn [^js sock]
+                                            (handle-passthrough-socket!
+                                             sock
+                                             {:domain (or (:domain config) "bitecho.org")
+                                              :internal-https-port internal-port
+                                              :ingress-target (get-in config [:http :ingress-target])
+                                              :connect-targets (get-in config [:http :connect-targets])
+                                              :connect-routes (get-in config [:http :connect-routes])
+                                              :peek-timeout-ms (get-in config [:http :peek-timeout-ms] 2000)
+                                              :shell-atom http-shell-atom})))]
+                           (.listen front-srv https-port bind-ip
+                                    (fn []
+                                      (let [bp (.-port (.address front-srv))]
+                                        (swap! ports-atom assoc :https-port bp)
+                                        (swap! stop-fns conj #(do (.close front-srv) (.close https-srv)))
+                                        (maybe-emit-ready!)))))))))
 
       ;; 4. HTTP (:80)
-      (when http-enabled?
-        (let [http-srv (.createServer
-                        node-http
-                        (fn [req res]
-                          (handle-web-or-api-request!
-                           req res
-                           {:config config :rt rt :relay-atom relay-atom :waiters-atom waiters-atom
-                            :faucet-atom faucet-atom
-                            :limiter-atom limiter-atom :http-shell-atom http-shell-atom
-                            :dns-shell-atom (:shell-atom @dns-handle-atom)
-                            :smtp-shell-atom (:shell-atom @smtp-handle-atom)
-                            :https? false :bound-https-port (:https-port @ports-atom)})))]
-          (.listen http-srv http-port bind-ip
-                   (fn []
-                     (let [bp (.-port (.address http-srv))]
-                       (swap! ports-atom assoc :http-port bp)
-                       (apply-shell-event! http-shell-atom {:type :started :generation http-gen :resources {:http http-srv}})
-                       (swap! stop-fns conj #(.close http-srv))
-                       (maybe-emit-ready!))))))
+          (when http-enabled?
+            (let [http-srv (.createServer
+                            node-http
+                            (fn [req res]
+                              (handle-web-or-api-request!
+                               req res
+                               {:config config :rt rt :relay-atom relay-atom :waiters-atom waiters-atom
+                                :faucet-atom faucet-atom
+                                :limiter-atom limiter-atom :http-shell-atom http-shell-atom
+                                :dns-shell-atom (:shell-atom @dns-handle-atom)
+                                :smtp-shell-atom (:shell-atom @smtp-handle-atom)
+                                :https? false :bound-https-port (:https-port @ports-atom)})))]
+              (.listen http-srv http-port bind-ip
+                       (fn []
+                         (let [bp (.-port (.address http-srv))]
+                           (swap! ports-atom assoc :http-port bp)
+                           (apply-shell-event! http-shell-atom {:type :started :generation http-gen :resources {:http http-srv}})
+                           (swap! stop-fns conj #(.close http-srv))
+                           (maybe-emit-ready!))))))
 
       ;; 5. Localhost Diagnostics HTTP (`127.0.0.1:8080`) when no embedded validator is present
-      (when (and diag-enabled? (not has-embedded-val?))
-        (let [d-host (get-in config [:validator :http :host] "127.0.0.1")
-              d-port (long (get-in config [:validator :http :port] 8080))
-              d-srv (.createServer
-                     node-http
-                     (fn [req res]
-                       (let [u (or (.-url req) "/")]
-                         (cond
-                           (str/starts-with? u "/healthz")
-                           (send-json! res 200 {:ok true :runtime "nodejs" :version full-node-version :node_id (name node-id)})
+          (when (and diag-enabled? (not has-embedded-val?))
+            (let [d-host (get-in config [:validator :http :host] "127.0.0.1")
+                  d-port (long (get-in config [:validator :http :port] 8080))
+                  d-srv (.createServer
+                         node-http
+                         (fn [req res]
+                           (let [u (or (.-url req) "/")]
+                             (cond
+                               (str/starts-with? u "/healthz")
+                               (send-json! res 200 {:ok true :runtime "nodejs" :version full-node-version :node_id (name node-id)})
 
-                           (str/starts-with? u "/statusz")
-                           (send-json! res 200 (build-statusz-payload rt limiter-atom http-shell-atom
-                                                                      (:shell-atom @dns-handle-atom)
-                                                                      (:shell-atom @smtp-handle-atom)))
+                               (str/starts-with? u "/statusz")
+                               (send-json! res 200 (build-statusz-payload rt limiter-atom http-shell-atom
+                                                                          (:shell-atom @dns-handle-atom)
+                                                                          (:shell-atom @smtp-handle-atom)))
 
-                           :else
-                           (send-json! res 404 {:ok false :error "not-found" :path u})))))]
-          (.listen d-srv d-port d-host
-                   (fn []
-                     (swap! ports-atom assoc :diag-port (.-port (.address d-srv)))
-                     (swap! stop-fns conj #(.close d-srv))
-                     (maybe-emit-ready!)))))
+                               :else
+                               (send-json! res 404 {:ok false :error "not-found" :path u})))))]
+              (.listen d-srv d-port d-host
+                       (fn []
+                         (swap! ports-atom assoc :diag-port (.-port (.address d-srv)))
+                         (swap! stop-fns conj #(.close d-srv))
+                         (maybe-emit-ready!)))))
 
-      (when (zero? total-listeners)
-        (maybe-emit-ready!))
+          (when (zero? total-listeners)
+            (maybe-emit-ready!))
 
-      ;; Graceful shutdown on SIGTERM / SIGINT
-      (let [shutdown! (fn []
-                        (doseq [f @stop-fns]
-                          (try (f) (catch :default _ nil)))
-                        (.exit js/process 0))]
-        (.on js/process "SIGTERM" shutdown!)
-        (.on js/process "SIGINT" shutdown!)))))
+      ;; Graceful shutdown on SIGTERM / SIGINT / exit
+          (let [shutdown! (fn []
+                            (doseq [f @stop-fns]
+                              (try (f) (catch :default _ nil)))
+                            (release-full-node-lock! state-dir my-lock-pid my-lock-token)
+                            (.exit js/process 0))]
+            (.on js/process "exit" (fn [_] (release-full-node-lock! state-dir my-lock-pid my-lock-token)))
+            (.on js/process "SIGTERM" shutdown!)
+            (.on js/process "SIGINT" shutdown!)))))))
 
 ;; =============================================================================
 ;; 10. Deterministic `--self-test` & CLI Entry Point

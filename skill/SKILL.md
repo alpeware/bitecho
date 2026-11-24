@@ -102,3 +102,10 @@ Three OS-level verbs are explicitly unsupported in-browser and fail closed with 
 - `serve` — Browser light node runs live in-page without a local TCP control socket or filesystem `--state-dir`.
 - `daemon` — OS background process/PID management is unavailable in a browser tab.
 - `mcp` — MCP stdio JSON-RPC requires OS stdin/stdout pipes unavailable in a browser tab.
+
+---
+
+## 5. Runtime Contracts (`BIP-022` Stage B: Rows 4, 5, 10)
+- **Canonical Status (`bitecho.status/v1`):** `ctl/status` (Node.js & JVM) and `BitechoLightNode.getStatus()` (Browser) emit the same canonical `bitecho.status/v1` keys (`schema_version`, `version`, `runtime`, `subnet_id`, `subscribed_subnets`, `connected`, `transport_healthy`, `phase`, `generation`, `finalized_epoch`, `peers`, `sessions`, `sessions_detail`, `petnames_count`, `security_flags`, `sync`, `instance_lock`, `delivery_telemetry`, `diagnostics`); Full Node `/statusz` includes `schema_version`, `security_flags`, `instance_lock`, and normalized `diagnostics`.
+- **Uniform Periodic Sync & `F-EPOCH-1` Loud Stall:** All light-node shells run `bitecho.sync.core/step-auto-sync` at 15s cadence (180s when Browser tab is hidden, with immediate resume on visible/online) and emit counted `:auto-sync-stalled` (`:finalized-epoch-stalled`) diagnostics when `finalized_epoch` freezes past threshold.
+- **Single-Instance Lock & Multi-Tab Leader Election:** Node.js Light, JVM Light, and Full Node enforce OS-atomic `serve.lock` (`O_CREAT|O_EXCL` / `CREATE_NEW`, mode `0600`) rejecting live duplicate instances with `:duplicate-instance` (exit 1) and reclaiming dead PIDs loudly (`:stale-serve-lock-reclaimed`). Browser tabs coordinate via two-phase `navigator.locks` + `BroadcastChannel` with automatic secondary-to-leader handoff (`:browser-tab-leader-handoff`).

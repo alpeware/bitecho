@@ -13,12 +13,15 @@
             [bitecho.deploy.core :as deploy]
             [bitecho.errors.core :as errors]
             [bitecho.fressian :as fressian]
+            [bitecho.lifecycle.lock-core :as lock-core]
             [bitecho.light-node.cli :as cli]
             [bitecho.light-node.core :as light-core]
             [bitecho.net.relay-pool :as relay-pool]
             [bitecho.shell.browser :as browser]
+            [bitecho.status.core :as status-core]
             [bitecho.storage.chunk-constants :as chunk-const]
             [bitecho.storage.chunk-fetch :as chunk-fetch]
+            [bitecho.sync.core :as sync-core]
             [bitecho.webauthn :as webauthn]
             [cljs.reader :as edn]
             [clojure.string :as str]
@@ -72,7 +75,7 @@
 (defonce ^:private event-listener-next-id-atom (atom 0))
 (defonce ^:private event-seq-atom (atom 0))
 
-(declare get-status fetch-relay-chain-state! start-browser-auto-sync!)
+(declare get-status fetch-relay-chain-state! start-browser-auto-sync! start-browser-tab-lock! release-browser-tab-lock!)
 
 (defn emit-browser-event!
   "Emits a normalized v1.0.0 event to all `BitechoLightNode.onEvent` subscribers.
@@ -657,7 +660,16 @@
                           :x25519 x25519
                           :conn conn-state
                           :mesh-conns mesh-conns
-                          :auto-sync (browser/init-auto-sync-state {:generation 1})
+                          :auto-sync (sync-core/init-sync-state {:generation 1})
+                          :instance-lock (lock-core/init-lock-state
+                                          {:mode :web-lock
+                                           :lock-id (str "bitecho-node-"
+                                                         (or (:subnet-id light-st) (:subnet-id opts-map) "global")
+                                                         "-"
+                                                         (or (:pubkey light-st) "anon"))
+                                           :self-id (str "tab-" (.now js/Date))
+                                           :runtime "browser"
+                                           :generation 1})
                           :light-state light-st
                           :petnames default-petnames
                           :petname-meta {}
@@ -670,6 +682,7 @@
                           :burned-ech 0
                           :autonomous? false})]
      (reset! active-node-atom node-atom)
+     (start-browser-tab-lock! node-atom)
      (when-not (false? (:auto-sync? opts-map))
        (start-browser-auto-sync! node-atom))
      (when (:persist? opts-map)
@@ -689,7 +702,9 @@
              polling? (atom false)
              poll-tick!
              (fn poll-tick! []
-               (when (compare-and-set! polling? false true)
+               (when (and @node-atom
+                          (not= :secondary (get-in @node-atom [:instance-lock :role]))
+                          (compare-and-set! polling? false true))
                  (let [st (:light-state @node-atom)
                        pk-hex (or (:pubkey st) pubkey-hex)
                        privkey (:private-key (:keypair @node-atom))]
@@ -794,11 +809,13 @@
         (or events [])))
 
 (defn get-status
-  "Returns Rule 4 & Rule 5 status and single-authority multi-peer diagnostics map as a JavaScript object."
+  "Returns canonical `bitecho.status/v1` status via `bitecho.status.core/render-status`
+   projected with backwards-compatible browser camelCase aliases (BIP-022 Stage B Row 4; Rules 4 & 5)."
   ([] (get-status @active-node-atom))
   ([node-atom]
    (when node-atom
      (let [node @node-atom
+           now-ms (.now js/Date)
            conn (:conn node)
            diag (:diagnostics conn)
            mesh-conns (:mesh-conns node)
@@ -823,8 +840,6 @@
            relay-fallback-active? (and (empty? connected-nodes)
                                        (boolean (or (:relay-url node) (:relay-fallback-active? node))))
            core-diags (or (:diagnostics light-st) {})
-           dt (merge light-core/initial-delivery-telemetry (or (:delivery-telemetry light-st) {}))
-           unacked-aged (light-core/compute-unacked-aged-count light-st (.now js/Date))
            closed-nodes (or (:closed-peers mesh-summary) [])
            dialing-nodes (or (:dialing-peers mesh-summary) [])
            degraded? (boolean (:degraded? mesh-summary))
@@ -833,9 +848,6 @@
                     (:relay-url node) "http-relay"
                     (or (keyword? tr-val) (symbol? tr-val) (string? tr-val)) (name tr-val)
                     :else "webrtc")
-           phase-val (if has-mesh-peers? (:phase mesh-summary) (:phase conn))
-           phase-str (kw-or-str->name phase-val "idle")
-           diag-phase-str (kw-or-str->name (if has-mesh-peers? (:phase mesh-summary) (:phase diag)) "idle")
            eff-gen (if has-mesh-peers? (long (or (:generation mesh-summary) 0)) (long (or (:generation conn) 0)))
            eff-last-err (if has-mesh-peers? (:last-error mesh-summary) (:last-error diag))
            eff-dropped (if has-mesh-peers? (:dropped mesh-summary) (or (:dropped diag) 0))
@@ -862,89 +874,78 @@
                       light-st
                       {:mesh-open-peers (count connected-nodes)
                        :relay-fallback-active? relay-fallback-active?
-                       :connection-error eff-last-err})]
-       (clj->js {:peerId (:peer-id node)
-                 :subnetId (or (:subnet-id light-st) (:subnet-id node) "global")
-                 :pubkey pubkey-hex
-                 :address (when pubkey-hex (bech32m/pubkey->bech32m pubkey-hex "ech"))
-                 :hardwareLocked (nil? (get-in node [:keypair :private-key]))
-                 :epoch (or (:epoch light-st) 0)
-                 :balance (or (get-in light-st [:account :balance]) (:balance light-st) 0)
-                 :spendable (or (get-in light-st [:account :spendable]) (:spendable light-st) 0)
-                 :transport tr-str
-                 :phase phase-str
-                 :generation eff-gen
-                 :visibilityState (or (:visibility-state mesh-summary) (:visibility-state conn) "visible")
-                 :burnedEch (or (:burned-ech node) 0)
-                 :connected (boolean (:connected? projected))
-                 :meshConnected (boolean (seq connected-nodes))
-                 :meshOpenPeers (count connected-nodes)
-                 :transportHealthy (boolean (:transport-healthy? projected))
-                 :relayFallbackActive (boolean (:relay-fallback-active? projected))
-                 :connectedNodes connected-nodes
-                 :closedNodes closed-nodes
-                 :dialingNodes dialing-nodes
-                 :degraded degraded?
-                 :deliveryTelemetry {:sent (long (or (:sent dt) 0))
-                                     :acked (long (or (:acked dt) 0))
-                                     :unackedAged unacked-aged
-                                     :evictedByReason (:evicted-by-reason dt)
-                                     :receivedButNotEmitted (:received-but-not-emitted dt)
-                                     :fanout (:fanout dt)
-                                     :ringBufferCount (count (or (:ring-buffer dt) []))}
-                 :security_flags (flags/security-flags->wire
-                                  (flags/build-security-flags-echo
-                                   {:subnet-id (or (:subnet-id light-st) (:subnet-id node) "global")
-                                    :subnet-id-overridden? (boolean (:subnet-id-overridden? light-st false))
-                                    :trusted-dac-anchors (:trusted-dac-anchors light-st)
-                                    :trusted-dac-anchors-provenance (:trusted-dac-anchors-provenance light-st)
-                                    :trusted-deploy-authorities (:trusted-deploy-authorities light-st)
-                                    :pin-version (:pin-version light-st)
-                                    :auto-update-pointer (:auto-update-pointer light-st)
-                                    :keystore-security-tier (if (nil? (get-in node [:keypair :private-key]))
-                                                              :webauthn-locked
-                                                              :legacy-file-0600)}))
-                 :securityFlags (flags/security-flags->wire
-                                 (flags/build-security-flags-echo
-                                  {:subnet-id (or (:subnet-id light-st) (:subnet-id node) "global")
-                                   :subnet-id-overridden? (boolean (:subnet-id-overridden? light-st false))
-                                   :trusted-dac-anchors (:trusted-dac-anchors light-st)
-                                   :trusted-dac-anchors-provenance (:trusted-dac-anchors-provenance light-st)
-                                   :trusted-deploy-authorities (:trusted-deploy-authorities light-st)
-                                   :pin-version (:pin-version light-st)
-                                   :auto-update-pointer (:auto-update-pointer light-st)
-                                   :keystore-security-tier (if (nil? (get-in node [:keypair :private-key]))
-                                                             :webauthn-locked
-                                                             :legacy-file-0600)}))
-                 :sessions (redact-for-js (or (:sessions light-st) {}))
-                 :pendingOffers (redact-for-js (or (:pending-offers light-st) {}))
-                 :broadcastInbox (redact-for-js (or (:broadcast-inbox light-st) []))
-                 :chatHistory (or (:chat-history node) [])
-                 :petnames (or (:petnames node) default-petnames)
-                 :diagnostics (merge
-                               core-diags
-                               {:phase diag-phase-str
-                                :generation eff-gen
-                                :lastError eff-last-err
-                                :dropped (+ (long (or eff-dropped 0)) (long (or (:dropped core-diags) 0)))
-                                :ignoredStale eff-stale
-                                :unsupportedFormatDropped eff-unsup
-                                :backgroundThrottledEvents eff-bg
-                                :iceDisconnects eff-ice-disc
-                                :iceReconnects eff-ice-reconn
-                                :closeCount eff-close-cnt
-                                :dialFailures eff-dial-fail
-                                :eventListenerErrors (long (or (:event-listener-errors diag) 0))
-                                :cidMismatch (long (or (:cid-mismatch diag) 0))
-                                :lastIceState eff-last-ice
-                                :lastConnectionState eff-last-cs
-                                :totalPeers (long (or (:total-peers mesh-summary) 0))
-                                :openPeers connected-nodes
-                                :dialingPeers dialing-nodes
-                                :closedPeers closed-nodes
-                                :degraded degraded?
-                                :peers eff-peers
-                                :recentEvents eff-recent})})))))
+                       :connection-error eff-last-err})
+           sec-flags-echo (flags/build-security-flags-echo
+                           {:subnet-id (or (:subnet-id light-st) (:subnet-id node) "global")
+                            :subnet-id-overridden? (boolean (:subnet-id-overridden? light-st false))
+                            :trusted-dac-anchors (:trusted-dac-anchors light-st)
+                            :trusted-dac-anchors-provenance (:trusted-dac-anchors-provenance light-st)
+                            :trusted-deploy-authorities (:trusted-deploy-authorities light-st)
+                            :pin-version (:pin-version light-st)
+                            :auto-update-pointer (:auto-update-pointer light-st)
+                            :keystore-security-tier (if (nil? (get-in node [:keypair :private-key]))
+                                                      :webauthn-locked
+                                                      :legacy-file-0600)})
+           st-for-render (assoc (or light-st {})
+                                :pubkey pubkey-hex
+                                :subnet-id (or (:subnet-id light-st) (:subnet-id node) "global")
+                                :petnames (or (:petnames node) (:petnames light-st) default-petnames))
+           runtime-ctx {:runtime :browser
+                        :now-ms now-ms
+                        :version config/version
+                        :conn conn
+                        :connected? (boolean (:connected? projected))
+                        :transport-healthy? (boolean (:transport-healthy? projected))
+                        :mesh-summary {:phase (if has-mesh-peers? (:phase mesh-summary) (:phase conn))
+                                       :generation eff-gen
+                                       :last-error eff-last-err
+                                       :dropped eff-dropped
+                                       :ignored-stale eff-stale
+                                       :open-peers connected-nodes
+                                       :dialing-peers dialing-nodes
+                                       :closed-peers closed-nodes
+                                       :relay-fallback-active? (boolean (:relay-fallback-active? projected))
+                                       :degraded? degraded?}
+                        :sync-state (:auto-sync node)
+                        :lock-state (:instance-lock node)
+                        :security-flags sec-flags-echo}
+           canonical (status-core/render-status st-for-render runtime-ctx)
+           canon-diags (get canonical "diagnostics")
+           merged-diags (merge
+                         core-diags
+                         canon-diags
+                         {"lastError" eff-last-err
+                          "ignoredStale" eff-stale
+                          "unsupportedFormatDropped" eff-unsup
+                          "backgroundThrottledEvents" eff-bg
+                          "iceDisconnects" eff-ice-disc
+                          "iceReconnects" eff-ice-reconn
+                          "closeCount" eff-close-cnt
+                          "dialFailures" eff-dial-fail
+                          "eventListenerErrors" (long (or (:event-listener-errors diag) 0))
+                          "cidMismatch" (long (or (:cid-mismatch diag) 0))
+                          "lastIceState" eff-last-ice
+                          "lastConnectionState" eff-last-cs
+                          "totalPeers" (long (or (:total-peers mesh-summary) 0))
+                          "openPeers" connected-nodes
+                          "dialingPeers" dialing-nodes
+                          "closedPeers" closed-nodes
+                          "degraded" degraded?
+                          "peers" eff-peers
+                          "recentEvents" eff-recent})
+           canonical-with-diags (assoc canonical
+                                       "diagnostics" merged-diags
+                                       "sessions" (redact-for-js (or (:sessions light-st) {})))
+           browser-extras {"peerId" (:peer-id node)
+                           "address" (when pubkey-hex (bech32m/pubkey->bech32m pubkey-hex "ech"))
+                           "hardwareLocked" (nil? (get-in node [:keypair :private-key]))
+                           "transport" tr-str
+                           "visibilityState" (or (:visibility-state mesh-summary) (:visibility-state conn) "visible")
+                           "burnedEch" (or (:burned-ech node) 0)
+                           "pendingOffers" (redact-for-js (or (:pending-offers light-st) {}))
+                           "broadcastInbox" (redact-for-js (or (:broadcast-inbox light-st) []))
+                           "chatHistory" (or (:chat-history node) [])}]
+       (clj->js (status-core/project-browser-status canonical-with-diags browser-extras))))))
 
 (defn build-p2p-link-bind-envelope
   "Builds and signs a :p2p-link-bind envelope proving peer pubkey and session identity."
@@ -1766,7 +1767,7 @@
 (defonce ^:private auto-sync-runtime-atom (atom {:timer nil :abort-ctrl nil :online-fn nil :vis-fn nil}))
 
 (defn- stop-browser-auto-sync!
-  "Tears down browser background auto-sync timers, listeners, and in-flight AbortController (BIP-021 §2.5.2)."
+  "Tears down browser background auto-sync timers, listeners, and in-flight AbortController (BIP-022 Stage B Row 5)."
   [node-atom]
   (let [{:keys [timer abort-ctrl online-fn vis-fn]} @auto-sync-runtime-atom]
     (when timer (try (js/clearInterval timer) (catch :default _ nil)))
@@ -1777,8 +1778,29 @@
       (try (.removeEventListener js/document "visibilitychange" vis-fn) (catch :default _ nil)))
     (reset! auto-sync-runtime-atom {:timer nil :abort-ctrl nil :online-fn nil :vis-fn nil})
     (when (and node-atom @node-atom)
-      (let [[st' _] (browser/transition-auto-sync (:auto-sync @node-atom) {:type :stop})]
+      (let [[st' _] (sync-core/step-auto-sync (:auto-sync @node-atom) {:type :stop})]
         (swap! node-atom assoc :auto-sync st')))))
+
+(defn- apply-browser-sync-state!
+  [node-atom sync-st']
+  (when (and node-atom @node-atom)
+    (swap! node-atom
+           (fn [n]
+             (let [ls (or (:light-state n) {})
+                   tracker {:last-finalized-epoch (:last-finalized-epoch sync-st')
+                            :last-advanced-ms (:last-advanced-ms sync-st')
+                            :stalled? (:stalled? sync-st')
+                            :stall-started-ms (:stall-started-ms sync-st')
+                            :stall-duration-ms (:stall-duration-ms sync-st')}
+                   ls' (cond-> (assoc ls
+                                      :auto-sync-stall-tracker tracker
+                                      :auto-sync-last-error (:last-error sync-st'))
+                         (:stalled? sync-st')
+                         (-> (update-in [:diagnostics :auto-sync-stalled] (fnil inc 0))
+                             (update-in [:diagnostics :finalized-epoch-stalled] (fnil inc 0))))]
+               (assoc n
+                      :auto-sync sync-st'
+                      :light-state ls'))))))
 
 (defn- execute-browser-auto-sync-effects!
   [node-atom effects]
@@ -1786,9 +1808,23 @@
     (case (:effect eff)
       :diagnose
       (when (and node-atom @node-atom)
-        (swap! node-atom update-in [:light-state :diagnostics (or (:reason eff) :auto-sync-diagnostic)] (fnil inc 0)))
+        (let [reason (or (:reason eff) :auto-sync-diagnostic)
+              alias-reason (:alias-reason eff)]
+          (swap! node-atom
+                 (fn [n]
+                   (cond-> (update-in n [:light-state :diagnostics reason] (fnil inc 0))
+                     alias-reason (update-in [:light-state :diagnostics alias-reason] (fnil inc 0)))))))
 
-      :reschedule-auto-sync
+      :emit-event
+      (when (and node-atom @node-atom)
+        (notify-ui-listeners!))
+
+      :cancel-timer
+      (when-let [t (:timer @auto-sync-runtime-atom)]
+        (try (js/clearInterval t) (catch :default _ nil))
+        (swap! auto-sync-runtime-atom assoc :timer nil))
+
+      :reschedule-timer
       (when-let [interval-ms (:interval-ms eff)]
         (when-let [t (:timer @auto-sync-runtime-atom)]
           (try (js/clearInterval t) (catch :default _ nil)))
@@ -1800,12 +1836,13 @@
                                    active? (boolean (or (seq (:active-channels node))
                                                         (:relay-url node)
                                                         (:relay-fallback-active? node)))
-                                   [st' effs] (browser/transition-auto-sync
+                                   [st' effs] (sync-core/step-auto-sync
                                                (:auto-sync node)
                                                {:type :tick
                                                 :generation (get-in node [:auto-sync :generation] 1)
+                                                :now-ms (.now js/Date)
                                                 :visibility vis
-                                                :mesh-or-relay-active? active?})]
+                                                :active? active?})]
                                (swap! node-atom assoc :auto-sync st')
                                (execute-browser-auto-sync-effects! node-atom effs))))
                          interval-ms)]
@@ -1813,10 +1850,10 @@
             (.unref new-timer))
           (swap! auto-sync-runtime-atom assoc :timer new-timer)))
 
-      :run-auto-sync
+      :fetch-quorum-sync
       (when (and node-atom @node-atom)
         (let [gen (:generation eff)
-              timeout-ms (or (:timeout-ms eff) browser/auto-sync-fetch-timeout-ms)
+              timeout-ms (or (:timeout-ms eff) sync-core/default-fetch-timeout-ms)
               node @node-atom
               relay-urls (vec (distinct (keep identity (concat [(:relay-url node)]
                                                                ["https://ns1.bitecho.org"
@@ -1830,10 +1867,12 @@
                        (reset! timed-out? true)
                        (when ctrl (try (.abort ctrl) (catch :default _ nil)))
                        (when (and node-atom @node-atom)
-                         (let [[st' effs] (browser/transition-auto-sync
+                         (let [[st' effs] (sync-core/step-auto-sync
                                            (:auto-sync @node-atom)
-                                           {:type :timeout :generation gen})]
-                           (swap! node-atom assoc :auto-sync st')
+                                           {:type :timeout
+                                            :generation gen
+                                            :now-ms (.now js/Date)})]
+                           (apply-browser-sync-state! node-atom st')
                            (execute-browser-auto-sync-effects! node-atom effs))))
                      timeout-ms)
               try-relay!
@@ -1842,13 +1881,14 @@
                   (do
                     (js/clearTimeout to-id)
                     (when (and (not @timed-out?) node-atom @node-atom)
-                      (let [[st' _] (browser/transition-auto-sync
-                                     (:auto-sync @node-atom)
-                                     {:type :complete :generation gen :error "all-relays-failed"})]
-                        (swap! node-atom (fn [n]
-                                           (-> n
-                                               (assoc :auto-sync st')
-                                               (assoc-in [:light-state :auto-sync-last-error] "all-relays-failed")))))))
+                      (let [[st' effs] (sync-core/step-auto-sync
+                                        (:auto-sync @node-atom)
+                                        {:type :fetch-error
+                                         :generation gen
+                                         :now-ms (.now js/Date)
+                                         :error "all-relays-failed"})]
+                        (apply-browser-sync-state! node-atom st')
+                        (execute-browser-auto-sync-effects! node-atom effs))))
                   (let [r-url (nth relay-urls idx)]
                     (-> (fetch-relay-chain-state! r-url {:node-atom node-atom})
                         (.then (fn [res]
@@ -1857,18 +1897,21 @@
                                      (js/clearTimeout to-id)
                                      (when (and (not @timed-out?) node-atom @node-atom)
                                        (let [now-ms (.now js/Date)
-                                             [st' _] (browser/transition-auto-sync
-                                                      (:auto-sync @node-atom)
-                                                      {:type :complete :generation gen :error nil})]
-                                         (swap! node-atom
-                                                (fn [n]
-                                                  (let [ls (:light-state n)
-                                                        fin-ep (long (or (get-in ls [:account :finalized-epoch]) (:epoch ls) 0))
-                                                        stall-res (light-core/evaluate-auto-sync-stall ls fin-ep now-ms)]
-                                                    (-> n
-                                                        (assoc :auto-sync st'
-                                                               :relay-fallback-healthy? true)
-                                                        (assoc :light-state (assoc (:state stall-res) :auto-sync-last-error nil)))))))))
+                                             ls (:light-state @node-atom)
+                                             fin-ep (long (or (get-in ls [:account :finalized-epoch]) (:epoch ls) 0))
+                                             bal (long (or (get-in ls [:account :balance]) 0))
+                                             spend (long (or (get-in ls [:account :spendable]) bal 0))
+                                             [st' effs] (sync-core/step-auto-sync
+                                                         (:auto-sync @node-atom)
+                                                         {:type :fetch-ok
+                                                          :generation gen
+                                                          :now-ms now-ms
+                                                          :finalized-epoch fin-ep
+                                                          :balance bal
+                                                          :spendable spend})]
+                                         (swap! node-atom assoc :relay-fallback-healthy? true)
+                                         (apply-browser-sync-state! node-atom st')
+                                         (execute-browser-auto-sync-effects! node-atom effs))))
                                    (when-not @timed-out?
                                      (try-relay! (inc idx))))))
                         (.catch (fn [_]
@@ -1879,32 +1922,37 @@
       nil)))
 
 (defn- start-browser-auto-sync!
-  "Starts bounded 30s (visible) / 180s (hidden) generation-tagged browser auto-sync loop (BIP-021 §2.5.2)."
+  "Starts unified 15s (visible) / 180s (hidden) generation-tagged browser auto-sync loop
+   driven by `bitecho.sync.core/step-auto-sync` (BIP-022 Stage B Row 5)."
   [node-atom]
   (stop-browser-auto-sync! node-atom)
   (when (and node-atom @node-atom)
     (let [vis (if (and (exists? js/document) (= (.-visibilityState js/document) "hidden")) :hidden :visible)
           gen (inc (long (get-in @node-atom [:auto-sync :generation] 0)))
-          st0 (browser/init-auto-sync-state {:generation gen :visibility vis})
+          lock-role (or (get-in @node-atom [:instance-lock :role]) :single)
+          sync-role (if (= :secondary lock-role) :secondary :leader)
+          st0 (sync-core/init-sync-state {:generation gen
+                                          :visibility vis
+                                          :role sync-role})
           _ (swap! node-atom assoc :auto-sync st0)
           vis-fn (fn []
                    (when (and node-atom @node-atom (exists? js/document))
                      (let [next-vis (if (= (.-visibilityState js/document) "hidden") :hidden :visible)
-                           prev-vis (get-in @node-atom [:auto-sync :visibility] :visible)
-                           [st' effs] (browser/transition-auto-sync
+                           [st' effs] (sync-core/step-auto-sync
                                        (:auto-sync @node-atom)
                                        {:type :visibility-change
                                         :generation (get-in @node-atom [:auto-sync :generation] gen)
-                                        :visibility next-vis
-                                        :prev-visibility prev-vis})]
+                                        :now-ms (.now js/Date)
+                                        :visibility next-vis})]
                        (swap! node-atom assoc :auto-sync st')
                        (execute-browser-auto-sync-effects! node-atom effs))))
           online-fn (fn []
                       (when (and node-atom @node-atom)
-                        (let [[st' effs] (browser/transition-auto-sync
+                        (let [[st' effs] (sync-core/step-auto-sync
                                           (:auto-sync @node-atom)
                                           {:type :online
-                                           :generation (get-in @node-atom [:auto-sync :generation] gen)})]
+                                           :generation (get-in @node-atom [:auto-sync :generation] gen)
+                                           :now-ms (.now js/Date)})]
                           (swap! node-atom assoc :auto-sync st')
                           (execute-browser-auto-sync-effects! node-atom effs))))]
       (when (and (exists? js/document) (fn? (.-addEventListener js/document)))
@@ -1912,9 +1960,156 @@
       (when (and (exists? js/window) (fn? (.-addEventListener js/window)))
         (.addEventListener js/window "online" online-fn))
       (swap! auto-sync-runtime-atom assoc :vis-fn vis-fn :online-fn online-fn)
-      (execute-browser-auto-sync-effects! node-atom [{:effect :reschedule-auto-sync
-                                                      :interval-ms (browser/auto-sync-interval-ms vis)
+      (execute-browser-auto-sync-effects! node-atom [{:effect :reschedule-timer
+                                                      :interval-ms (sync-core/effective-interval-ms st0)
                                                       :generation gen}]))))
+
+(defonce ^:private tab-lock-runtime-atom
+  (atom {:release-fn nil :channel nil :tab-id nil}))
+
+(defn- execute-browser-tab-lock-effects!
+  [node-atom effects]
+  (doseq [eff effects]
+    (case (:effect eff)
+      :diagnose
+      (when (and node-atom @node-atom)
+        (swap! node-atom update-in [:light-state :diagnostics (or (:reason eff) :tab-lock-diagnostic)] (fnil inc 0)))
+
+      :broadcast-channel
+      (when-let [^js ch (:channel @tab-lock-runtime-atom)]
+        (try (.postMessage ch (clj->js (:message eff))) (catch :default _ nil)))
+
+      :activate-leader
+      (when (and node-atom @node-atom)
+        (let [[sync-st' sync-effs] (sync-core/step-auto-sync
+                                    (:auto-sync @node-atom)
+                                    {:type :role-change
+                                     :generation (get-in @node-atom [:auto-sync :generation] 1)
+                                     :role :leader})]
+          (swap! node-atom assoc :auto-sync sync-st')
+          (execute-browser-auto-sync-effects! node-atom sync-effs)
+          (notify-ui-listeners!)))
+
+      :enter-secondary
+      (when (and node-atom @node-atom)
+        (let [[sync-st' sync-effs] (sync-core/step-auto-sync
+                                    (:auto-sync @node-atom)
+                                    {:type :role-change
+                                     :generation (get-in @node-atom [:auto-sync :generation] 1)
+                                     :role :secondary})]
+          (swap! node-atom assoc :auto-sync sync-st')
+          (execute-browser-auto-sync-effects! node-atom sync-effs)
+          (notify-ui-listeners!)))
+
+      nil)))
+
+(defn- release-browser-tab-lock!
+  [node-atom]
+  (let [{:keys [release-fn channel]} @tab-lock-runtime-atom]
+    (when (and node-atom @node-atom (:instance-lock @node-atom))
+      (let [[st' effs] (lock-core/transition-lock (:instance-lock @node-atom) {:type :release-requested})]
+        (swap! node-atom assoc :instance-lock st')
+        (execute-browser-tab-lock-effects! node-atom effs)))
+    (when (fn? release-fn)
+      (try (release-fn) (catch :default _ nil)))
+    (when channel
+      (try (.close ^js channel) (catch :default _ nil)))
+    (reset! tab-lock-runtime-atom {:release-fn nil :channel nil :tab-id nil})))
+
+(defn- start-browser-tab-lock!
+  "Two-phase `navigator.locks` + `BroadcastChannel` multi-tab leader election & automatic handoff
+   driven by `bitecho.lifecycle.lock-core/transition-lock` (BIP-022 Stage B Row 10)."
+  [node-atom]
+  (release-browser-tab-lock! node-atom)
+  (when (and node-atom @node-atom)
+    (let [node @node-atom
+          light-st (:light-state node)
+          subnet-id (or (:subnet-id light-st) (:subnet-id node) "global")
+          pubkey (or (:pubkey light-st) "anon")
+          lock-name (str "bitecho-node-" subnet-id "-" pubkey)
+          tab-id (str "tab-" (.now js/Date) "-" (.toString (.floor js/Math (* (.random js/Math) 1000000)) 16))
+          init-st (lock-core/init-lock-state {:mode :web-lock
+                                              :lock-id lock-name
+                                              :self-id tab-id
+                                              :runtime "browser"
+                                              :generation 1})
+          [st0 _] (lock-core/transition-lock init-st {:type :acquire-requested :now-ms (.now js/Date)})
+          _ (swap! node-atom assoc :instance-lock st0)
+          bc (when (exists? js/BroadcastChannel)
+               (try
+                 (let [ch (js/BroadcastChannel. lock-name)]
+                   (set! (.-onmessage ch)
+                         (fn [^js ev]
+                           (when (and node-atom @node-atom ev (.-data ev))
+                             (let [msg (js->clj (.-data ev) :keywordize-keys true)]
+                               (when (and (= "leader-elected" (:type msg))
+                                          (not= tab-id (:tab-id msg)))
+                                 (let [[l-st' l-effs] (lock-core/transition-lock
+                                                       (:instance-lock @node-atom)
+                                                       {:type :broadcast-leader-heartbeat
+                                                        :generation (get-in @node-atom [:instance-lock :generation] 1)
+                                                        :leader-tab-id (:tab-id msg)
+                                                        :now-ms (.now js/Date)})]
+                                   (swap! node-atom assoc :instance-lock l-st')
+                                   (execute-browser-tab-lock-effects! node-atom l-effs)))))))
+                   ch)
+                 (catch :default _ nil)))
+          _ (swap! tab-lock-runtime-atom assoc :channel bc :tab-id tab-id)
+          locks-api (when (exists? js/navigator) (.-locks js/navigator))]
+      (if (and locks-api (fn? (.-request ^js locks-api)))
+        (.request ^js locks-api
+                  lock-name
+                  #js {:mode "exclusive" :ifAvailable true}
+                  (fn [lock]
+                    (if lock
+                      (js/Promise.
+                       (fn [resolve-hold _]
+                         (swap! tab-lock-runtime-atom assoc :release-fn resolve-hold)
+                         (when (and node-atom @node-atom)
+                           (let [[l-st' l-effs] (lock-core/transition-lock
+                                                 (:instance-lock @node-atom)
+                                                 {:type :web-lock-probe
+                                                  :generation (get-in @node-atom [:instance-lock :generation] 1)
+                                                  :available? true
+                                                  :now-ms (.now js/Date)})]
+                             (swap! node-atom assoc :instance-lock l-st')
+                             (execute-browser-tab-lock-effects! node-atom l-effs)))))
+                      ;; Lock already held by primary tab -> enter :secondary & queue handoff wait
+                      (do
+                        (when (and node-atom @node-atom)
+                          (let [[l-st' l-effs] (lock-core/transition-lock
+                                                (:instance-lock @node-atom)
+                                                {:type :web-lock-probe
+                                                 :generation (get-in @node-atom [:instance-lock :generation] 1)
+                                                 :available? false
+                                                 :holder-tab-id nil
+                                                 :now-ms (.now js/Date)})]
+                            (swap! node-atom assoc :instance-lock l-st')
+                            (execute-browser-tab-lock-effects! node-atom l-effs)))
+                        (.request ^js locks-api
+                                  lock-name
+                                  #js {:mode "exclusive"}
+                                  (fn [_handoff-lock]
+                                    (js/Promise.
+                                     (fn [resolve-hold _]
+                                       (swap! tab-lock-runtime-atom assoc :release-fn resolve-hold)
+                                       (when (and node-atom @node-atom)
+                                         (let [[l-st' l-effs] (lock-core/transition-lock
+                                                               (:instance-lock @node-atom)
+                                                               {:type :web-lock-acquired
+                                                                :generation (get-in @node-atom [:instance-lock :generation] 1)
+                                                                :handoff? true
+                                                                :now-ms (.now js/Date)})]
+                                           (swap! node-atom assoc :instance-lock l-st')
+                                           (execute-browser-tab-lock-effects! node-atom l-effs)))))))))))
+        ;; navigator.locks unavailable -> :single with counted :web-locks-unavailable diagnostic
+        (let [[l-st' l-effs] (lock-core/transition-lock
+                              (:instance-lock @node-atom)
+                              {:type :web-lock-unavailable
+                               :generation (get-in @node-atom [:instance-lock :generation] 1)
+                               :now-ms (.now js/Date)})]
+          (swap! node-atom assoc :instance-lock l-st')
+          (execute-browser-tab-lock-effects! node-atom l-effs))))))
 
 (defn handle-visibility-change!
   "Dispatches visibility change ('visible' | 'hidden') into active node's connection state, mesh-conns, and auto-sync."
@@ -1923,15 +2118,14 @@
    (when node-atom
      (let [state-str (if (= (str vis-state) "hidden") "hidden" "visible")
            vis-kw (if (= state-str "hidden") :hidden :visible)
-           prev-vis (get-in @node-atom [:auto-sync :visibility] :visible)
            [new-conn effects] (browser/transition-conn (:conn @node-atom)
                                                        {:type :visibility-change :state state-str})
            [new-mesh _mesh-effs] (browser/transition-mesh-visibility (:mesh-conns @node-atom) state-str)
-           [new-as as-effs] (browser/transition-auto-sync (:auto-sync @node-atom)
-                                                          {:type :visibility-change
-                                                           :generation (get-in @node-atom [:auto-sync :generation] 1)
-                                                           :visibility vis-kw
-                                                           :prev-visibility prev-vis})]
+           [new-as as-effs] (sync-core/step-auto-sync (:auto-sync @node-atom)
+                                                      {:type :visibility-change
+                                                       :generation (get-in @node-atom [:auto-sync :generation] 1)
+                                                       :now-ms (.now js/Date)
+                                                       :visibility vis-kw})]
        (swap! node-atom assoc :conn new-conn :mesh-conns new-mesh :auto-sync new-as)
        (execute-browser-auto-sync-effects! node-atom as-effs)
        (clj->js {:visibilityState (:visibility-state new-conn)
@@ -2672,6 +2866,7 @@
   [& [node-atom]]
   (let [na (or node-atom @active-node-atom)]
     (stop-browser-auto-sync! na)
+    (release-browser-tab-lock! na)
     (when (and na @na)
       (let [channels (:active-channels @na)]
         (doseq [[_id dc] channels]

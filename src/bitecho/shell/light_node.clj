@@ -9,6 +9,7 @@
             [bitecho.deploy.core :as deploy]
             [bitecho.errors.core :as errors]
             [bitecho.fressian :as fressian]
+            [bitecho.lifecycle.lock-core :as lock-core]
             [bitecho.light-node.cli :as cli]
             [bitecho.light-node.core :as light-core]
             [bitecho.light-node.mcp :as mcp]
@@ -17,6 +18,7 @@
             [bitecho.shell.identity :as identity]
             [bitecho.shell.updater :as updater]
             [bitecho.snapshot.core :as snap]
+            [bitecho.sync.core :as sync-core]
             [clojure.data.json :as json]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
@@ -28,9 +30,10 @@
            [java.lang ProcessHandle ProcessBuilder ProcessBuilder$Redirect]
            [java.net InetSocketAddress StandardSocketOptions URI]
            [java.net.http HttpClient HttpClient$Redirect HttpClient$Version HttpRequest HttpRequest$BodyPublishers HttpResponse$BodyHandlers]
+           [java.nio ByteBuffer]
            [java.nio.channels DatagramChannel FileChannel]
            [java.nio.charset StandardCharsets]
-           [java.nio.file Files StandardCopyOption StandardOpenOption]
+           [java.nio.file FileAlreadyExistsException Files StandardCopyOption StandardOpenOption]
            [java.nio.file.attribute PosixFilePermissions]
            [java.time Duration]
            [java.util.concurrent Executors ThreadFactory]))
@@ -1311,15 +1314,20 @@
       (:last-diagnostic conn) (assoc :last_diagnostic (:last-diagnostic conn)))))
 
 (defn- sync-conn-diagnostics!
-  "Updates state-atom with connection liveness and conn-diagnostics summary."
+  "Updates state-atom with connection liveness, conn-diagnostics summary, and live :runtime-ctx."
   [state-atom conn-atom]
   (when (and state-atom conn-atom)
     (let [c @conn-atom
           diag (conn-diagnostics-summary c)]
-      (swap! state-atom assoc
-             :connected? (boolean (:ok? c))
-             :connection-error (:error c)
-             :conn-diagnostics diag))))
+      (swap! state-atom (fn [st]
+                          (-> st
+                              (assoc :connected? (boolean (:ok? c))
+                                     :connection-error (:error c)
+                                     :conn-diagnostics diag)
+                              (update :runtime-ctx merge
+                                      {:runtime :jvm
+                                       :conn (assoc c :diagnostics diag)
+                                       :connected? (boolean (:ok? c))})))))))
 
 (defn- record-conn-diagnostic!
   "Records a connection-level diagnostic failure into state-atom under :diagnostics."
@@ -3246,63 +3254,124 @@
                   err)))))))))
 
 (defn run-auto-sync-tick!
-  "Executes a single non-blocking background chain-state quorum sync tick.
-   Updates state-atom, persists to state-file when sync succeeds, emits a structured
-   `auto-sync` JSONL event, diagnoses failures loudly (Rule 5), and optionally renews
-   `register-home-set` when `:auto-register-home-set?` is enabled."
+  "Executes a single non-blocking background chain-state quorum sync tick driven by
+   `bitecho.sync.core/step-auto-sync` (BIP-022 Stage B, Row 5; Rules 2, 4, 5).
+   Updates state-atom, persists to state-file when sync succeeds, detects F-EPOCH-1
+   stalls loudly, emits structured `auto-sync` JSONL events, diagnoses failures loudly,
+   and optionally renews `register-home-set` when `:auto-register-home-set?` is enabled."
   [state-atom bootstrap identity state-file conn-opts]
   (let [pubkey (or (:pubkey-hex identity) (:pubkey identity))
         privkey (:privkey-bytes identity)
         conn-atom (:conn-atom conn-opts)
         event-out (:event-out conn-opts)
-        sync-opts (assoc (or conn-opts {}) :identity identity)
-        res (try
-              (maybe-sync-account-state! state-atom bootstrap pubkey privkey sync-opts)
-              (catch Exception e
-                {:ok? false :error (or (.getMessage e) "auto-sync-tick-failed")}))]
-    (if (:ok? res)
-      (let [_ (when (:auto-register-home-set? conn-opts)
-                (let [price (long (or (:home-set-price conn-opts) 10))
-                      hs-res (light-core/handle-command @state-atom {"cmd" "register-home-set" "price" price} privkey)
-                      replay-envs (light-core/build-unacked-replay-envelopes @state-atom privkey)
-                      envs (into (vec replay-envs) (:net-envelopes hs-res))]
-                  (when (seq envs)
-                    (let [live? (and conn-atom (connection-live? @conn-atom @state-atom))
-                          sent? (if live?
-                                  (send-all-envelopes! (:send-fn @conn-atom) envs)
-                                  (when-let [rfn (:reconnect-fn conn-opts)]
-                                    (let [reconn (rfn)]
-                                      (and (:ok? reconn)
-                                           (send-all-envelopes! (:send-fn reconn) envs)))))]
-                      (if sent?
-                        (reset! state-atom (assoc (:state hs-res) :connected? true :connection-error nil))
-                        (when conn-atom
-                          (apply-conn-event! conn-atom {:type :send-failed :error "auto-register-home-set-send-failed"} conn-opts)
-                          (sync-conn-diagnostics! state-atom conn-atom)))))))
-            _ (when state-file
-                (try (save-light-state! state-file @state-atom) (catch Exception _ nil)))
-            st @state-atom
-            fin-ep (long (or (get-in st [:account :finalized-epoch]) (:epoch st) 0))
-            bal (long (or (get-in st [:account :balance]) 0))
-            spend (long (or (get-in st [:account :spendable]) bal 0))]
-        (when event-out
-          (event-out {"event" "auto-sync"
-                      "ok" true
-                      "finalized_epoch" fin-ep
-                      "balance" bal
-                      "spendable" spend
-                      "synced" true}))
-        res)
-      (let [err (str (or (:error res) "auto-sync-tick-failed"))]
-        (when conn-atom
-          (apply-conn-event! conn-atom {:type :auto-sync-failed :error err} conn-opts)
-          (sync-conn-diagnostics! state-atom conn-atom))
-        (when event-out
-          (event-out {"event" "auto-sync"
-                      "ok" false
-                      "synced" false
-                      "error" err}))
-        res))))
+        now-fn (or (:now-ms-fn conn-opts) #(System/currentTimeMillis))
+        sync-atom (or (:sync-atom conn-opts)
+                      (atom (sync-core/init-sync-state
+                             {:interval-ms (or (:sync-interval-ms conn-opts) sync-core/default-sync-interval-ms)
+                              :stall-threshold-ms (or (:stall-threshold-ms conn-opts) sync-core/default-stall-threshold-ms)})))
+        cur-gen (:generation @sync-atom 1)
+        [tick-st tick-effs] (sync-core/step-auto-sync @sync-atom
+                                                      {:type :tick
+                                                       :generation cur-gen
+                                                       :now-ms (now-fn)
+                                                       :active? true})
+        _ (reset! sync-atom tick-st)
+        _ (swap! state-atom assoc-in [:runtime-ctx :sync-state] tick-st)
+        should-fetch? (boolean (some #(= :fetch-quorum-sync (:effect %)) tick-effs))]
+    (if-not should-fetch?
+      {:ok? true :skipped? true}
+      (let [sync-opts (assoc (or conn-opts {}) :identity identity)
+            res (try
+                  (maybe-sync-account-state! state-atom bootstrap pubkey privkey sync-opts)
+                  (catch Exception e
+                    {:ok? false :error (or (.getMessage e) "auto-sync-tick-failed")}))]
+        (if (:ok? res)
+          (let [_ (when (:auto-register-home-set? conn-opts)
+                    (let [price (long (or (:home-set-price conn-opts) 10))
+                          hs-res (light-core/handle-command @state-atom {"cmd" "register-home-set" "price" price} privkey)
+                          replay-envs (light-core/build-unacked-replay-envelopes @state-atom privkey)
+                          envs (into (vec replay-envs) (:net-envelopes hs-res))]
+                      (when (seq envs)
+                        (let [live? (and conn-atom (connection-live? @conn-atom @state-atom))
+                              sent? (if live?
+                                      (send-all-envelopes! (:send-fn @conn-atom) envs)
+                                      (when-let [rfn (:reconnect-fn conn-opts)]
+                                        (let [reconn (rfn)]
+                                          (and (:ok? reconn)
+                                               (send-all-envelopes! (:send-fn reconn) envs)))))]
+                          (if sent?
+                            (reset! state-atom (assoc (:state hs-res) :connected? true :connection-error nil))
+                            (when conn-atom
+                              (apply-conn-event! conn-atom {:type :send-failed :error "auto-register-home-set-send-failed"} conn-opts)
+                              (sync-conn-diagnostics! state-atom conn-atom)))))))
+                st0 @state-atom
+                fin-ep (long (or (get-in st0 [:account :finalized-epoch]) (:epoch st0) 0))
+                bal (long (or (get-in st0 [:account :balance]) 0))
+                spend (long (or (get-in st0 [:account :spendable]) bal 0))
+                [sync-st' effs] (sync-core/step-auto-sync @sync-atom
+                                                          {:type :fetch-ok
+                                                           :generation cur-gen
+                                                           :now-ms (now-fn)
+                                                           :finalized-epoch fin-ep
+                                                           :head-epoch (:head-epoch res)
+                                                           :balance bal
+                                                           :spendable spend})
+                _ (reset! sync-atom sync-st')
+                _ (swap! state-atom
+                         (fn [s]
+                           (let [tracker {:last-finalized-epoch (:last-finalized-epoch sync-st')
+                                          :last-advanced-ms (:last-advanced-ms sync-st')
+                                          :stalled? (:stalled? sync-st')
+                                          :stall-started-ms (:stall-started-ms sync-st')
+                                          :stall-duration-ms (:stall-duration-ms sync-st')}]
+                             (cond-> (-> s
+                                         (assoc :auto-sync-stall-tracker tracker
+                                                :auto-sync-last-error (:last-error sync-st'))
+                                         (assoc-in [:runtime-ctx :sync-state] sync-st'))
+                               (:stalled? sync-st')
+                               (-> (update-in [:diagnostics :auto-sync-stalled] (fnil inc 0))
+                                   (update-in [:diagnostics :finalized-epoch-stalled] (fnil inc 0)))))))
+                _ (when state-file
+                    (try (save-light-state! state-file @state-atom) (catch Exception _ nil)))]
+            (doseq [eff effs]
+              (case (:effect eff)
+                :diagnose
+                (when (= :auto-sync-stalled (:reason eff))
+                  (when conn-atom
+                    (apply-conn-event! conn-atom
+                                       {:type :finalized-epoch-stalled
+                                        :finalized-epoch fin-ep
+                                        :stall-duration-ms (:stall-duration-ms eff)
+                                        :diagnose eff}
+                                       conn-opts)
+                    (sync-conn-diagnostics! state-atom conn-atom)))
+
+                :emit-event
+                (when event-out
+                  (event-out (:event eff)))
+
+                nil))
+            (assoc res
+                   :stalled? (:stalled? sync-st')
+                   :stall-duration-ms (:stall-duration-ms sync-st')))
+          (let [err (str (or (:error res) "auto-sync-tick-failed"))
+                [sync-st' effs] (sync-core/step-auto-sync @sync-atom
+                                                          {:type :fetch-error
+                                                           :generation cur-gen
+                                                           :now-ms (now-fn)
+                                                           :error err})]
+            (reset! sync-atom sync-st')
+            (swap! state-atom (fn [s]
+                                (-> s
+                                    (assoc :auto-sync-last-error err)
+                                    (assoc-in [:runtime-ctx :sync-state] sync-st'))))
+            (when conn-atom
+              (apply-conn-event! conn-atom {:type :auto-sync-failed :error err} conn-opts)
+              (sync-conn-diagnostics! state-atom conn-atom))
+            (doseq [eff effs]
+              (when (and (= :emit-event (:effect eff)) event-out)
+                (event-out (:event eff))))
+            res))))))
 
 (defn- detect-lan-ipv4
   "Finds the first up, non-loopback IPv4 host address, preferring site-local addresses,
@@ -3341,104 +3410,195 @@
     (.pid (ProcessHandle/current))
     (catch Exception _ 1)))
 
+(defn- generate-lock-token
+  []
+  (let [bytes (byte-array 8)]
+    (.nextBytes (java.security.SecureRandom.) bytes)
+    (apply str (map #(format "%02x" (bit-and % 0xff)) bytes))))
+
+(defn- write-lock-exclusive!
+  "OS-atomic CREATE_NEW write with POSIX 0600 permissions and fsync (`force(true)`).
+   Returns `:created` or `:exists`."
+  [^java.io.File lock-file payload-map]
+  (let [path (.toPath lock-file)
+        bytes (.getBytes (pr-str payload-map) StandardCharsets/UTF_8)]
+    (try
+      (with-open [ch (FileChannel/open path
+                                       (into-array java.nio.file.OpenOption
+                                                   [StandardOpenOption/CREATE_NEW
+                                                    StandardOpenOption/WRITE]))]
+        (try
+          (Files/setPosixFilePermissions path (PosixFilePermissions/fromString "rw-------"))
+          (catch UnsupportedOperationException _ nil))
+        (let [buf (ByteBuffer/wrap bytes)]
+          (while (.hasRemaining buf)
+            (.write ch buf)))
+        (.force ch true))
+      :created
+      (catch FileAlreadyExistsException _
+        :exists))))
+
+(defn- read-existing-lock-holder
+  [^java.io.File lock-file ^java.io.File ctrl-file]
+  (let [lock-info (when (.exists lock-file)
+                    (try (edn/read-string (slurp lock-file)) (catch Exception _ nil)))
+        ctrl-info (when (.exists ctrl-file)
+                    (try (json/read-str (slurp ctrl-file)) (catch Exception _ nil)))
+        raw-pid (or (when (map? lock-info) (:pid lock-info))
+                    (when (map? ctrl-info) (or (get ctrl-info "pid") (:pid ctrl-info))))
+        pid-long (when (some? raw-pid)
+                   (try (Long/parseLong (str raw-pid)) (catch Exception _ nil)))]
+    (when (or (map? lock-info) (some? pid-long))
+      {:pid pid-long
+       :token (when (map? lock-info) (:token lock-info))
+       :timestamp-ms (when (map? lock-info) (:timestamp-ms lock-info))})))
+
 (defn check-single-instance-lock
-  "Atomic single-instance serve/driver guard (`BIP-010` / `P-OPS-3`, Rule 5):
-   Probes `<state-dir>/serve.lock` and `<state-dir>/control.json` for an active PID.
-   - If held by a live PID (`(pid-alive-fn locked-pid)` is true and `locked-pid != current-pid`),
-     fails fast without overwriting `control.json`, returning a counted `:diagnose`
-     (`:reason :duplicate-serve-instance-rejected`).
-   - If the lock is from a dead PID, reclaims the stale lock, records `:reclaimed-stale-lock? true`,
-     and writes `{:pid current-pid :timestamp-ms ...}` into `<state-dir>/serve.lock`."
+  "OS-atomic single-instance serve/driver guard (`BIP-022` Row 10 / `BIP-010` / `P-OPS-3`, Rules 4 & 5):
+   Uses `FileChannel.open(CREATE_NEW, WRITE)` with POSIX `0600` + `force(true)` driven by
+   `bitecho.lifecycle.lock-core/transition-lock`.
+   - If `serve.lock` (or `control.json`) is held by a live PID (`!= current-pid`), fails fast
+     without touching `control.json`, returning canonical `:duplicate-instance` error + counted
+     `:diagnose {:reason :duplicate-serve-instance-rejected}`.
+   - If held by a dead PID (or corrupt lock), unlinks and retries atomic `CREATE_NEW` (bounded
+     by `lock-core/default-max-reclaim-retries`), emitting counted `:stale-serve-lock-reclaimed`."
   ([state-dir]
    (check-single-instance-lock state-dir nil))
-  ([state-dir {:keys [current-pid pid-alive-fn timestamp-ms state]}]
+  ([state-dir {:keys [current-pid pid-alive-fn timestamp-ms state token]}]
    (locking single-instance-lock-guard
      (let [dir (io/file (or state-dir "."))
            _ (when-not (.exists dir) (.mkdirs dir))
            lock-file (io/file dir "serve.lock")
            ctrl-file (io/file dir "control.json")
            my-pid (long (or current-pid (current-jvm-pid)))
+           my-tok (or token (generate-lock-token))
            alive-fn (or pid-alive-fn default-pid-alive?)
            now-ms (long (or timestamp-ms (System/currentTimeMillis)))
-           lock-info (when (.exists lock-file)
-                       (try (edn/read-string (slurp lock-file)) (catch Exception _ nil)))
-           ctrl-info (when (.exists ctrl-file)
-                       (try (json/read-str (slurp ctrl-file)) (catch Exception _ nil)))
-           existing-pid (or (when (map? lock-info) (:pid lock-info))
-                            (when (map? ctrl-info) (or (get ctrl-info "pid") (:pid ctrl-info))))
-           existing-pid-long (when (some? existing-pid)
-                               (try (Long/parseLong (str existing-pid)) (catch Exception _ nil)))
-           live-holder? (boolean (and existing-pid-long
-                                      (not= existing-pid-long my-pid)
-                                      (alive-fn existing-pid-long)))]
-       (if live-holder?
-         (let [diag {:effect :diagnose
-                     :type :diagnose
-                     :reason :duplicate-serve-instance-rejected
-                     :locked-pid existing-pid-long
-                     :attempted-pid my-pid
-                     :state-dir (.getAbsolutePath dir)}
-               st' (update-in (or state {:diagnostics {}})
-                              [:diagnostics :duplicate-serve-instance-rejected]
-                              (fnil inc 0))]
-           {:ok? false
-            :error "already-running"
-            :locked-pid existing-pid-long
-            :attempted-pid my-pid
-            :diagnose diag
-            :diagnostics (:diagnostics st')
-            :state st'
-            :effects [diag]})
-         (let [reclaimed? (boolean (and existing-pid-long (not= existing-pid-long my-pid)))
-               new-lock {:pid my-pid
-                         :timestamp-ms now-ms
-                         :reclaimed-stale-pid (when reclaimed? existing-pid-long)}
-               tmp-f (java.io.File/createTempFile "serve-lock-" ".tmp" dir)]
-           (try
-             (spit tmp-f (pr-str new-lock))
-             (try
-               (Files/move (.toPath tmp-f) (.toPath lock-file)
-                           (into-array java.nio.file.CopyOption [StandardCopyOption/ATOMIC_MOVE
-                                                                 StandardCopyOption/REPLACE_EXISTING]))
-               (catch Exception _
-                 (Files/move (.toPath tmp-f) (.toPath lock-file)
-                             (into-array java.nio.file.CopyOption [StandardCopyOption/REPLACE_EXISTING]))))
-             (finally
-               (when (.exists tmp-f) (try (.delete tmp-f) (catch Exception _ nil)))))
-           (cond-> {:ok? true
-                    :locked-pid my-pid
-                    :lock-file (.getAbsolutePath lock-file)
-                    :reclaimed-stale-lock? reclaimed?
-                    :effects (if reclaimed?
-                               [{:effect :diagnose
-                                 :type :diagnose
-                                 :reason :stale-serve-lock-reclaimed
-                                 :stale-pid existing-pid-long
-                                 :new-pid my-pid}]
-                               [])}
-             reclaimed? (assoc :stale-pid existing-pid-long))))))))
+           ;; Upgrade compatibility: if serve.lock does not exist yet, check live control.json PID
+           ctrl-holder (when (and (not (.exists lock-file)) (.exists ctrl-file))
+                         (read-existing-lock-holder lock-file ctrl-file))
+           init-st (lock-core/init-lock-state {:mode :pid-file
+                                               :lock-id (.getAbsolutePath lock-file)
+                                               :self-id my-pid
+                                               :token my-tok
+                                               :runtime "jvm"
+                                               :generation 1})
+           [st0 effs0] (lock-core/transition-lock init-st {:type :acquire-requested :now-ms now-ms})]
+       (loop [cur-st st0
+              effs effs0
+              all-diags []]
+         (let [diag-effs (filterv #(= :diagnose (:effect %)) effs)
+               next-diags (into all-diags diag-effs)
+               action-eff (first (remove #(= :diagnose (:effect %)) effs))]
+           (case (:effect action-eff)
+             :fs-create-exclusive
+             (let [live-ctrl? (boolean (and ctrl-holder
+                                            (some? (:pid ctrl-holder))
+                                            (not= (:pid ctrl-holder) my-pid)
+                                            (alive-fn (:pid ctrl-holder))))
+                   create-res (if live-ctrl?
+                                :exists
+                                (write-lock-exclusive! lock-file (:payload action-eff)))]
+               (if (= :created create-res)
+                 (let [[st' effs'] (lock-core/transition-lock cur-st {:type :create-exclusive-ok
+                                                                      :generation (:generation action-eff)
+                                                                      :now-ms now-ms})]
+                   (recur st' effs' next-diags))
+                 (let [holder (or (read-existing-lock-holder lock-file ctrl-file) ctrl-holder)
+                       h-pid (:pid holder)
+                       alive? (boolean (and h-pid (not= h-pid my-pid) (alive-fn h-pid)))
+                       [st' effs'] (lock-core/transition-lock cur-st {:type :create-exclusive-exists
+                                                                      :generation (:generation action-eff)
+                                                                      :existing-holder holder
+                                                                      :holder-alive? alive?
+                                                                      :now-ms now-ms})]
+                   (recur st' effs' next-diags))))
+
+             :fs-reclaim-stale
+             (do
+               (when (.exists lock-file)
+                 (try (.delete lock-file) (catch Exception _ nil)))
+               (let [recreate-res (write-lock-exclusive! lock-file (:payload action-eff))]
+                 (if (= :created recreate-res)
+                   (let [[st' effs'] (lock-core/transition-lock cur-st {:type :stale-reclaim-ok
+                                                                        :generation (:generation action-eff)
+                                                                        :stale-pid (:expected-stale-pid action-eff)
+                                                                        :now-ms now-ms})]
+                     (recur st' effs' next-diags))
+                   (let [[st' effs'] (lock-core/transition-lock cur-st {:type :stale-reclaim-race
+                                                                        :generation (:generation action-eff)
+                                                                        :now-ms now-ms})]
+                     (recur st' effs' next-diags)))))
+
+             :activate-leader
+             (let [reclaimed? (boolean (:reclaimed-stale-lock? cur-st))
+                   stale-pid (:stale-pid cur-st)]
+               (cond-> {:ok? true
+                        :locked-pid my-pid
+                        :token my-tok
+                        :lock-file (.getAbsolutePath lock-file)
+                        :reclaimed-stale-lock? reclaimed?
+                        :lock-state cur-st
+                        :effects next-diags}
+                 reclaimed? (assoc :stale-pid stale-pid)))
+
+             :reject-duplicate
+             (let [canon-err (:error action-eff)
+                   locked-pid (:holder-pid cur-st)
+                   diag (or (first (filter #(= :duplicate-serve-instance-rejected (:reason %)) next-diags))
+                            {:effect :diagnose
+                             :type :diagnose
+                             :reason :duplicate-serve-instance-rejected
+                             :locked-pid locked-pid
+                             :attempted-pid my-pid
+                             :state-dir (.getAbsolutePath dir)})
+                   st' (update-in (or state {:diagnostics {}})
+                                  [:diagnostics :duplicate-serve-instance-rejected]
+                                  (fnil inc 0))]
+               {:ok? false
+                :error "already-running"
+                :canonical-error canon-err
+                :locked-pid locked-pid
+                :attempted-pid my-pid
+                :lock-state cur-st
+                :diagnose diag
+                :diagnostics (:diagnostics st')
+                :state st'
+                :effects next-diags})
+
+             {:ok? false
+              :error "lock-acquisition-failed"
+              :lock-state cur-st
+              :effects next-diags})))))))
 
 (defn acquire-serve-lock!
-  "Acquires the single-instance lock for `state-dir`."
+  "Acquires the OS-atomic single-instance lock for `state-dir`."
   ([state-dir]
    (check-single-instance-lock state-dir nil))
   ([state-dir opts]
    (check-single-instance-lock state-dir opts)))
 
 (defn release-serve-lock!
-  "Releases `<state-dir>/serve.lock` if owned by `expected-pid` (or unconditionally when `expected-pid` is nil)."
+  "Releases `<state-dir>/serve.lock` only if owned by `expected-pid` (and `expected-token` when provided)."
   ([state-dir]
-   (release-serve-lock! state-dir nil))
+   (release-serve-lock! state-dir nil nil))
   ([state-dir expected-pid]
+   (release-serve-lock! state-dir expected-pid nil))
+  ([state-dir expected-pid expected-token]
    (locking single-instance-lock-guard
      (when state-dir
        (let [lock-file (io/file state-dir "serve.lock")]
          (when (.exists lock-file)
            (let [info (try (edn/read-string (slurp lock-file)) (catch Exception _ nil))
-                 owner-pid (when (map? info) (:pid info))]
-             (when (or (nil? expected-pid)
-                       (nil? owner-pid)
-                       (= (long expected-pid) (long owner-pid)))
+                 owner-pid (when (map? info) (:pid info))
+                 owner-tok (when (map? info) (:token info))
+                 pid-ok? (or (nil? expected-pid)
+                             (nil? owner-pid)
+                             (= (long expected-pid) (long owner-pid)))
+                 tok-ok? (or (nil? expected-token)
+                             (nil? owner-tok)
+                             (= (str expected-token) (str owner-tok)))]
+             (when (and pid-ok? tok-ok?)
                (try (.delete lock-file) (catch Exception _ false))))))))))
 
 (defn run-serve!
@@ -3455,14 +3615,24 @@
                    {:ok? true :locked-pid (current-jvm-pid)}
                    (acquire-serve-lock! state-dir opts))]
     (if-not (:ok? lock-res)
-      (let [err-ev {"event" "duplicate-serve-rejected"
-                    "ok" false
-                    "error" "already-running"
-                    "locked_pid" (:locked-pid lock-res)
-                    "diagnose" "duplicate-serve-instance-rejected"}]
+      (let [canon-wire (errors/canonical-error->wire
+                        (or (:canonical-error lock-res)
+                            (errors/canonical-error :duplicate-instance
+                                                    {:locked-pid (:locked-pid lock-res)
+                                                     :attempted-pid (:attempted-pid lock-res)
+                                                     :lock-file (str (io/file state-dir "serve.lock"))})))
+            err-ev (merge canon-wire
+                          {"event" "duplicate-serve-rejected"
+                           "ok" false
+                           "error" "duplicate-instance"
+                           "legacy_error" "already-running"
+                           "locked_pid" (:locked-pid lock-res)
+                           "diagnose" "duplicate-serve-instance-rejected"})]
         (emit-json-line! out-writer err-ev events-out)
         lock-res)
       (let [my-lock-pid (:locked-pid lock-res)
+            my-lock-token (:token lock-res)
+            lock-state (:lock-state lock-res)
             _ (when (:reclaimed-stale-lock? lock-res)
                 (emit-json-line! out-writer
                                  {"event" "stale-serve-lock-reclaimed"
@@ -3583,10 +3753,18 @@
                              (str "udp://" lan-ip ":" ingress-port)
                              (str "tcp://" lan-ip ":" ingress-port)]
                             [])
+            sync-interval-ms (max 1000 (long (or (:sync-interval-ms opts) sync-core/default-sync-interval-ms)))
+            sync-atom (atom (sync-core/init-sync-state {:interval-ms sync-interval-ms
+                                                        :stall-threshold-ms (or (:stall-threshold-ms opts)
+                                                                                sync-core/default-stall-threshold-ms)
+                                                        :enabled? (boolean (:auto-sync? opts true))}))
             _ (swap! state-atom assoc
                      :mdns-hostname mdns-host
                      :lan-ip lan-ip
-                     :default-p2p-candidates default-cands)
+                     :default-p2p-candidates default-cands
+                     :runtime-ctx {:runtime :jvm
+                                   :lock-state lock-state
+                                   :sync-state @sync-atom})
             mdns-svc (try (mdns/start-mdns-service! {:initial-hosts {mdns-host lan-ip}}) (catch Exception _ nil))
             stop-updater! (when (:auto-update-pointer opts)
                             (updater/start-jvm-auto-updater!
@@ -3606,6 +3784,7 @@
             conn-opts (assoc opts
                              :state-atom state-atom
                              :conn-atom conn-atom
+                             :sync-atom sync-atom
                              :event-out event-out
                              :reconnect-fn reconnect-fn
                              :state-file state-file
@@ -3761,7 +3940,7 @@
                            (swap! st update-in [:diagnostics :control-server-fatal] (fnil inc 0)))
                          nil))
             shutdown-hook (Thread. ^Runnable (fn []
-                                               (release-serve-lock! state-dir my-lock-pid)
+                                               (release-serve-lock! state-dir my-lock-pid my-lock-token)
                                                (when ctrl-svc
                                                  (try ((:stop! ctrl-svc)) (catch Exception _ nil)))))
             _ (.addShutdownHook (Runtime/getRuntime) shutdown-hook)
@@ -3834,7 +4013,7 @@
            :daemon-running? daemon-running?
            :stop! (fn []
                     (reset! daemon-running? false)
-                    (release-serve-lock! state-dir my-lock-pid)
+                    (release-serve-lock! state-dir my-lock-pid my-lock-token)
                     (when conn-atom
                       (apply-conn-event! conn-atom {:type :shutdown} conn-opts))
                     (when ctrl-svc
@@ -3858,7 +4037,7 @@
                         (try (Thread/sleep 1000) (catch InterruptedException _ (reset! daemon-running? false)))))))))
             (finally
               (reset! daemon-running? false)
-              (release-serve-lock! state-dir my-lock-pid)
+              (release-serve-lock! state-dir my-lock-pid my-lock-token)
               (when conn-atom
                 (apply-conn-event! conn-atom {:type :shutdown} conn-opts))
               (when ctrl-svc
