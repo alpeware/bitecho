@@ -359,7 +359,7 @@
                 :nonce nonce1
                 :network-uri net-uri})
          claim1 (faucet/reduce-faucet-claim
-                 (:state ch1)
+                 (assoc (:state ch1) :trusted-root-fingerprints #{(:trusted-root-fingerprint att1)})
                  (assoc att1
                         :nonce nonce1
                         :credential-id-hash cred-hash
@@ -376,7 +376,7 @@
                 :nonce nonce2
                 :network-uri net-uri})
          claim2 (faucet/reduce-faucet-claim
-                 (:state ch2)
+                 (assoc (:state ch2) :trusted-root-fingerprints #{(:trusted-root-fingerprint att2)})
                  (assoc att2
                         :nonce nonce2
                         :credential-id-hash cred-hash
@@ -642,20 +642,21 @@
               nonce (get-in ch-json ["challenge" "nonce"])
               ;; 2. Submit claim with verified hardware attestation (BIP-024 fail-closed)
               hw-kp (crypto/generate-keypair "d32-s4-hw")
-              att1 (:attestation (faucet/build-test-hardware-attestation
-                                  {:hw-privkey (kp->sk hw-kp)
-                                   :hw-pubkey (kp->pk-hex hw-kp)
-                                   :claimant-privkey (kp->sk claimant-kp)
-                                   :claimant-pubkey claimant-pk
-                                   :nonce nonce
-                                   :network-uri "devnet.bitecho.org"}))
+              att1-bundle (faucet/build-test-hardware-attestation
+                           {:hw-privkey (kp->sk hw-kp)
+                            :hw-pubkey (kp->pk-hex hw-kp)
+                            :claimant-privkey (kp->sk claimant-kp)
+                            :claimant-pubkey claimant-pk
+                            :nonce nonce
+                            :network-uri "devnet.bitecho.org"})
+              att1 (:attestation att1-bundle)
+              _ (swap! faucet-atom assoc :trusted-root-fingerprints #{(:trusted-root-fingerprint att1-bundle)})
               claim-body (json/write-str {"nonce" nonce
                                           "credential_id_hash" cred-hash
                                           "claimant_pubkey" claimant-pk
                                           "network_uri" "devnet.bitecho.org"
-                                          "attestation" {"fmt" (:fmt att1)
-                                                         "aaguid" (:aaguid att1)
-                                                         "x5c" (:x5c att1)
+                                          "attestation" {"attestation_object_hex" (:attestation-object-hex att1)
+                                                         "client_data_hash_hex" (:client-data-hash-hex att1)
                                                          "hw_pubkey" (:hw-pubkey att1)
                                                          "assertion_sig" (:assertion-sig att1)
                                                          "claimant_pop_sig" (:claimant-pop-sig att1)}})

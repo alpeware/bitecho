@@ -307,7 +307,7 @@
      'reduce (coll reduce)
      'every? (coll every?)
      'some (coll some)
-     'distinct (coll distinct)
+     'distinct (alloc distinct)
      'range safe-range}))
 
 (defn- to-cond-map

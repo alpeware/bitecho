@@ -680,9 +680,10 @@
               :directory-entity
               (let [expected-auth (when (:authority principal) (normalize-spki-hex (:authority principal)))
                     norm-auth (normalize-spki-hex auth)
-                    ms (or (:owner-multisig principal) (:owner-multisig ctx) {})
-                    owners (set (keep normalize-spki-hex (or (:pubkeys ms) (:owner-pubkeys proof) [])))
-                    threshold (long (or (:threshold ms) (:owner-threshold proof) 1))]
+                    ;; F7: NEVER fall back to untrusted proof-claimed owners; require prior :owner-multisig from principal or ctx
+                    ms (or (:owner-multisig principal) (:owner-multisig ctx))
+                    owners (when (map? ms) (set (keep normalize-spki-hex (:pubkeys ms))))
+                    threshold (when (map? ms) (long (or (:threshold ms) 0)))]
                 (cond
                   (and expected-auth (not= norm-auth expected-auth))
                   {:ok? false :error :unauthorized-pointer-authority}
@@ -690,7 +691,10 @@
                   (not= :directory-entity (:proof/type proof))
                   {:ok? false :error :directory-entity-proof-required}
 
-                  (or (empty? owners) (< threshold 1) (> threshold (count owners)))
+                  (or (not (map? ms)) (empty? owners))
+                  {:ok? false :error :missing-prior-owner-multisig}
+
+                  (or (< threshold 1) (> threshold (count owners)))
                   {:ok? false :error :invalid-owner-multisig}
 
                   :else
@@ -768,8 +772,9 @@
 
         :directory-entity
         (let [sigs (:signatures proof)
-              allowed (set (keep normalize-spki-hex (or (:signers acl-res) (:owner-pubkeys proof) #{})))
-              threshold (long (or (:threshold acl-res) (:owner-threshold proof) 1))
+              ;; F7: Strictly use ACL-verified prior owners & threshold, never untrusted proof-claimed owners
+              allowed (set (keep normalize-spki-hex (:signers acl-res)))
+              threshold (long (or (:threshold acl-res) 0))
               tuple ["bitecho-pointer-directory-entity-v2"
                      (str (:pointer/subnet pointer))
                      path
@@ -1048,9 +1053,19 @@
                ms-expired? (and (some? expires) (some? now-ms)
                                 (>= (long now-ms) (+ (long expires) skew-ms)))
                epoch-expired? (and (some? expires-epoch) (some? current-epoch)
-                                   (>= (long current-epoch) (long expires-epoch)))]
-           (if (or ms-expired? epoch-expired?)
+                                   (>= (long current-epoch) (long expires-epoch)))
+               prev-ptr (:prev-pointer ctx)
+               seq-regressed? (and (map? prev-ptr)
+                                   (<= (long (:pointer/seq pointer))
+                                       (long (:pointer/seq prev-ptr 0))))]
+           (cond
+             (or ms-expired? epoch-expired?)
              {:ok? false :error :pointer-expired}
+
+             seq-regressed?
+             {:ok? false :error :non-monotonic-pointer-seq}
+
+             :else
              (let [dir-path? (str/starts-with? (str (:pointer/path pointer)) "dir/")
                    acl-res (cond
                              (and (nil? ctx) (not dir-path?))

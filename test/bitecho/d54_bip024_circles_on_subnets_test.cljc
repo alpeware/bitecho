@@ -14,6 +14,7 @@
             [bitecho.crypto :as crypto]
             [bitecho.economy.puzzle :as puzzle]
             [bitecho.fressian :as fressian]
+            [bitecho.light-node.core :as light-core]
             [bitecho.memento.constants :as mem-const]
             [bitecho.shell.browser :as browser]
             [bitecho.streamlet.core :as streamlet]
@@ -495,22 +496,29 @@
                        :network-uri "devnet.bitecho.org"
                        :authenticator-verified? true}
                       10100)
-          ;; fmt="none" MUST be rejected in production
+          ;; fmt="none" inside real CBOR attestationObject MUST be rejected in production (F1)
           ch2 (faucet/issue-faucet-challenge (:state forged-res) {:network-uri "devnet.bitecho.org" :rng rng} 10200)
+          n2 (get-in ch2 [:challenge :nonce])
+          hw-kp (gen-kp)
+          att-none (faucet/build-test-hardware-attestation
+                    {:hw-privkey (:private hw-kp)
+                     :hw-pubkey (:spki-hex hw-kp)
+                     :claimant-privkey (:private claimant)
+                     :claimant-pubkey (:spki-hex claimant)
+                     :nonce n2
+                     :network-uri "devnet.bitecho.org"
+                     :fmt "none"})
           fmt-none-res (faucet/reduce-faucet-claim
-                        (:state ch2)
-                        {:nonce (get-in ch2 [:challenge :nonce])
-                         :credential-id-hash "cred-1"
-                         :claimant-pubkey (:spki-hex claimant)
-                         :network-uri "devnet.bitecho.org"
-                         :attestation {:fmt "none"
-                                       :aaguid "2fc0579f-8113-47ea-b116-bb5a8db9202a"
-                                       :x5c ["cert-pem"]}}
+                        (assoc (:state ch2) :trusted-root-fingerprints #{(:trusted-root-fingerprint att-none)})
+                        (assoc att-none
+                               :nonce n2
+                               :credential-id-hash "cred-1"
+                               :claimant-pubkey (:spki-hex claimant)
+                               :network-uri "devnet.bitecho.org")
                         10300)
-          ;; Valid hardware attestation + claimant PoP + hardware uniqueness nullifier succeeds
+          ;; Valid CBOR attestationObject + real X.509 x5c chain + attStmt.sig + claimant PoP + pinned root succeeds (F1)
           ch3 (faucet/issue-faucet-challenge (:state fmt-none-res) {:network-uri "devnet.bitecho.org" :rng rng} 10400)
           n3 (get-in ch3 [:challenge :nonce])
-          hw-kp (gen-kp)
           att-payload (faucet/build-test-hardware-attestation
                        {:hw-privkey (:private hw-kp)
                         :hw-pubkey (:spki-hex hw-kp)
@@ -520,10 +528,35 @@
                         :network-uri "devnet.bitecho.org"
                         :aaguid "2fc0579f-8113-47ea-b116-bb5a8db9202a"
                         :fmt "packed"})
+          ;; Untrusted / unpinned X.509 root MUST be rejected fail-closed!
+          untrusted-root-res (faucet/reduce-faucet-claim
+                              (assoc (:state ch3) :trusted-root-fingerprints #{})
+                              (assoc att-payload
+                                     :nonce n3
+                                     :credential-id-hash "cred-1"
+                                     :claimant-pubkey (:spki-hex claimant)
+                                     :network-uri "devnet.bitecho.org"
+                                     :epoch 50)
+                              10450)
+          ;; Re-issue challenge and pin the trusted root fingerprint -> succeeds!
+          ch3b (faucet/issue-faucet-challenge (assoc (:state untrusted-root-res)
+                                                     :trusted-root-fingerprints #{(:trusted-root-fingerprint att-payload)})
+                                              {:network-uri "devnet.bitecho.org" :rng rng} 10460)
+          n3b (get-in ch3b [:challenge :nonce])
+          att-payload-b (faucet/build-test-hardware-attestation
+                         {:hw-privkey (:private hw-kp)
+                          :hw-pubkey (:spki-hex hw-kp)
+                          :claimant-privkey (:private claimant)
+                          :claimant-pubkey (:spki-hex claimant)
+                          :nonce n3b
+                          :network-uri "devnet.bitecho.org"
+                          :aaguid "2fc0579f-8113-47ea-b116-bb5a8db9202a"
+                          :fmt "packed"})
+          st3b (assoc (:state ch3b) :trusted-root-fingerprints #{(:trusted-root-fingerprint att-payload-b)})
           ok-res (faucet/reduce-faucet-claim
-                  (:state ch3)
-                  (assoc att-payload
-                         :nonce n3
+                  st3b
+                  (assoc att-payload-b
+                         :nonce n3b
                          :credential-id-hash "cred-1"
                          :claimant-pubkey (:spki-hex claimant)
                          :network-uri "devnet.bitecho.org"
@@ -542,7 +575,7 @@
                           :aaguid "2fc0579f-8113-47ea-b116-bb5a8db9202a"
                           :fmt "packed"})
           sybil-res (faucet/reduce-faucet-claim
-                     (:state ch4)
+                     (assoc (:state ch4) :trusted-root-fingerprints #{(:trusted-root-fingerprint att-payload-2)})
                      (assoc att-payload-2
                             :nonce n4
                             :credential-id-hash "cred-2-different"
@@ -550,20 +583,26 @@
                             :network-uri "devnet.bitecho.org"
                             :epoch 50)
                      10700)
-          ;; Unlinkable blinded voucher onboarding
+          ;; Unlinkable blinded voucher onboarding with earmarked funding & ledger credit (F10)
           blinding-secret "secret-blinding-factor-999"
           commitment (faucet/blind-voucher-commitment blinding-secret (:spki-hex claimant))
-          voucher (faucet/issue-blinded-voucher (:private treasury) (:spki-hex treasury)
-                                                "devnet.bitecho.org" test-genesis-cid commitment 1000 50)
-          redeemed (faucet/redeem-blinded-voucher (:state ok-res) voucher blinding-secret (:spki-hex claimant) 50)]
+          issued-res (faucet/issue-blinded-voucher (:state ok-res) commitment 1000 50)
+          voucher (:voucher issued-res)
+          redeemed (faucet/redeem-blinded-voucher (:state issued-res) voucher blinding-secret (:spki-hex claimant) 50)]
       (is (false? (:ok? forged-res)))
       (is (= :faucet-attestation-required (:error forged-res)))
       (is (false? (:ok? fmt-none-res)))
       (is (= :faucet-attestation-fmt-rejected (:error fmt-none-res)))
+      (is (false? (:ok? untrusted-root-res)))
+      (is (= :faucet-attestation-root-untrusted (:error untrusted-root-res)))
       (is (:ok? ok-res))
       (is (false? (:ok? sybil-res)))
       (is (= :faucet-hardware-already-claimed (:error sybil-res)))
+      (is (:ok? issued-res))
+      (is (= 1000 (:earmarked-voucher-balance (:state issued-res))))
       (is (:ok? redeemed))
+      (is (= 0 (:earmarked-voucher-balance (:state redeemed))))
+      (is (= 1000 (get-in (:state redeemed) [:ledger (:spki-hex claimant) :balance])))
       ;; Blinded voucher receipt never links hardware nullifier to claimant
       (is (not (contains? (:voucher-receipt redeemed) :hardware-nullifier)))
       (is (not (contains? (:voucher-receipt redeemed) :credential-id-hash))))))
@@ -722,3 +761,200 @@
       (is (false? (:ok? b2)))
       (is (= :bridge-root-cap-exceeded (:error b2)))
       (is (some #(= :bridge-root-cap-exceeded (:reason %)) (:effects b2))))))
+
+;; =============================================================================
+;; 7. Stage 4 seq 2 Regressions (V1 CLJS SCI distinct + V3 hierarchical directory-register)
+;; =============================================================================
+
+(deftest test-v1-sci-distinct-in-cljs-and-jvm
+  (testing "V1: (distinct [\"a\" \"b\" \"a\"]) evaluates cleanly inside SCI puzzle on both JVM and CLJS"
+    (let [src "(fn [env _sol] (if (= 2 (count (distinct [\"a\" \"b\" \"a\"]))) [{:type :release :receiver (:receiver env) :amount (:amount env)}] false))"
+          res (puzzle/eval-puzzle src {} {:receiver "alice" :amount 1000 :epoch 1})]
+      (is (true? (:valid? res)))
+      (is (= [{:type :release :receiver "alice" :amount 1000}] (:conditions res))))))
+
+(deftest test-v3-directory-register-preserves-hierarchical-paths-and-flat-nicknames
+  (testing "V3: directory-register preserves hierarchical slash paths while keeping flat nicknames working"
+    (let [kp (gen-kp)
+          st0 (light-core/init-light-state {:pubkey-hex (:spki-hex kp)} {})
+          r-hier (light-core/handle-command st0
+                                            {"cmd" "directory-register"
+                                             "name" "root/protocol/dev/nexus"
+                                             "domain" "devnet.bitecho.org"
+                                             "local_only" true}
+                                            (:private kp))
+          r-qual (light-core/handle-command st0
+                                            {"cmd" "directory-register"
+                                             "name" "devnet.bitecho.org/root/inc/board"
+                                             "local_only" true}
+                                            (:private kp))
+          r-flat (light-core/handle-command st0
+                                            {"cmd" "directory-register"
+                                             "name" "alice"
+                                             "domain" "devnet.bitecho.org"
+                                             "local_only" true}
+                                            (:private kp))]
+      (is (true? (get-in r-hier [:response "ok"])))
+      (is (= "devnet.bitecho.org/root/protocol/dev/nexus" (get-in r-hier [:response "uri"])))
+      (is (= "root/protocol/dev/nexus" (get-in r-hier [:response "nickname"])))
+      (is (true? (get-in r-qual [:response "ok"])))
+      (is (= "devnet.bitecho.org/root/inc/board" (get-in r-qual [:response "uri"])))
+      (is (= "root/inc/board" (get-in r-qual [:response "nickname"])))
+      (is (true? (get-in r-flat [:response "ok"])))
+      (is (= "devnet.bitecho.org/alice" (get-in r-flat [:response "uri"])))
+      (is (= "alice" (get-in r-flat [:response "nickname"]))))))
+
+;; =============================================================================
+;; 8. Axiom LIGHT Review Closures (F2, F6, F7, F8, F9, F13, F14, F15, MUT-12)
+;; =============================================================================
+
+(deftest test-axiom-f2-f6-f7-f8-f9-f13-f14-f15-and-mut12
+  (testing "F8 & F13: config/ratified-theta-star exists and mainnet-config enforces :strict-network-uri? true"
+    (is (map? config/ratified-theta-star))
+    (is (= 26280 (:bootstrap-sunset-epoch config/ratified-theta-star)))
+    (is (true? (:strict-network-uri? config/mainnet-config))))
+
+  (testing "F2: Live streamlet/valid-block-proposal? and verify-ancestor-quorum reject static fallback once last-finalized-epoch >= 1"
+    (let [v1 (gen-kp)
+          blk (streamlet/sign-block (streamlet/->Block 5 "genesis" [] (:spki-hex v1)) (:private v1))
+          b-hash (streamlet/hash-block blk)
+          sig (basalt/bytes->hex (crypto/sign (:private v1) (fressian/utf8->bytes b-hash)))
+          st {:epoch 5
+              :last-finalized-epoch 3
+              :strict-validator-history? true
+              :validator-set-history {}
+              :validators [(:spki-hex v1)]
+              :peers-map {(:spki-hex v1) (:public v1)}}
+          anc-res (streamlet/verify-ancestor-quorum st {:block blk :votes {(:spki-hex v1) (streamlet/->Vote b-hash 5 sig)}})]
+      (is (false? (streamlet/valid-block-proposal? st {:block blk})))
+      (is (false? (:valid? anc-res)))
+      (is (= :static-validator-fallback-forbidden (:error anc-res)))))
+
+  (testing "F6 & F7: verify-pointer enforces strict :pointer/seq monotonicity, prior-owner binding, and incoming-key PoP"
+    (let [auth-kp (gen-kp)
+          old-kp (gen-kp)
+          new-kp (gen-kp)
+          net "devnet.bitecho.org"
+          cid (circle/descriptor-cid {:seq 2})
+          ;; Proof with prior owner sig + incoming-key PoP
+          proof-with-pop (data/create-directory-entity-proof
+                          [{:pubkey (:spki-hex old-kp) :privkey (:private old-kp)}]
+                          net "dir/root/sub" 2 cid 1 [(:spki-hex new-kp)]
+                          {:incoming-signers [{:pubkey (:spki-hex new-kp) :privkey (:private new-kp)}]})
+          proof-no-pop (data/create-directory-entity-proof
+                        [{:pubkey (:spki-hex old-kp) :privkey (:private old-kp)}]
+                        net "dir/root/sub" 2 cid 1 [(:spki-hex new-kp)])
+          ptr2 (data/sign-pointer (:private auth-kp)
+                                  {:pointer/authority (:spki-hex auth-kp)
+                                   :pointer/subnet net
+                                   :pointer/path "dir/root/sub"
+                                   :pointer/seq 2
+                                   :pointer/target cid
+                                   :pointer/expires-epoch 500
+                                   :pointer/proof proof-with-pop})
+          ptr2-no-pop (data/sign-pointer (:private auth-kp)
+                                         {:pointer/authority (:spki-hex auth-kp)
+                                          :pointer/subnet net
+                                          :pointer/path "dir/root/sub"
+                                          :pointer/seq 2
+                                          :pointer/target cid
+                                          :pointer/expires-epoch 500
+                                          :pointer/proof proof-no-pop})
+          acl-with-prior [{:pattern "dir/*"
+                           :principal {:type :directory-entity
+                                       :authority (:spki-hex auth-kp)
+                                       :owner-multisig {:threshold 1 :pubkeys [(:spki-hex old-kp)]}}}]
+          acl-bare [{:pattern "dir/*"
+                     :principal {:type :directory-entity
+                                 :authority (:spki-hex auth-kp)}}]
+          ;; F7: Bare ACL without prior :owner-multisig MUST fail closed (never trust proof-claimed owners)
+          r-bare (data/verify-pointer ptr2 {:subnet net :path-acl acl-bare :current-epoch 10})
+          ;; F7: Missing incoming-key PoP on rotation fails closed through verify-pointer
+          r-no-pop (data/verify-pointer ptr2-no-pop {:subnet net :path-acl acl-with-prior
+                                                     :incoming-pubkeys [(:spki-hex new-kp)] :current-epoch 10})
+          ;; F7: Valid prior owner + incoming-key PoP passes through verify-pointer
+          r-ok (data/verify-pointer ptr2 {:subnet net :path-acl acl-with-prior
+                                          :incoming-pubkeys [(:spki-hex new-kp)]
+                                          :prev-pointer {:pointer/seq 1}
+                                          :current-epoch 10})
+          ;; F6: Non-monotonic :pointer/seq (2 <= 2 or 2 <= 3) fails closed!
+          r-replay (data/verify-pointer ptr2 {:subnet net :path-acl acl-with-prior
+                                              :incoming-pubkeys [(:spki-hex new-kp)]
+                                              :prev-pointer {:pointer/seq 2}
+                                              :current-epoch 10})]
+      (is (false? (:ok? r-bare)))
+      (is (= :missing-prior-owner-multisig (:error r-bare)))
+      (is (false? (:ok? r-no-pop)))
+      (is (= :missing-or-invalid-incoming-pop (:error r-no-pop)))
+      (is (:ok? r-ok))
+      (is (false? (:ok? r-replay)))
+      (is (= :non-monotonic-pointer-seq (:error r-replay)))))
+
+  (testing "F9, F14 & F15: :consent-round-cid validation, CSPRNG secretbox nonce non-reuse, and authenticated cancel-recovery"
+    (let [r1 (gen-kp)
+          g1 (gen-kp)
+          attacker (gen-kp)
+          desc-no-consent (circle/create-entity-descriptor
+                           {:network-uri "devnet.bitecho.org"
+                            :network-genesis-cid test-genesis-cid
+                            :entity-kind :circle
+                            :visibility :public
+                            :path "root"
+                            :owner-multisig {:threshold 1 :pubkeys [(:spki-hex r1)]}
+                            :purpose-cid test-purpose-cid
+                            :consent-round-cid nil
+                            :policy {:recovery-policy {:guardians [(:spki-hex g1)] :threshold 1 :timelock-epochs 168}}
+                            :retention-policy (sample-retention)
+                            :storage-accounting (sample-storage (:spki-hex r1))
+                            :issued-epoch 10
+                            :expires-epoch 27280}
+                           [{:pubkey (:spki-hex r1) :privkey (:private r1)}])
+          ;; F9: Missing :consent-round-cid on constitutional root MUST fail
+          r-f9 (circle/verify-entity-descriptor desc-no-consent {:network-uri "devnet.bitecho.org"
+                                                                 :network-genesis-cid test-genesis-cid})
+          ;; F14: Two encryptions of identical descriptor use distinct CSPRNG nonces
+          gk (crypto/sha256 (fressian/utf8->bytes "f14-key"))
+          e1 (circle/encrypt-shared-descriptor desc-no-consent gk)
+          e2 (circle/encrypt-shared-descriptor desc-no-consent gk)
+          ;; F15: cancel-recovery rejects unauthorized attacker and succeeds with owner sig
+          pending {:new-owner-multisig {:threshold 1 :pubkeys [(:spki-hex g1)]}
+                   :initiated-epoch 50
+                   :executable-epoch 218
+                   :status :pending}
+          tuple (circle/cancel-recovery-signing-tuple desc-no-consent pending)
+          att-sig (basalt/bytes->hex (crypto/sign-canonical (:private attacker) tuple))
+          own-sig (basalt/bytes->hex (crypto/sign-canonical (:private r1) tuple))
+          c-unauth (circle/cancel-recovery desc-no-consent pending {:owner-signatures {(:spki-hex attacker) att-sig}})
+          c-auth (circle/cancel-recovery desc-no-consent pending {:owner-signatures {(:spki-hex r1) own-sig}})]
+      (is (false? (:ok? r-f9)))
+      (is (= :missing-or-invalid-consent-round-cid (:error r-f9)))
+      (is (not= (:nonce-hex e1) (:nonce-hex e2)))
+      (is (false? (:ok? c-unauth)))
+      (is (= :unauthorized-recovery-cancel (:error c-unauth)))
+      (is (:ok? c-auth))
+      (is (= :cancelled (get-in c-auth [:pending-recovery :status])))))
+
+  (testing "MUT-12: :pointer/expires-epoch is strictly compared against :current-epoch and NEVER :now-ms"
+    (let [auth-kp (gen-kp)
+          own-kp (gen-kp)
+          net "devnet.bitecho.org"
+          cid (circle/descriptor-cid {:mut 12})
+          proof (data/create-directory-entity-proof
+                 [{:pubkey (:spki-hex own-kp) :privkey (:private own-kp)}]
+                 net "dir/root" 1 cid 1 [(:spki-hex own-kp)])
+          ptr (data/sign-pointer (:private auth-kp)
+                                 {:pointer/authority (:spki-hex auth-kp)
+                                  :pointer/subnet net
+                                  :pointer/path "dir/root"
+                                  :pointer/seq 1
+                                  :pointer/target cid
+                                  :pointer/expires-epoch 5000
+                                  :pointer/proof proof})
+          acl [{:pattern "dir/*"
+                :principal {:type :directory-entity
+                            :authority (:spki-hex auth-kp)
+                            :owner-multisig {:threshold 1 :pubkeys [(:spki-hex own-kp)]}}}]]
+      ;; now-ms is 1.8 trillion (>> 5000), but current-epoch 4999 < 5000 -> MUST SUCCEED
+      (is (:ok? (data/verify-pointer ptr {:subnet net :path-acl acl :current-epoch 4999 :now-ms 1800000000000})))
+      ;; now-ms is 1 (<< 5000), but current-epoch 5000 >= 5000 -> MUST FAIL CLOSED
+      (is (= :pointer-expired (:error (data/verify-pointer ptr {:subnet net :path-acl acl :current-epoch 5000 :now-ms 1})))))))

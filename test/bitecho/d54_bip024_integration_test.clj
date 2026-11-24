@@ -5,12 +5,16 @@
    - `state_machine/compute-checkpoint-state-digest` commitment to `:vaults` & `:validator-set-history`
    - `streamlet/verify-ancestor-quorum` historical catchup across 3+ consecutive validator rotations."
   (:require [bitecho.basalt.core :as basalt]
+            [bitecho.circles.vault :as vault]
+            [bitecho.config :as config]
             [bitecho.core.circle :as circle]
             [bitecho.core.data :as data]
             [bitecho.core.protocol.faucet :as faucet]
             [bitecho.core.subnet :as subnet]
             [bitecho.crypto :as crypto]
+            [bitecho.economy.puzzle :as puzzle]
             [bitecho.fressian :as fressian]
+            [bitecho.main :as main]
             [bitecho.shell.http :as http]
             [bitecho.state-machine :as sm]
             [bitecho.streamlet.core :as streamlet]
@@ -104,26 +108,27 @@
             (is (false? (get cl-json "ok")))
             (is (= "faucet-attestation-required" (get cl-json "error")))))
 
-        (testing "Valid hardware attestation over /faucet/v1/claim succeeds with 200"
+        (testing "Valid real CBOR + X.509 x5c hardware attestation over /faucet/v1/claim succeeds with 200 (F1)"
           (let [ch-req (-> (HttpRequest/newBuilder (URI/create (str "http://127.0.0.1:" port "/faucet/v1/challenge")))
                            (.GET)
                            (.build))
                 ch-resp (.send client ch-req (HttpResponse$BodyHandlers/ofString))
                 nonce (get-in (json/read-str (.body ch-resp)) ["challenge" "nonce"])
-                att (:attestation (faucet/build-test-hardware-attestation
-                                   {:hw-privkey (:private hw-kp)
-                                    :hw-pubkey (:spki-hex hw-kp)
-                                    :claimant-privkey (:private claimant)
-                                    :claimant-pubkey (:spki-hex claimant)
-                                    :nonce nonce
-                                    :network-uri "devnet.bitecho.org"}))
+                att-bundle (faucet/build-test-hardware-attestation
+                            {:hw-privkey (:private hw-kp)
+                             :hw-pubkey (:spki-hex hw-kp)
+                             :claimant-privkey (:private claimant)
+                             :claimant-pubkey (:spki-hex claimant)
+                             :nonce nonce
+                             :network-uri "devnet.bitecho.org"})
+                att (:attestation att-bundle)
+                _ (swap! faucet-atom assoc :trusted-root-fingerprints #{(:trusted-root-fingerprint att-bundle)})
                 valid-body (json/write-str {"nonce" nonce
                                             "credential_id_hash" "cred-valid-1"
                                             "claimant_pubkey" (:spki-hex claimant)
                                             "network_uri" "devnet.bitecho.org"
-                                            "attestation" {"fmt" (:fmt att)
-                                                           "aaguid" (:aaguid att)
-                                                           "x5c" (:x5c att)
+                                            "attestation" {"attestation_object_hex" (:attestation-object-hex att)
+                                                           "client_data_hash_hex" (:client-data-hash-hex att)
                                                            "hw_pubkey" (:hw-pubkey att)
                                                            "assertion_sig" (:assertion-sig att)
                                                            "claimant_pop_sig" (:claimant-pop-sig att)}})
@@ -189,3 +194,265 @@
       (is (:valid? (streamlet/verify-ancestor-quorum st (make-ancestor 25 c2))))
       ;; Forging an epoch 5 block with c3's votes MUST fail!
       (is (false? (:valid? (streamlet/verify-ancestor-quorum st (make-ancestor 5 c3))))))))
+
+(deftest test-v2-6node-vopr-partition-validator-rotation-and-vault-race
+  (testing "V2 (§6 item 1): Deterministic 6-node VOPR partition/heal + in-band :rotate-validator-set + concurrent :vault-seq race + 7-bucket INV-C1"
+    (let [;; 7 deterministic keypairs: 6 initial validators (n0..n5) + 1 replacement validator (n6)
+          kps (vec (repeatedly 7 gen-kp))
+          init-comm (subvec kps 0 6)
+          rot-comm (conj (subvec kps 0 5) (nth kps 6))
+          r1 (gen-kp)
+          r2 (gen-kp)
+          recv1 (gen-kp)
+          recv2 (gen-kp)
+          root-ms {:threshold 2 :pubkeys [(:spki-hex r1) (:spki-hex r2)]}
+          net-uri "devnet.bitecho.org"
+          gen-cid (apply str (repeat 64 "a"))
+          p-src (vault/canonical-multisig-treasury-puzzle-source 2 [(:spki-hex r1) (:spki-hex r2)])
+          p-hash (puzzle/puzzle-cid p-src)
+          peers-map (into {} (map (fn [kp] [(:spki-hex kp) (:public kp)]) kps))
+          init-vals (vec (sort (map :spki-hex init-comm)))
+          rot-vals (vec (sort (map :spki-hex rot-comm)))
+          kp-by-hex (into {} (map (fn [kp] [(:spki-hex kp) kp]) kps))
+          ;; Initialize 6 validator states with identical genesis custody supply = 100,000 ECHO
+          init-node (fn [kp]
+                      (-> (sm/init-state kp (config/make-config
+                                             {:network-uri net-uri
+                                              :network-genesis-cid gen-cid
+                                              :validators init-vals
+                                              :root-owner-multisig root-ms
+                                              :validator-activation-lead-epochs 6
+                                              :economy-enabled? true}))
+                          (assoc :network-uri net-uri
+                                 :network-genesis-cid gen-cid
+                                 :validators init-vals
+                                 :root-owner-multisig root-ms
+                                 :peers-map peers-map
+                                 :genesis-custody-supply 100000
+                                 :root-unallocated 0
+                                 :total-burned 0
+                                 :sunset-custody-burned 0
+                                 :validator-set-history {0 {:committee init-vals :quorum-threshold 4 :descriptor-cid gen-cid}})))
+          nodes0 (into {} (map (fn [kp] [(:spki-hex kp) (init-node kp)]) init-comm))
+          ;; Helper to finalize one Streamlet epoch on a given active partition of nodes
+          finalize-epoch!
+          (fn [nodes-map active-pks ep parent-hash receipts]
+            (let [ref-st (get nodes-map (first active-pks))
+                  hist-entry (streamlet/committee-at-epoch (:validator-set-history ref-st) ep)
+                  comm (vec (sort (or (:committee hist-entry) (:validators ref-st))))
+                  leader (nth comm (mod ep (count comm)))
+                  leader-kp (get kp-by-hex leader)
+                  blk (streamlet/sign-block (streamlet/->Block ep parent-hash receipts leader) (:private leader-kp))
+                  b-hash (streamlet/hash-block blk)
+                  ;; Deliver propose to active partition and collect 4-of-6 votes
+                  after-propose (reduce (fn [m pk]
+                                          (let [st (get m pk)
+                                                st' (assoc st :epoch ep)
+                                                res (sm/handle-event st' {:type :receive-propose :sender leader :block blk})]
+                                            (assoc m pk (:state res))))
+                                        nodes-map
+                                        active-pks)
+                  votes (keep (fn [pk]
+                                (when (contains? (set comm) pk)
+                                  (let [vkp (get kp-by-hex pk)
+                                        sig (basalt/bytes->hex (crypto/sign (:private vkp) (fressian/utf8->bytes b-hash)))]
+                                    [pk (streamlet/->Vote b-hash ep sig)])))
+                              active-pks)
+                  after-votes (reduce (fn [m pk]
+                                        (reduce (fn [m2 [vpk vote]]
+                                                  (let [res (sm/handle-event (get m2 pk) {:type :receive-vote :sender vpk :vote vote})]
+                                                    (assoc m2 pk (:state res))))
+                                                m
+                                                votes))
+                                      after-propose
+                                      active-pks)]
+              {:nodes after-votes :block blk :block-hash b-hash :votes (into {} votes)}))
+          ;; Partition: 4-node majority (init-vals[0..3]) active; 2-node minority (init-vals[4..5]) isolated
+          majority-pks (subvec init-vals 0 4)
+          minority-pk (nth init-vals 4)
+          ;; Epoch 1: Create persistent vault with 100,000 ECHO
+          r-create {:type :vault-create
+                    :receipt-id "v-create-1"
+                    :vault-id "vault:devnet.bitecho.org/root"
+                    :entity-uri "devnet.bitecho.org/root"
+                    :custody-bucket :bootstrap
+                    :puzzle-hash p-hash
+                    :balance 100000}
+          ;; Epoch 2: Concurrent :vault-seq 1 spend race (2 conflicting spends in same block!)
+          out-a [{:type :release :receiver (:spki-hex recv1) :amount 10000}
+                 {:type :relock :amount 90000 :next-puzzle-hash p-hash}]
+          dig-a (vault/treasury-spend-digest {:network-uri net-uri :network-genesis-cid gen-cid
+                                              :vault-id "vault:devnet.bitecho.org/root" :puzzle-hash p-hash
+                                              :vault-seq 1 :outputs out-a :next-puzzle-hash p-hash})
+          r-spend-a {:type :vault-spend
+                     :receipt-id "v-spend-a"
+                     :vault-id "vault:devnet.bitecho.org/root"
+                     :vault-seq 1
+                     :puzzle-source p-src
+                     :solution {:outputs out-a :next-puzzle-hash p-hash
+                                :signatures {(:spki-hex r1) (basalt/bytes->hex (crypto/sign (:private r1) dig-a))
+                                             (:spki-hex r2) (basalt/bytes->hex (crypto/sign (:private r2) dig-a))}}}
+          out-b [{:type :release :receiver (:spki-hex recv2) :amount 20000}
+                 {:type :relock :amount 80000 :next-puzzle-hash p-hash}]
+          dig-b (vault/treasury-spend-digest {:network-uri net-uri :network-genesis-cid gen-cid
+                                              :vault-id "vault:devnet.bitecho.org/root" :puzzle-hash p-hash
+                                              :vault-seq 1 :outputs out-b :next-puzzle-hash p-hash})
+          r-spend-b {:type :vault-spend
+                     :receipt-id "v-spend-b"
+                     :vault-id "vault:devnet.bitecho.org/root"
+                     :vault-seq 1
+                     :puzzle-source p-src
+                     :solution {:outputs out-b :next-puzzle-hash p-hash
+                                :signatures {(:spki-hex r1) (basalt/bytes->hex (crypto/sign (:private r1) dig-b))
+                                             (:spki-hex r2) (basalt/bytes->hex (crypto/sign (:private r2) dig-b))}}}
+          ;; Epoch 3: In-band :rotate-validator-set effective at epoch 9 (satisfying default 6-epoch activation lead: 3 + 6 = 9)
+          rot-desc (circle/create-validator-set-descriptor
+                    {:network-uri net-uri
+                     :network-genesis-cid gen-cid
+                     :version 1
+                     :not-before-epoch 9
+                     :epoch-finalized 3
+                     :epoch-effective 9
+                     :quorum-threshold 4
+                     :delegated-operator-circle "devnet.bitecho.org/root/protocol"
+                     :consent-round-cid (apply str (repeat 64 "2"))
+                     :committee (mapv (fn [pk] {:pubkey pk :role :core-validator :operator-circle "devnet.bitecho.org/root/protocol"}) rot-vals)
+                     :retention-policy {:max-entries 128 :max-bytes 1048576 :rotate-every-entries 32 :ttl-epochs 52560}
+                     :storage-accounting {:bytes-at-rest 2048 :cache-incentive :free-self-hosted :payer-pubkey (:spki-hex r1) :fee-ech 0}}
+                    [{:pubkey (:spki-hex r1) :privkey (:private r1)}
+                     {:pubkey (:spki-hex r2) :privkey (:private r2)}])
+          r-rotate {:type :rotate-validator-set :receipt-id "v-rot-1" :descriptor rot-desc}
+          ;; Run majority epochs 1, 2, 3 (leaders 1,2,3 all in majority-pks -> finalizes ep 1 & 2)
+          ;; Skip isolated minority leader slots 4 & 5, then run consecutive majority epochs 6, 7, 8 (finalizes ep 3 & records rotation at ep 9!)
+          e1 (finalize-epoch! nodes0 majority-pks 1 "genesis" [r-create])
+          e2 (finalize-epoch! (:nodes e1) majority-pks 2 (:block-hash e1) [r-spend-a r-spend-b])
+          e3 (finalize-epoch! (:nodes e2) majority-pks 3 (:block-hash e2) [r-rotate])
+          e6 (finalize-epoch! (:nodes e3) majority-pks 6 (:block-hash e3) [])
+          e7 (finalize-epoch! (:nodes e6) majority-pks 7 (:block-hash e6) [])
+          e8 (finalize-epoch! (:nodes e7) majority-pks 8 (:block-hash e7) [])
+          ;; Also produce post-rotation epoch 9 block signed by 4-of-6 of the rotated committee (rot-vals)
+          e9 (finalize-epoch! (:nodes e8) (subvec rot-vals 0 4) 9 (:block-hash e8) [])
+          maj-st (get (:nodes e8) (first majority-pks))
+          ;; Verify vault race: exactly 1 spend committed (90,000 relocked, vault-seq = 2), 2nd rejected with counted :diagnose
+          v-final (get-in maj-st [:vaults "vault:devnet.bitecho.org/root"])
+          ;; Verify 7-bucket INV-C1 conservation on finalized majority state
+          cons-res (vault/verify-7-bucket-conservation maj-st)
+          ;; Partition heal: lagging minority follower catches up using epoch-indexed :validator-set-history
+          healed-minority (assoc (get (:nodes e8) minority-pk)
+                                 :epoch 9
+                                 :validator-set-history (:validator-set-history maj-st))]
+      (is (= 2 (:vault-seq v-final)))
+      (is (= 90000 (:balance v-final)))
+      (is (= 1 (get-in maj-st [:diagnostics :vault-seq-mismatch])))
+      (is (:ok? cons-res) (str "INV-C1 conservation must hold after concurrent vault race: " cons-res))
+      (is (= (set rot-vals) (set (get-in maj-st [:validator-set-history 9 :committee]))))
+      ;; Lagging minority follower verifies pre-rotation (epoch 2) AND post-rotation (epoch 9) ancestors!
+      (is (:valid? (streamlet/verify-ancestor-quorum healed-minority {:block (:block e2) :votes (:votes e2)})))
+      (is (:valid? (streamlet/verify-ancestor-quorum healed-minority {:block (:block e9) :votes (:votes e9)})))
+      ;; F11: :rotate-validator-set mirrors to "root/validators" with epoch-anchored :supply-merkle-root
+      (is (= "root/validators" (get-in maj-st [:validator-set-mirror :pointer/path])))
+      (is (string? (get-in maj-st [:validator-set-mirror :supply-merkle-root]))))))
+
+(deftest test-axiom-f3-f4-f5-governance-cold-root-startup-and-reconfigure-gate
+  (testing "F3: State-machine executes :register-entity-descriptor, :register-advisory-twin, :initiate-recovery, :cancel-recovery, and :dissolve-circle"
+    (let [v1 (gen-kp)
+          r1 (gen-kp)
+          r2 (gen-kp)
+          g1 (gen-kp)
+          twin (gen-kp)
+          net "devnet.bitecho.org"
+          gen-cid (apply str (repeat 64 "a"))
+          p-cid (apply str (repeat 64 "1"))
+          c-cid (apply str (repeat 64 "2"))
+          root-ms {:threshold 2 :pubkeys [(:spki-hex r1) (:spki-hex r2)]}
+          peers {(:spki-hex v1) (:public v1)}
+          st0 (-> (sm/init-state v1 (config/make-config {:network-uri net :network-genesis-cid gen-cid
+                                                         :validators [(:spki-hex v1)] :root-owner-multisig root-ms}))
+                  (assoc :network-uri net :network-genesis-cid gen-cid :validators [(:spki-hex v1)]
+                         :root-owner-multisig root-ms :peers-map peers))
+          root-desc (circle/create-entity-descriptor
+                     {:network-uri net :network-genesis-cid gen-cid :entity-kind :circle :visibility :public
+                      :path "root" :owner-multisig root-ms :purpose-cid p-cid :consent-round-cid c-cid
+                      :policy {:recovery-policy {:guardians [(:spki-hex g1)] :threshold 1 :timelock-epochs 168}}
+                      :retention-policy {:max-entries 256 :max-bytes 4194304 :rotate-every-entries 64 :ttl-epochs 26280}
+                      :storage-accounting {:bytes-at-rest 2048 :cache-incentive :free-self-hosted :payer-pubkey (:spki-hex r1) :fee-ech 0}
+                      :issued-epoch 1 :expires-epoch 27280}
+                     [{:pubkey (:spki-hex r1) :privkey (:private r1)}
+                      {:pubkey (:spki-hex r2) :privkey (:private r2)}])
+          rec-tuple ["bitecho-recovery-v1" (:uri root-desc) {:threshold 1 :pubkeys [(:spki-hex g1)]} 1]
+          g-sig (basalt/bytes->hex (crypto/sign-canonical (:private g1) rec-tuple))
+          cancel-tuple (circle/cancel-recovery-signing-tuple root-desc {:initiated-epoch 1})
+          r1-csig (basalt/bytes->hex (crypto/sign-canonical (:private r1) cancel-tuple))
+          r2-csig (basalt/bytes->hex (crypto/sign-canonical (:private r2) cancel-tuple))
+          ;; Drive 3-chain (ep 1, 2, 3) to finalize ep 1 governance receipts in state_machine!
+          run-ep (fn [st ep parent rcpts]
+                   (let [blk (streamlet/sign-block (streamlet/->Block ep parent rcpts (:spki-hex v1)) (:private v1))
+                         bh (streamlet/hash-block blk)
+                         st1 (:state (sm/handle-event (assoc st :epoch ep) {:type :receive-propose :sender (:spki-hex v1) :block blk}))
+                         sig (basalt/bytes->hex (crypto/sign (:private v1) (fressian/utf8->bytes bh)))
+                         st2 (:state (sm/handle-event st1 {:type :receive-vote :sender (:spki-hex v1) :vote (streamlet/->Vote bh ep sig)}))]
+                     [st2 bh]))
+          [s1 h1] (run-ep st0 1 "genesis"
+                          [{:type :register-entity-descriptor :receipt-id "gov-1" :descriptor root-desc}
+                           {:type :register-advisory-twin :receipt-id "gov-2" :pubkey (:spki-hex twin)}
+                           {:type :initiate-recovery :receipt-id "gov-3" :path "root"
+                            :new-owner-multisig {:threshold 1 :pubkeys [(:spki-hex g1)]}
+                            :guardian-signatures {(:spki-hex g1) g-sig}}
+                           {:type :cancel-recovery :receipt-id "gov-4" :path "root"
+                            :owner-signatures {(:spki-hex r1) r1-csig (:spki-hex r2) r2-csig}}])
+          [s2 h2] (run-ep s1 2 h1 [{:type :dissolve-circle :receipt-id "gov-5" :circle-path "root"
+                                    :consent-round {:lead-link-pubkey (:spki-hex r1)
+                                                    :ballots {(:spki-hex r1) :consent (:spki-hex r2) :consent}
+                                                    :quorum-size 2}}])
+          [s3 h3] (run-ep s2 3 h2 [])
+          [s4 _] (run-ep s3 4 h3 [])]
+      (is (some? (get-in s4 [:entity-descriptors "root"])))
+      (is (= :dissolved (get-in s4 [:entity-descriptors "root" :status])))
+      (is (circle/advisory-twin? (:advisory-twin-pubkeys s4) (:spki-hex twin)))
+      (is (= :cancelled (get-in s4 [:pending-recoveries "root" :status])))))
+
+  (testing "F4: main/apply-startup-cold-root-recovery! loads & verifies bundle by CID from disk and fails closed on mismatch"
+    (let [tmp-dir (.toFile (Files/createTempDirectory "bitecho-f4-rec-" (into-array FileAttribute [])))
+          blobs-dir (doto (java.io.File. tmp-dir "blobs") (.mkdirs))
+          r1 (gen-kp)
+          r2 (gen-kp)
+          v1 (gen-kp)
+          root-ms {:threshold 2 :pubkeys [(:spki-hex r1) (:spki-hex r2)]}
+          net "devnet.bitecho.org"
+          gen-cid (apply str (repeat 64 "a"))
+          bundle (circle/create-cold-root-recovery-bundle
+                  {:network-uri net :network-genesis-cid gen-cid :recovery-seq 25
+                   :last-known-finalized-block-hash gen-cid
+                   :committee [{:pubkey (:spki-hex v1) :role :core-validator}]
+                   :quorum-threshold 1}
+                  [{:pubkey (:spki-hex r1) :privkey (:private r1)}
+                   {:pubkey (:spki-hex r2) :privkey (:private r2)}])
+          raw-bytes (fressian/encode-canonical bundle)
+          cid (basalt/bytes->hex (crypto/sha256 raw-bytes))
+          _ (Files/write (.toPath (java.io.File. blobs-dir cid)) ^bytes raw-bytes (into-array java.nio.file.OpenOption []))
+          sa (atom {:last-finalized-epoch 10 :validator-set-history {} :diagnostics {}})
+          cfg {:root-owner-multisig root-ms :network-uri net :network-genesis-cid gen-cid}
+          bad-res (main/apply-startup-cold-root-recovery! sa (.getAbsolutePath tmp-dir) (apply str (repeat 64 "f")) cfg)
+          ok-res (main/apply-startup-cold-root-recovery! sa (.getAbsolutePath tmp-dir) cid cfg)]
+      (is (false? (:ok? bad-res)))
+      (is (= :cold-root-recovery-bundle-missing (:error bad-res)))
+      (is (:ok? ok-res))
+      (is (= 1 (get-in @sa [:diagnostics :cold-root-recovery-activated])))
+      (is (= [(:spki-hex v1)] (get-in @sa [:validator-set-history 25 :committee])))))
+
+  (testing "F5: Single-key :reconfigure-membership is rejected when :root-owner-multisig is configured, requiring Root quorum"
+    (let [treasury (gen-kp)
+          r1 (gen-kp)
+          r2 (gen-kp)
+          v1 (gen-kp)
+          root-ms {:threshold 2 :pubkeys [(:spki-hex r1) (:spki-hex r2)]}
+          st {:treasury-pubkey (:spki-hex treasury) :root-owner-multisig root-ms}
+          single-key-sig (sm/sign-reconfigure-membership (:private treasury) "rc-1" 10 [(:spki-hex v1)] {(:spki-hex v1) "127.0.0.1:5000"})
+          rcpt-single {:receipt-id "rc-1" :effective-epoch 10 :validators [(:spki-hex v1)]
+                       :mesh-nodes {(:spki-hex v1) "127.0.0.1:5000"} :signature single-key-sig}
+          msg-bs (sm/reconfigure-membership-signing-bytes "rc-1" 10 [(:spki-hex v1)] {(:spki-hex v1) "127.0.0.1:5000"})
+          rcpt-quorum (assoc rcpt-single :root-signatures
+                             {(:spki-hex r1) (basalt/bytes->hex (crypto/sign (:private r1) msg-bs))
+                              (:spki-hex r2) (basalt/bytes->hex (crypto/sign (:private r2) msg-bs))})]
+      (is (false? (sm/verify-reconfigure-membership? st rcpt-single)))
+      (is (true? (sm/verify-reconfigure-membership? st rcpt-quorum))))))

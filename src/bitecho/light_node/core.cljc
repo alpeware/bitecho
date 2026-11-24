@@ -764,19 +764,37 @@
 ;; Directory Attestation & Proof-of-Possession (PoP) (Axiom Amendment 2)
 ;; -----------------------------------------------------------------------------
 
+(defn valid-directory-path?
+  "Validates either a flat nickname (e.g. `alice`) or a BIP-024 hierarchical directory path
+   (e.g. `root/protocol/dev/nexus`) where every slash-separated segment satisfies `valid-petname?`."
+  [s]
+  (and (string? s)
+       (not (str/blank? s))
+       (let [trimmed (str/replace (str/trim s) #"^/+|/+$" "")
+             segs (str/split trimmed #"/")]
+         (and (seq segs)
+              (every? valid-petname? segs)))))
+
+(defn normalize-directory-path
+  "Normalizes a flat nickname or BIP-024 hierarchical directory path segment-by-segment."
+  [s]
+  (when (string? s)
+    (let [trimmed (str/replace (str/trim s) #"^/+|/+$" "")]
+      (str/join "/" (map normalize-petname (str/split trimmed #"/"))))))
+
 (defn create-directory-pop
   "Creates an agent Proof-of-Possession (PoP) map signed by agent-privkey-bytes.
    Optionally signs with prev-privkey-bytes to prove key rotation continuity.
    Optionally binds advertised :crypto-suites."
   [agent-privkey-bytes {:keys [domain nickname pubkey home-set epoch prev-pubkey prev-privkey-bytes crypto-suites]}]
-  (when (and (valid-petname? nickname)
+  (when (and (valid-directory-path? nickname)
              (valid-pubkey-hex? pubkey)
              (or (nil? epoch) (integer? epoch))
              (or (nil? prev-pubkey)
                  (and (valid-pubkey-hex? prev-pubkey)
                       (not= (normalize-pubkey-hex prev-pubkey) (normalize-pubkey-hex pubkey))
                       (some? prev-privkey-bytes))))
-    (let [norm-nick (normalize-petname nickname)
+    (let [norm-nick (normalize-directory-path nickname)
           norm-pub (normalize-pubkey-hex pubkey)
           norm-domain (if (or (nil? domain) (str/blank? domain)) "bitecho.org" (str/lower-case (str/trim domain)))
           sorted-hs (vec (sort (distinct (keep (fn [hn]
@@ -4918,19 +4936,22 @@
          :stdout-events []}))))
 
 (defn- split-qualified-directory-name
-  "Splits a possibly qualified `<domain>/<nickname>` string into `[domain-or-nil nickname]` (`P-SOAK-2`)."
+  "Splits a possibly domain-qualified `<domain>/<path...>` string into `[domain-or-nil path]`
+   while preserving BIP-024 hierarchical slash paths (e.g. `root/protocol/dev/nexus`) and
+   legacy flat nicknames (`P-SOAK-2` + `BIP-024`)."
   [raw-nick explicit-domain]
   (if (and (string? raw-nick) (not (str/blank? raw-nick)))
-    (let [trimmed (str/trim raw-nick)
-          slash-idx (.lastIndexOf trimmed "/")]
-      (if (pos? slash-idx)
-        (let [d (subs trimmed 0 slash-idx)
-              n (subs trimmed (inc slash-idx))]
-          [(if (and (string? explicit-domain) (not (str/blank? explicit-domain)))
-             explicit-domain
-             d)
-           n])
-        [explicit-domain trimmed]))
+    (let [trimmed (str/replace (str/trim raw-nick) #"^/+|/+$" "")
+          first-slash (.indexOf trimmed "/")
+          non-blank-dom (when (and (string? explicit-domain) (not (str/blank? explicit-domain)))
+                          (str/trim explicit-domain))]
+      (if (pos? first-slash)
+        (let [head (subs trimmed 0 first-slash)
+              tail (subs trimmed (inc first-slash))]
+          (if (str/includes? head ".")
+            [(or non-blank-dom head) tail]
+            [non-blank-dom trimmed]))
+        [non-blank-dom trimmed]))
     [explicit-domain raw-nick]))
 
 (defn- exec-directory-verify [state cmd-map]
@@ -4991,12 +5012,12 @@
                             prev-sk-raw
                             (basalt/hex->bytes prev-sk-raw))
                           (catch #?(:clj Exception :cljs :default) _ nil)))]
-    (if-not (valid-petname? nick)
+    (if-not (valid-directory-path? nick)
       {:state state
        :response {"ok" false "error" "invalid-nickname"}
        :net-envelopes []
        :stdout-events []}
-      (let [norm-nick (normalize-petname nick)
+      (let [norm-nick (normalize-directory-path nick)
             norm-domain (if (or (nil? domain) (str/blank? domain)) "bitecho.org" (str/lower-case (str/trim domain)))
             hs (if (seq (:home-set state))
                  (vec (for [hn (:home-set state)]
@@ -5040,12 +5061,12 @@
         raw-domain (or (get cmd-map "domain") (:domain cmd-map))
         [_ nick] (split-qualified-directory-name raw-nick raw-domain)
         raw-desc (or (get cmd-map "descriptor") (:descriptor cmd-map))]
-    (if-not (valid-petname? nick)
+    (if-not (valid-directory-path? nick)
       {:state state
        :response {"ok" false "error" "invalid-nickname"}
        :net-envelopes []
        :stdout-events []}
-      (let [norm-nick (normalize-petname nick)
+      (let [norm-nick (normalize-directory-path nick)
             trusted-pub (or (get cmd-map "directory_pubkey") (get cmd-map "directory-pubkey")
                             (:directory_pubkey cmd-map) (:directory-pubkey cmd-map)
                             (:trusted-directory-pubkey state)

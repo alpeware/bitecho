@@ -13,6 +13,7 @@
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.config :as config]
             [bitecho.config.flags :as flags]
+            [bitecho.core.circle :as circle]
             [bitecho.core.data :as data]
             [bitecho.core.infra :as core-infra]
             [bitecho.core.mesh :as core-mesh]
@@ -2415,9 +2416,12 @@
                    claim-net (or (get body-json "network_uri") (:network-uri config) "devnet.bitecho.org")
                    raw-att (get body-json "attestation")
                    attestation (when (map? raw-att)
-                                 {:fmt (get raw-att "fmt")
-                                  :aaguid (get raw-att "aaguid")
-                                  :x5c (get raw-att "x5c")
+                                 {:attestation-object-hex (or (get raw-att "attestation_object_hex")
+                                                              (get raw-att "attestation-object-hex")
+                                                              (get raw-att "attestationObject"))
+                                  :client-data-hash-hex (or (get raw-att "client_data_hash_hex")
+                                                            (get raw-att "client-data-hash-hex")
+                                                            (get raw-att "clientDataHash"))
                                   :hw-pubkey (or (get raw-att "hw_pubkey") (get raw-att "hw-pubkey"))
                                   :assertion-sig (or (get raw-att "assertion_sig") (get raw-att "assertion-sig"))
                                   :claimant-pop-sig (or (get raw-att "claimant_pop_sig") (get raw-att "claimant-pop-sig"))
@@ -5772,11 +5776,46 @@
                             :system_merkle_root (:system-merkle-root recomputed)
                             :subtree_roots (:subtree-roots recomputed)})))))))
 
+(defn- extract-cold-root-recovery-cid
+  [argv]
+  (let [idx (.indexOf argv "--cold-root-recovery-cid")]
+    (when (and (>= idx 0) (< (inc idx) (count argv)))
+      (nth argv (inc idx)))))
+
+(defn apply-startup-cold-root-recovery!
+  "BIP-024 §2.5 (F4): Loads a Cold-Root Emergency Recovery bundle by `--cold-root-recovery-cid`
+   from `<state-dir>/blobs/<cid>` or `<state-dir>/recovery/<cid>.fressian`, verifies SHA-256 == CID
+   and Root Association signatures, and applies it to `state-atom`."
+  [state-atom state-dir recovery-cid cfg]
+  (when (and recovery-cid (not (str/blank? (str recovery-cid))))
+    (let [norm-cid (str/lower-case (str/trim (str recovery-cid)))
+          sdir (str (or state-dir "data"))
+          candidates [(.join node-path sdir "blobs" norm-cid)
+                      (.join node-path sdir "recovery" (str norm-cid ".fressian"))
+                      (.join node-path sdir "recovery" norm-cid)]
+          found (first (filter #(.existsSync node-fs %) candidates))
+          raw-bytes (when found (js/Uint8Array. (.readFileSync node-fs found)))
+          ctx {:root-owner-multisig (or (:root-owner-multisig cfg)
+                                        (:root-owner-multisig @state-atom))
+               :network-uri (or (:network-uri cfg) (:network-uri @state-atom))
+               :network-genesis-cid (or (:network-genesis-cid cfg) (:network-genesis-cid @state-atom))
+               :advisory-twin-pubkeys (:advisory-twin-pubkeys @state-atom)}
+          res-box (atom nil)]
+      (swap! state-atom
+             (fn [st]
+               (let [r (circle/verify-and-apply-cold-root-recovery-by-cid st norm-cid raw-bytes ctx)]
+                 (reset! res-box r)
+                 (if (:ok? r)
+                   (:state r)
+                   (update-in st [:diagnostics (or (:error r) :cold-root-recovery-rejected)] (fnil inc 0))))))
+      @res-box)))
+
 (defn -main
   "CLI entry point for the Node.js full validator & infrastructure node."
   [& args]
   (let [argv (vec args)
-        first-arg (first argv)]
+        first-arg (first argv)
+        cold-rec-cid (extract-cold-root-recovery-cid argv)]
     (cond
       (some #{"--self-test"} argv)
       (let [res (run-self-test)]
@@ -5809,7 +5848,9 @@
       (cmd-run! (second argv))
 
       (= first-arg "infra-node")
-      (start-infra-node! (parse-infra-cli-config argv))
+      (let [cfg (cond-> (parse-infra-cli-config argv)
+                  cold-rec-cid (assoc :cold-root-recovery-cid cold-rec-cid))]
+        (start-infra-node! cfg))
 
       (or (= first-arg "print-identity") (= first-arg "print-fingerprint"))
       (cmd-print-identity! (second argv))

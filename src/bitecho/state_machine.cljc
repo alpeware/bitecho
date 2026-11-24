@@ -8,6 +8,7 @@
             [bitecho.config :as config]
             [bitecho.contagion.core :as contagion]
             [bitecho.core.circle :as circle]
+            [bitecho.core.data :as data]
             [bitecho.crypto :as crypto]
             [bitecho.deploy.core :as deploy]
             [bitecho.economy.account :as account]
@@ -1866,36 +1867,63 @@
     (basalt/bytes->hex (crypto/sign priv-bytes msg-bytes))))
 
 (defn verify-reconfigure-membership?
-  "Verifies a :reconfigure-membership receipt against :treasury-pubkey in state."
+  "Verifies a :reconfigure-membership receipt.
+   BIP-024 §2.5 (F5): When `:root-owner-multisig` is configured in state/config (or
+   `:require-root-quorum-reconfigure? true`), single-key `:treasury-pubkey` authorization
+   is rejected and `>= threshold` distinct Root Association signatures (`:root-signatures`)
+   are required (excluding `:advisory-twin-pubkeys`)."
   [state receipt]
-  (let [t-pub (or (:treasury-pubkey state) (get-in state [:config :treasury-pubkey]))
+  (let [root-ms (or (:root-owner-multisig state) (get-in state [:config :root-owner-multisig]))
+        require-root? (or (map? root-ms)
+                          (boolean (:require-root-quorum-reconfigure? state))
+                          (boolean (get-in state [:config :require-root-quorum-reconfigure?])))
+        t-pub (or (:treasury-pubkey state) (get-in state [:config :treasury-pubkey]))
         rid (:receipt-id receipt)
         eff-ep (:effective-epoch receipt)
         vals-coll (:validators receipt)
         mesh-coll (:mesh-nodes receipt)
-        sig (:signature receipt)]
+        sig (:signature receipt)
+        base-ok? (and (string? rid)
+                      (not (string/blank? rid))
+                      (integer? eff-ep)
+                      (>= (long eff-ep) 0)
+                      (coll? vals-coll)
+                      (seq vals-coll)
+                      (some? mesh-coll)
+                      (seq (canonical-membership-mesh mesh-coll)))]
     (boolean
-     (and (string? t-pub)
-          (not (string/blank? t-pub))
-          (string? rid)
-          (not (string/blank? rid))
-          (integer? eff-ep)
-          (>= (long eff-ep) 0)
-          (coll? vals-coll)
-          (seq vals-coll)
-          (some? mesh-coll)
-          (seq (canonical-membership-mesh mesh-coll))
-          (some? sig)
-          (try
-            (let [pub-bytes (if (string? t-pub) (fressian/hex->bytes t-pub) (to-byte-array t-pub))
-                  sig-bytes (cond
-                              (fressian/bytes? sig) sig
-                              (string? sig) (fressian/hex->bytes sig)
-                              :else (to-byte-array sig))
-                  msg-bytes (reconfigure-membership-signing-bytes rid eff-ep vals-coll mesh-coll)]
-              (crypto/verify pub-bytes msg-bytes sig-bytes))
-            (catch #?(:clj Exception :cljs :default) _
-              false))))))
+     (when base-ok?
+       (let [msg-bytes (reconfigure-membership-signing-bytes rid eff-ep vals-coll mesh-coll)]
+         (if require-root?
+           (let [allowed (set (circle/dedup-spki-pubkeys (:pubkeys root-ms)))
+                 th (long (or (:threshold root-ms) 2))
+                 twins (or (:advisory-twin-pubkeys state) #{})
+                 root-sigs (:root-signatures receipt)
+                 valid-signers (when (and (map? root-sigs) (seq allowed) (>= th 1))
+                                 (keep (fn [[pk s]]
+                                         (let [spki (circle/normalize-spki-pubkey pk)]
+                                           (when (and spki
+                                                      (contains? allowed spki)
+                                                      (not (circle/advisory-twin? twins spki))
+                                                      (string? s)
+                                                      (try
+                                                        (crypto/verify spki msg-bytes (fressian/hex->bytes s))
+                                                        (catch #?(:clj Exception :cljs :default) _ false)))
+                                             spki)))
+                                       root-sigs))]
+             (and (seq allowed) (>= (count (distinct valid-signers)) th)))
+           (and (string? t-pub)
+                (not (string/blank? t-pub))
+                (some? sig)
+                (try
+                  (let [pub-bytes (if (string? t-pub) (fressian/hex->bytes t-pub) (to-byte-array t-pub))
+                        sig-bytes (cond
+                                    (fressian/bytes? sig) sig
+                                    (string? sig) (fressian/hex->bytes sig)
+                                    :else (to-byte-array sig))]
+                    (crypto/verify pub-bytes msg-bytes sig-bytes))
+                  (catch #?(:clj Exception :cljs :default) _
+                    false)))))))))
 
 (defn execute-finalized-blocks
   "Executes finalized Streamlet blocks along the canonical chain in ascending order.
@@ -2383,17 +2411,83 @@
                                            (-> (:state res)
                                                (update :failed-receipts-count (fnil inc 0)))))
 
+                                       :register-entity-descriptor
+                                       (let [desc (:descriptor r)
+                                             path (:path desc)
+                                             prev-desc (when path (get-in s [:entity-descriptors path]))
+                                             v-res (circle/verify-entity-descriptor
+                                                    desc
+                                                    {:network-uri (or (:network-uri s) (get-in s [:config :network-uri]) (get-in state [:config :network-uri]))
+                                                     :network-genesis-cid (or (:network-genesis-cid s) (get-in s [:config :network-genesis-cid]) (get-in state [:config :network-genesis-cid]))
+                                                     :prev-descriptor prev-desc
+                                                     :advisory-twin-pubkeys (or (:advisory-twin-pubkeys s) (:advisory-twin-pubkeys state))})]
+                                         (if (:ok? v-res)
+                                           (assoc-in s [:entity-descriptors path] (assoc desc :cid (:cid v-res)))
+                                           (-> s
+                                               (update :failed-receipts-count (fnil inc 0))
+                                               (update-in [:diagnostics (or (:error v-res) :invalid-entity-descriptor)] (fnil inc 0)))))
+
+                                       :dissolve-circle
+                                       (let [d-res (circle/dissolve-circle
+                                                    s
+                                                    r
+                                                    {:advisory-twin-pubkeys (or (:advisory-twin-pubkeys s) (:advisory-twin-pubkeys state))})]
+                                         (if (:ok? d-res)
+                                           (:state d-res)
+                                           (-> s
+                                               (update :failed-receipts-count (fnil inc 0))
+                                               (update-in [:diagnostics (or (:error d-res) :dissolve-circle-rejected)] (fnil inc 0)))))
+
+                                       :initiate-recovery
+                                       (let [path (:path r)
+                                             desc (get-in s [:entity-descriptors path])
+                                             i-res (when desc
+                                                     (circle/initiate-recovery desc (assoc r :current-epoch b-epoch)))]
+                                         (if (and i-res (:ok? i-res))
+                                           (assoc-in s [:pending-recoveries path] (:pending-recovery i-res))
+                                           (-> s
+                                               (update :failed-receipts-count (fnil inc 0))
+                                               (update-in [:diagnostics (or (:error i-res) :initiate-recovery-rejected)] (fnil inc 0)))))
+
+                                       :cancel-recovery
+                                       (let [path (:path r)
+                                             desc (get-in s [:entity-descriptors path])
+                                             pending (get-in s [:pending-recoveries path])
+                                             c-res (when (and desc pending)
+                                                     (circle/cancel-recovery
+                                                      desc
+                                                      pending
+                                                      {:owner-signatures (:owner-signatures r)
+                                                       :advisory-twin-pubkeys (or (:advisory-twin-pubkeys s) (:advisory-twin-pubkeys state))}))]
+                                         (if (and c-res (:ok? c-res))
+                                           (assoc-in s [:pending-recoveries path] (:pending-recovery c-res))
+                                           (-> s
+                                               (update :failed-receipts-count (fnil inc 0))
+                                               (update-in [:diagnostics (or (:error c-res) :unauthorized-recovery-cancel)] (fnil inc 0)))))
+
+                                       :register-advisory-twin
+                                       (let [pk (circle/normalize-spki-pubkey (:pubkey r))]
+                                         (if pk
+                                           (update s :advisory-twin-pubkeys #(circle/register-advisory-twin % pk))
+                                           (-> s
+                                               (update :failed-receipts-count (fnil inc 0))
+                                               (update-in [:diagnostics :invalid-advisory-twin-pubkey] (fnil inc 0)))))
+
                                        :rotate-validator-set
                                        (let [desc (:descriptor r)
                                              root-ms (or (:root-owner-multisig s)
-                                                         (get-in s [:config :root-owner-multisig]))
-                                             lead (long (or (get-in s [:config :validator-activation-lead-epochs]) 6))
+                                                         (get-in s [:config :root-owner-multisig])
+                                                         (get-in state [:config :root-owner-multisig]))
+                                             lead (long (or (get-in s [:config :validator-activation-lead-epochs])
+                                                            (get-in state [:config :validator-activation-lead-epochs])
+                                                            6))
+                                             net-u (or (:network-uri s) (get-in s [:config :network-uri]) (get-in state [:config :network-uri]) "devnet.bitecho.org")
                                              v-res (circle/verify-validator-set-descriptor
                                                     desc
                                                     {:root-owner-multisig root-ms
-                                                     :network-uri (or (:network-uri s) (get-in s [:config :network-uri]))
-                                                     :network-genesis-cid (or (:network-genesis-cid s) (get-in s [:config :network-genesis-cid]))
-                                                     :advisory-twin-pubkeys (:advisory-twin-pubkeys s)
+                                                     :network-uri net-u
+                                                     :network-genesis-cid (or (:network-genesis-cid s) (get-in s [:config :network-genesis-cid]) (get-in state [:config :network-genesis-cid]))
+                                                     :advisory-twin-pubkeys (or (:advisory-twin-pubkeys s) (:advisory-twin-pubkeys state))
                                                      :lead-epochs lead})]
                                          (if (:ok? v-res)
                                            (let [ep-eff (:epoch-effective v-res)
@@ -2401,7 +2495,16 @@
                                                  entry {:committee comm
                                                         :quorum-threshold (:quorum-threshold v-res)
                                                         :descriptor-cid (:cid v-res)}
-                                                 s1 (assoc-in s [:validator-set-history ep-eff] entry)]
+                                                 ;; F11: Mirror finalized rotation to "root/validators" pointer record + epoch-anchored Merkle root
+                                                 mirror {:pointer/subnet net-u
+                                                         :pointer/path "root/validators"
+                                                         :pointer/target (:cid v-res)
+                                                         :epoch-effective ep-eff
+                                                         :committee comm
+                                                         :supply-merkle-root (data/compute-merkle-root s net-u {:anchor-epoch b-epoch})}
+                                                 s1 (-> s
+                                                        (assoc-in [:validator-set-history ep-eff] entry)
+                                                        (assoc :validator-set-mirror mirror))]
                                              (if (<= ep-eff b-epoch)
                                                (assoc s1 :validators comm)
                                                s1))
@@ -2412,14 +2515,15 @@
                                        :cold-root-recovery
                                        (let [bundle (:bundle r)
                                              root-ms (or (:root-owner-multisig s)
-                                                         (get-in s [:config :root-owner-multisig]))
+                                                         (get-in s [:config :root-owner-multisig])
+                                                         (get-in state [:config :root-owner-multisig]))
                                              rec-res (circle/apply-cold-root-recovery
                                                       s
                                                       bundle
                                                       {:root-owner-multisig root-ms
-                                                       :network-uri (or (:network-uri s) (get-in s [:config :network-uri]))
-                                                       :network-genesis-cid (or (:network-genesis-cid s) (get-in s [:config :network-genesis-cid]))
-                                                       :advisory-twin-pubkeys (:advisory-twin-pubkeys s)})]
+                                                       :network-uri (or (:network-uri s) (get-in s [:config :network-uri]) (get-in state [:config :network-uri]))
+                                                       :network-genesis-cid (or (:network-genesis-cid s) (get-in s [:config :network-genesis-cid]) (get-in state [:config :network-genesis-cid]))
+                                                       :advisory-twin-pubkeys (or (:advisory-twin-pubkeys s) (:advisory-twin-pubkeys state))})]
                                          (if (:ok? rec-res)
                                            (:state rec-res)
                                            (-> s

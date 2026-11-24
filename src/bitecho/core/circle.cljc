@@ -368,6 +368,13 @@
        (not (valid-cid-64? (:purpose-cid desc)))
        (diag-fail :missing-or-invalid-purpose-cid)
 
+       ;; F9: Constitutional entity descriptors and rotations MUST carry a valid 64-char hex :consent-round-cid
+       (and (or (contains? #{"root" "root/protocol" "root/inc"} (:path desc))
+                (> (long (or (:version desc) 1)) 1)
+                (some? (:consent-round-cid desc)))
+            (not (valid-cid-64? (:consent-round-cid desc))))
+       (diag-fail :missing-or-invalid-consent-round-cid)
+
        (not (contains? valid-entity-kinds (:entity-kind desc)))
        (diag-fail :invalid-entity-kind)
 
@@ -564,10 +571,35 @@
                           :executable-epoch (+ (long current-epoch) tl)
                           :status :pending}})))
 
+(defn cancel-recovery-signing-tuple
+  "Domain-separated canonical signing tuple for authenticating `cancel-recovery` (F15)."
+  [descriptor pending-recovery]
+  ["bitecho-cancel-recovery-v1"
+   (str (:uri descriptor))
+   (long (or (:initiated-epoch pending-recovery) 0))])
+
 (defn cancel-recovery
-  "Cancels a pending timelocked recovery when authorized by the active owner key(s)."
-  [pending-recovery]
-  (assoc pending-recovery :status :cancelled))
+  "Authenticates and cancels a pending timelocked recovery (F15).
+   Requires `>= threshold` valid signatures from the active `:owner-multisig` (excluding
+   advisory twins) over `cancel-recovery-signing-tuple`. Fails closed with `:unauthorized-recovery-cancel`."
+  [descriptor pending-recovery {:keys [owner-signatures advisory-twin-pubkeys]}]
+  (let [owner-ms (:owner-multisig descriptor)
+        owners (dedup-spki-pubkeys (:pubkeys owner-ms))
+        th (long (or (:threshold owner-ms) 1))
+        twin-set (or advisory-twin-pubkeys #{})
+        tuple (cancel-recovery-signing-tuple descriptor pending-recovery)
+        valid-sigs (count-valid-multisig-signatures owner-signatures owners tuple twin-set)]
+    (cond
+      (not= :pending (:status pending-recovery))
+      (diag-fail :recovery-not-pending)
+
+      (or (empty? owners) (< valid-sigs th))
+      (diag-fail :unauthorized-recovery-cancel {:valid valid-sigs :required th})
+
+      :else
+      {:ok? true
+       :pending-recovery (assoc pending-recovery :status :cancelled)
+       :effects []})))
 
 (defn execute-recovery
   "Executes a pending recovery once `current-epoch >= executable-epoch` and not cancelled."
@@ -600,34 +632,30 @@
 
 (defn encrypt-shared-descriptor
   "Encrypts sensitive payload fields (`:members`, `:home-set`, `:allocation-ech`, `:purpose-cid`,
-   `:policy`) of a `:shared-encrypted` descriptor with AEAD (`crypto/secretbox`), keeping only
-   structural verification headers visible to relays for BIP-016 and signature verification."
-  [descriptor group-key-bytes]
-  (let [sensitive (select-keys descriptor [:members :home-set :allocation-ech :purpose-cid :policy :lease-holder-uri])
-        plaintext (fressian/encode-canonical sensitive)
-        nonce (crypto/sha256 (fressian/encode-canonical ["bitecho-shared-desc-nonce-v1"
-                                                         (:network-uri descriptor)
-                                                         (:path descriptor)
-                                                         (:version descriptor)]))
-        nonce-24 #?(:clj (let [out (byte-array 24)]
-                           (System/arraycopy ^bytes nonce 0 out 0 24)
-                           out)
-                    :cljs (.slice ^js/Uint8Array nonce 0 24))
-        ciphertext (crypto/secretbox group-key-bytes nonce-24 plaintext)
-        owner-commitment (str/lower-case (basalt/bytes->hex (crypto/sha256 (fressian/encode-canonical (:owner-multisig descriptor)))))]
-    {:bitecho/type :directory/encrypted-entity-envelope
-     :schema-version 2
-     :visibility :shared-encrypted
-     :network-uri (:network-uri descriptor)
-     :network-genesis-cid (:network-genesis-cid descriptor)
-     :blinded-path (blinded-subpath (or (:parent-path descriptor) "root") (:path descriptor) group-key-bytes)
-     :version (:version descriptor)
-     :prev-descriptor-cid (:prev-descriptor-cid descriptor)
-     :owner-multisig-commitment owner-commitment
-     :retention-policy (:retention-policy descriptor)
-     :storage-accounting (:storage-accounting descriptor)
-     :nonce-hex (str/lower-case (basalt/bytes->hex nonce-24))
-     :ciphertext-hex (str/lower-case (basalt/bytes->hex ciphertext))}))
+   `:policy`) of a `:shared-encrypted` descriptor with AEAD (`crypto/secretbox`) using a fresh
+   CSPRNG 24-byte nonce (`F14`, never deterministic nonce reuse), keeping only structural
+   verification headers visible to relays for BIP-016 and signature verification."
+  ([descriptor group-key-bytes]
+   (encrypt-shared-descriptor descriptor group-key-bytes nil))
+  ([descriptor group-key-bytes opts]
+   (let [sensitive (select-keys descriptor [:members :home-set :allocation-ech :purpose-cid :policy :lease-holder-uri])
+         plaintext (fressian/encode-canonical sensitive)
+         nonce-24 (or (:nonce-bytes opts) (crypto/random-bytes 24))
+         ciphertext (crypto/secretbox group-key-bytes nonce-24 plaintext)
+         owner-commitment (str/lower-case (basalt/bytes->hex (crypto/sha256 (fressian/encode-canonical (:owner-multisig descriptor)))))]
+     {:bitecho/type :directory/encrypted-entity-envelope
+      :schema-version 2
+      :visibility :shared-encrypted
+      :network-uri (:network-uri descriptor)
+      :network-genesis-cid (:network-genesis-cid descriptor)
+      :blinded-path (blinded-subpath (or (:parent-path descriptor) "root") (:path descriptor) group-key-bytes)
+      :version (:version descriptor)
+      :prev-descriptor-cid (:prev-descriptor-cid descriptor)
+      :owner-multisig-commitment owner-commitment
+      :retention-policy (:retention-policy descriptor)
+      :storage-accounting (:storage-accounting descriptor)
+      :nonce-hex (str/lower-case (basalt/bytes->hex nonce-24))
+      :ciphertext-hex (str/lower-case (basalt/bytes->hex ciphertext))})))
 
 (defn decrypt-shared-descriptor
   "Decrypts a `:directory/encrypted-entity-envelope` using `group-key-bytes`."
@@ -737,6 +765,10 @@
     (cond
       (not= :root/validator-set-descriptor (:bitecho/type desc))
       (diag-fail :invalid-validator-descriptor-type)
+
+      ;; F9: Validator-set rotation is a constitutional act requiring valid 64-char hex :consent-round-cid
+      (not (valid-cid-64? (:consent-round-cid desc)))
+      (diag-fail :missing-or-invalid-consent-round-cid)
 
       (and (:network-uri ctx) (not= (str (:network-uri ctx)) (str (:network-uri desc))))
       (diag-fail :network-uri-mismatch)
@@ -855,6 +887,29 @@
                     (assoc :validators (:committee v-res))
                     (update-in [:diagnostics :cold-root-recovery-activated] (fnil inc 0)))]
         {:ok? true :state st' :effects [diag]}))))
+
+(defn verify-and-apply-cold-root-recovery-by-cid
+  "Pure startup helper (F4): verifies `SHA-256(raw-bytes) == expected-cid`, decodes the
+   canonical Fressian `:cold-root-recovery` bundle, and applies it via `apply-cold-root-recovery`.
+   Fails closed with counted `:diagnose` on CID mismatch, decode failure, or invalid signatures."
+  [state expected-cid raw-bytes ctx]
+  (let [norm-cid (when (string? expected-cid) (str/lower-case (str/trim expected-cid)))]
+    (cond
+      (not (valid-cid-64? norm-cid))
+      (diag-fail :invalid-cold-root-recovery-cid {:cid expected-cid})
+
+      (not (and (fressian/bytes? raw-bytes) (pos? (fressian/count-bytes raw-bytes))))
+      (diag-fail :cold-root-recovery-bundle-missing {:cid norm-cid})
+
+      :else
+      (let [actual-cid (str/lower-case (basalt/bytes->hex (crypto/sha256 raw-bytes)))]
+        (if (not= actual-cid norm-cid)
+          (diag-fail :cold-root-recovery-cid-mismatch {:expected norm-cid :actual actual-cid})
+          (let [bundle (try (fressian/decode-wire raw-bytes)
+                            (catch #?(:clj Throwable :cljs :default) _ nil))]
+            (if-not (map? bundle)
+              (diag-fail :cold-root-recovery-decode-failed {:cid norm-cid})
+              (apply-cold-root-recovery state bundle ctx))))))))
 
 ;; =============================================================================
 ;; 7. Section 8 Foundations: Asset-ID, Supply Commitment, 3-Chain QC & G4 Bridge Caps

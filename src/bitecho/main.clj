@@ -2,6 +2,7 @@
   "CLI entrypoint for Bitecho node."
   (:gen-class)
   (:require [bitecho.basalt.core :as basalt]
+            [bitecho.core.circle :as circle]
             [bitecho.light-node.core :as light-core]
             [bitecho.shell.acme :as acme-shell]
             [bitecho.shell.agent-sim :as agent-sim]
@@ -232,46 +233,83 @@
               (when peer-mesh (infra/stop-datachannel-peer-mesh! peer-mesh))
               (infra/stop-subnet-runtime! runtime))}))
 
+(defn apply-startup-cold-root-recovery!
+  "BIP-024 §2.5 (F4): Loads a Cold-Root Emergency Recovery bundle by `--cold-root-recovery-cid`
+   from `<state-dir>/blobs/<cid>` or `<state-dir>/recovery/<cid>.fressian`, verifies SHA-256 == CID
+   and Root Association supermajority signatures, and applies it to `state-atom`.
+   Fails closed with counted `:diagnose` on missing/corrupt/untrusted bundles."
+  [state-atom state-dir recovery-cid cfg]
+  (when (and recovery-cid (not (str/blank? (str recovery-cid))))
+    (let [norm-cid (str/lower-case (str/trim (str recovery-cid)))
+          candidates [(io/file (str (or state-dir "data")) "blobs" norm-cid)
+                      (io/file (str (or state-dir "data")) "recovery" (str norm-cid ".fressian"))
+                      (io/file (str (or state-dir "data")) "recovery" norm-cid)]
+          found ^java.io.File (first (filter #(.exists ^java.io.File %) candidates))
+          raw-bytes (when found (java.nio.file.Files/readAllBytes (.toPath found)))
+          ctx {:root-owner-multisig (or (:root-owner-multisig cfg)
+                                        (:root-owner-multisig @state-atom))
+               :network-uri (or (:network-uri cfg) (:network-uri @state-atom))
+               :network-genesis-cid (or (:network-genesis-cid cfg) (:network-genesis-cid @state-atom))
+               :advisory-twin-pubkeys (:advisory-twin-pubkeys @state-atom)}
+          res-box (atom nil)]
+      (swap! state-atom
+             (fn [st]
+               (let [r (circle/verify-and-apply-cold-root-recovery-by-cid st norm-cid raw-bytes ctx)]
+                 (reset! res-box r)
+                 (if (:ok? r)
+                   (:state r)
+                   (update-in st [:diagnostics (or (:error r) :cold-root-recovery-rejected)] (fnil inc 0))))))
+      @res-box)))
+
 (defn- cmd-run
   "Runs a Bitecho mesh node given a config EDN file."
-  [config-file]
-  (let [f (io/file config-file)]
-    (when-not (.exists f)
-      (binding [*out* *err*]
-        (println (str "Error: config file not found: " config-file)))
-      (System/exit 1))
-    (let [cfg (edn/read-string (slurp f))
-          node (mesh/start-mesh-node! cfg)
-          _ (when (:auto-update-pointer cfg)
-              (when-let [stop-upd (updater/start-jvm-auto-updater!
-                                   {:node-id (name (:node-id node))
-                                    :pointer-url (:auto-update-pointer cfg)
-                                    :poll-interval-ms (:auto-update-interval-ms cfg)
-                                    :pinned-version (:pin-version cfg)
-                                    :force-http? (boolean (:auto-update-force-http? cfg))
-                                    :trusted-deploy-authorities (:trusted-deploy-authorities cfg)
-                                    :mesh-connected-fn (fn [] (mesh/has-open-mesh-peers? node))
-                                    :mesh-chunk-fetch-fn (fn [cid eff]
-                                                           (let [bs (when-let [sa (:state-atom node)]
-                                                                      (get-in @sa [:data :blob-store :entries cid :bytes]))]
-                                                             (if (bytes? bs)
-                                                               {:ok? true :bytes bs :source :local-cas}
-                                                               (mesh/fetch-mesh-chunks-from-peers! node cid eff))))
-                                    :stop-node-fn! #(mesh/stop-mesh-node! node)})]
-                (.addShutdownHook (Runtime/getRuntime) (Thread. ^Runnable stop-upd))))
-          node-id (:node-id node)
-          pubkey (get-in node [:identity :pubkey-hex])
-          fp (get-in node [:identity :fingerprint])
-          http-port (get-in cfg [:http :port] 8080)]
-      (println (format "Bitecho node started: id=%s pubkey=%s fingerprint=%s http=:%d"
-                       (name node-id) pubkey fp http-port))
-      (.addShutdownHook (Runtime/getRuntime)
-                        (Thread. ^Runnable (fn []
-                                             (println "Shutting down Bitecho node...")
-                                             ((:stop! node)))))
-      (let [lock (Object.)]
-        (locking lock
-          (.wait lock))))))
+  ([config-file]
+   (cmd-run config-file nil))
+  ([config-file extra-opts]
+   (let [f (io/file config-file)]
+     (when-not (.exists f)
+       (binding [*out* *err*]
+         (println (str "Error: config file not found: " config-file)))
+       (System/exit 1))
+     (let [cfg (merge (edn/read-string (slurp f)) extra-opts)
+           node (mesh/start-mesh-node! cfg)
+           _ (when-let [rec-cid (:cold-root-recovery-cid cfg)]
+               (when-let [sa (:state-atom node)]
+                 (let [r (apply-startup-cold-root-recovery! sa (:state-dir cfg) rec-cid cfg)]
+                   (when-not (:ok? r)
+                     (binding [*out* *err*]
+                       (println (str "FATAL: --cold-root-recovery-cid failed verification: " (:error r))))
+                     (System/exit 1)))))
+           _ (when (:auto-update-pointer cfg)
+               (when-let [stop-upd (updater/start-jvm-auto-updater!
+                                    {:node-id (name (:node-id node))
+                                     :pointer-url (:auto-update-pointer cfg)
+                                     :poll-interval-ms (:auto-update-interval-ms cfg)
+                                     :pinned-version (:pin-version cfg)
+                                     :force-http? (boolean (:auto-update-force-http? cfg))
+                                     :trusted-deploy-authorities (:trusted-deploy-authorities cfg)
+                                     :mesh-connected-fn (fn [] (mesh/has-open-mesh-peers? node))
+                                     :mesh-chunk-fetch-fn (fn [cid eff]
+                                                            (let [bs (when-let [sa (:state-atom node)]
+                                                                       (get-in @sa [:data :blob-store :entries cid :bytes]))]
+                                                              (if (bytes? bs)
+                                                                {:ok? true :bytes bs :source :local-cas}
+                                                                (mesh/fetch-mesh-chunks-from-peers! node cid eff))))
+                                     :stop-node-fn! #(mesh/stop-mesh-node! node)})]
+                 (.addShutdownHook (Runtime/getRuntime) (Thread. ^Runnable stop-upd))))
+           node-id (:node-id node)
+           pubkey (get-in node [:identity :pubkey-hex])
+           fp (get-in node [:identity :fingerprint])
+           http-port (get-in cfg [:http :port] 8080)]
+       (println (format "Bitecho node started: id=%s pubkey=%s fingerprint=%s http=:%d"
+                        (name node-id) pubkey fp http-port))
+       (.addShutdownHook (Runtime/getRuntime)
+                         (Thread. ^Runnable (fn []
+                                              (println "Shutting down Bitecho node...")
+                                              ((:stop! node)))))
+       (let [lock (Object.)]
+         (locking lock
+           (.wait lock)))))))
 
 (defn- cmd-print-identity
   "Prints the persistent node identity for a given config EDN file."

@@ -599,12 +599,48 @@
       (when (seq eligible)
         (get validator-set-history (apply max eligible))))))
 
+(defn resolve-active-validators
+  "BIP-024 §2.5 Anti-Downgrade Rule (F2): Static `:config :validators` fallback is permitted
+   strictly iff `last-finalized-epoch == 0`. Once `last-finalized-epoch >= 1`, nodes with
+   `:strict-validator-history? true` MUST reject static fallback with
+   `{:ok? false :error :static-validator-fallback-forbidden}` + counted `:diagnose`."
+  ([state]
+   (resolve-active-validators state (or (:epoch state) (:last-finalized-epoch state) (:last-executed-finalized-epoch state) 0)))
+  ([state target-epoch]
+   (let [history (:validator-set-history state)
+         last-fin (long (or (:last-finalized-epoch state) (:last-executed-finalized-epoch state) 0))
+         entry (committee-at-epoch history (long (or target-epoch 0)))
+         strict? (or (boolean (:strict-validator-history? state))
+                     (boolean (get-in state [:config :strict-validator-history?])))]
+     (cond
+       entry
+       {:ok? true
+        :from-history? true
+        :validators (vec (sort (:committee entry)))
+        :quorum-threshold (or (:quorum-threshold entry)
+                              (quorum-threshold (count (:committee entry))))}
+
+       (and strict? (>= last-fin 1))
+       {:ok? false
+        :error :static-validator-fallback-forbidden
+        :effects [{:effect :diagnose
+                   :reason :static-validator-fallback-forbidden
+                   :last-finalized-epoch last-fin}]}
+
+       :else
+       (let [vhex (extract-validator-hexes state)]
+         {:ok? true
+          :from-history? false
+          :validators vhex
+          :quorum-threshold (quorum-threshold (total-node-count state vhex))})))))
+
 (defn valid-block-proposal?
   "Validates a block proposal event against state:
    - event and block must be maps
    - :peers-map must be non-empty
    - epoch must be a positive integer
    - proposer must be a string, in :peers-map, and in the Streamlet BFT committee active at `(:epoch block)`
+     (enforcing `resolve-active-validators` anti-downgrade guard, F2)
    - proposer must match expected round-robin leader for epoch
    - if :sender is present on event, must equal (:proposer block)
    - proposer signature must be valid Ed25519 signature verified by proposer's pubkey bytes"
@@ -613,34 +649,33 @@
    (when (and (map? state) (map? event) (map? (:block event)))
      (let [block (:block event)
            epoch (:epoch block)
-           hist-entry (committee-at-epoch (:validator-set-history state) epoch)
-           validator-hexes (if hist-entry
-                             (vec (sort (:committee hist-entry)))
-                             (extract-validator-hexes state))
-           validator-set (set validator-hexes)
-           total-nodes (if hist-entry
-                         (count validator-hexes)
-                         (total-node-count state validator-hexes))
-           proposer (:proposer block)
-           sender (:sender event)
-           sender-hex (cond
-                        (string? sender) sender
-                        (bytes? sender) (bytes->hex sender)
-                        :else nil)]
-       (when (and (seq (:peers-map state))
-                  (seq validator-hexes)
-                  (integer? epoch)
-                  (pos? epoch)
-                  (string? proposer)
-                  (contains? validator-set proposer)
-                  (pos? total-nodes)
-                  (or (nil? sender) (= sender-hex proposer)))
-         (let [expected-leader (nth validator-hexes (mod epoch total-nodes))
-               proposer-pk (resolve-peer-pubkey-bytes state proposer)]
-           (and expected-leader
-                (= proposer expected-leader)
-                proposer-pk
-                (verify-block-signature block proposer-pk))))))))
+           active-res (resolve-active-validators state epoch)]
+       (when (:ok? active-res)
+         (let [validator-hexes (:validators active-res)
+               validator-set (set validator-hexes)
+               total-nodes (if (:from-history? active-res)
+                             (count validator-hexes)
+                             (total-node-count state validator-hexes))
+               proposer (:proposer block)
+               sender (:sender event)
+               sender-hex (cond
+                            (string? sender) sender
+                            (bytes? sender) (bytes->hex sender)
+                            :else nil)]
+           (when (and (seq (:peers-map state))
+                      (seq validator-hexes)
+                      (integer? epoch)
+                      (pos? epoch)
+                      (string? proposer)
+                      (contains? validator-set proposer)
+                      (pos? total-nodes)
+                      (or (nil? sender) (= sender-hex proposer)))
+             (let [expected-leader (nth validator-hexes (mod epoch total-nodes))
+                   proposer-pk (resolve-peer-pubkey-bytes state proposer)]
+               (and expected-leader
+                    (= proposer expected-leader)
+                    proposer-pk
+                    (verify-block-signature block proposer-pk))))))))))
 
 (defn- extract-targets
   "Determines target destinations for outgoing network commands.
@@ -745,42 +780,10 @@
               (recur p-hash (inc depth) (conj visited p-hash) next-acc)))
           acc)))))
 
-(defn resolve-active-validators
-  "BIP-024 §2.5 Anti-Downgrade Rule: Static `:config :validators` fallback is permitted
-   strictly iff `last-finalized-epoch == 0`. Once `last-finalized-epoch >= 1`, nodes with
-   `:strict-validator-history? true` (or non-empty `:validator-set-history`) MUST reject
-   static fallback with `{:ok? false :error :static-validator-fallback-forbidden}`."
-  [state]
-  (let [history (:validator-set-history state)
-        last-fin (long (or (:last-finalized-epoch state) (:last-executed-finalized-epoch state) 0))
-        curr-ep (long (or (:epoch state) last-fin))
-        entry (committee-at-epoch history curr-ep)
-        strict? (or (boolean (:strict-validator-history? state))
-                    (boolean (get-in state [:config :strict-validator-history?])))]
-    (cond
-      entry
-      {:ok? true
-       :validators (vec (:committee entry))
-       :quorum-threshold (or (:quorum-threshold entry)
-                             (quorum-threshold (count (:committee entry))))}
-
-      (and strict? (>= last-fin 1))
-      {:ok? false
-       :error :static-validator-fallback-forbidden
-       :effects [{:effect :diagnose
-                  :reason :static-validator-fallback-forbidden
-                  :last-finalized-epoch last-fin}]}
-
-      :else
-      (let [vhex (extract-validator-hexes state)]
-        {:ok? true
-         :validators vhex
-         :quorum-threshold (quorum-threshold (total-node-count state vhex))}))))
-
 (defn verify-ancestor-quorum
   "Verifies that an ancestor entry contains a valid block proposal within max-epoch-catchup-delta
    and a quorum of validly signed votes from the Streamlet BFT committee active at `(:epoch block)`
-   (resolving `:validator-set-history` for historical catchup across rotations, BIP-024 §2.5)."
+   (resolving `:validator-set-history` and enforcing `resolve-active-validators` anti-downgrade, BIP-024 §2.5 / F2)."
   [state ancestor-entry]
   (if-not (and (map? ancestor-entry)
                (map? (:block ancestor-entry))
@@ -792,20 +795,15 @@
           max-d (or (:max-epoch-catchup-delta state) max-epoch-catchup-delta)
           epoch-ok? (and (integer? (:epoch block))
                          (<= (long (:epoch block)) (+ curr-ep max-d)))
-          proposal-ok? (and epoch-ok? (valid-block-proposal? state {:block block}))]
+          active-res (resolve-active-validators state (:epoch block))
+          proposal-ok? (and epoch-ok? (:ok? active-res) (valid-block-proposal? state {:block block}))]
       (if-not proposal-ok?
-        {:valid? false}
+        (cond-> {:valid? false}
+          (not (:ok? active-res)) (assoc :error (:error active-res) :effects (:effects active-res)))
         (let [b-hash (hash-block block)
-              hist-entry (committee-at-epoch (:validator-set-history state) (:epoch block))
-              validator-hexes (if hist-entry
-                                (vec (:committee hist-entry))
-                                (extract-validator-hexes state))
+              validator-hexes (:validators active-res)
               validator-set (set validator-hexes)
-              total-nodes (if hist-entry
-                            (count validator-hexes)
-                            (total-node-count state validator-hexes))
-              threshold (or (:quorum-threshold hist-entry)
-                            (quorum-threshold total-nodes))
+              threshold (:quorum-threshold active-res)
               verified-votes
               (into {}
                     (filter (fn [[voter-hex vote]]
