@@ -23,7 +23,7 @@ Complete registry of committed Bitecho Improvement Proposals (**BIP-000** throug
 | **BIP-017a** | D43 / `v0.23.19` | `:consented` | [`bip-017a-v02319.edn`](bip-017a-v02319.edn) ([Spec](bip-017a-chunked-storage-spec.md)) | `99780163a3c4bb193191baf4ebbdc174b7b0720ccc1f2d7f5f955c60200f73ba` |
 | **BIP-017b** | D44 / `v0.23.20` | `:consented` | [`bip-017b-v02320.edn`](bip-017b-v02320.edn) ([Spec](bip-017b-web-app-release-spec.md)) | `d8c0d3ca715f41e4012e8b0859ddf3cf9a7910a4818c48312eb17b968ac5c0da` |
 | **BIP-023** | Host Policy / `v0.23.21` | `:consented` | [`bip-023-gentoo-host-update-policy.edn`](bip-023-gentoo-host-update-policy.edn) ([Policy](bip-023-gentoo-host-update-policy.md)) | `8a7b7cadeb65234c724d4457ddcafd0a5d5377197af7e195d56d1e3bb1aa94bc` |
-| **BIP-024** | Circles on Subnets / `v0.23.23` | `:consented` | [`bip-024-v02323.edn`](bip-024-v02323.edn) ([Spec](BIP-024.md) `048e907185153195ad968e76f6e5fc907903b05186c1e1f994e48d4493d003a2`) | `eccc10c207bc7effcad6dbe104aaa7a73c456afbc8ff28913dba17062155fd71` |
+| **BIP-024** | Circles on Subnets / `v0.23.23` | `:consented` | [`bip-024-v02323.edn`](bip-024-v02323.edn) ([Spec](BIP-024.md) `048e907185153195ad968e76f6e5fc907903b05186c1e1f994e48d4493d003a2`) | `b91e12226cd05ac38200797ba5a5f9e3962987e6932a99adcfa84b7055cb86ff` |
 
 ## Active Staged Rollouts
 

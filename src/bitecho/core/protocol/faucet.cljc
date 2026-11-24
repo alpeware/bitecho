@@ -97,13 +97,68 @@
     :else nil))
 
 ;; =============================================================================
-;; 1. Real CBOR WebAuthn `attestationObject` & `authData` Parser (F1)
+;; 1. Real CBOR WebAuthn `attestationObject`, `authData` & COSE Key Parser (F1 / F1-R)
 ;; =============================================================================
+
+(def ^:private ed25519-spki-prefix-hex "302a300506032b6570032100")
+(def ^:private ec2-p256-spki-prefix-hex "3059301306072a8648ce3d020106082a8648ce3d03010703420004")
+
+(defn compute-expected-client-data-hash
+  "Derives the server-expected 32-byte WebAuthn `clientDataHash` bound to
+   `network-uri`, single-use `nonce`, and `subject-commitment` (either claimant SPKI
+   in direct mode or blinded `voucher-commitment` in blinded mode)."
+  [network-uri nonce subject-commitment]
+  (crypto/sha256
+   (fressian/encode-canonical
+    ["bitecho-webauthn-clientdata-v1"
+     (str network-uri)
+     (str nonce)
+     (str/lower-case (str/trim (str (or subject-commitment ""))))])))
+
+(defn ed25519-spki->cose-bytes
+  "Encodes a canonical 88-char Ed25519 SPKI hex public key into a CBOR COSE_Key map
+   (OKP kty=1, alg=-8 EdDSA, crv=6 Ed25519, -2=raw 32-byte x)."
+  [hw-spki]
+  (when-let [norm (circle/normalize-spki-pubkey hw-spki)]
+    (let [raw-hex (if (str/starts-with? norm ed25519-spki-prefix-hex)
+                    (subs norm (count ed25519-spki-prefix-hex))
+                    norm)
+          raw-bs (basalt/hex->bytes raw-hex)]
+      (when (= 32 (fressian/count-bytes raw-bs))
+        (cbor/encode {1 1, 3 -8, -1 6, -2 raw-bs})))))
+
+(defn parse-cose-public-key
+  "Parses a CBOR-decoded COSE_Key map from WebAuthn `authData.attestedCredentialData` (F1-R).
+   Supports OKP Ed25519 (`kty=1, crv=6, -2=x`) and EC2 P-256 (`kty=2, crv=1, -2=x, -3=y`)."
+  [cose-map]
+  (when (map? cose-map)
+    (let [kty (get cose-map 1)
+          crv (get cose-map -1)
+          x-bs (coerce-bytes (get cose-map -2))
+          y-bs (coerce-bytes (get cose-map -3))]
+      (cond
+        ;; OKP Ed25519: kty=1, crv=6, 32-byte x
+        (and (= 1 kty) (= 6 crv) x-bs (= 32 (fressian/count-bytes x-bs)))
+        (let [x-hex (str/lower-case (basalt/bytes->hex x-bs))
+              spki (str ed25519-spki-prefix-hex x-hex)]
+          {:kty :okp :crv :ed25519 :hw-pubkey spki :raw-x-hex x-hex})
+
+        ;; EC2 P-256: kty=2, crv=1, 32-byte x, 32-byte y
+        (and (= 2 kty) (= 1 crv) x-bs y-bs
+             (= 32 (fressian/count-bytes x-bs))
+             (= 32 (fressian/count-bytes y-bs)))
+        (let [x-hex (str/lower-case (basalt/bytes->hex x-bs))
+              y-hex (str/lower-case (basalt/bytes->hex y-bs))
+              spki (str ec2-p256-spki-prefix-hex x-hex y-hex)]
+          {:kty :ec2 :crv :p-256 :hw-pubkey spki :raw-x-hex x-hex :raw-y-hex y-hex})
+
+        :else nil))))
 
 (defn parse-webauthn-auth-data
   "Parses binary WebAuthn `authData` per W3C WebAuthn Level 2 §6.1:
    - `rpIdHash` (32 B), `flags` (1 B), `signCount` (4 B)
-   - When AT flag (`0x40`) is set: `aaguid` (16 B UUID), `credIdLen` (2 B), `credentialId`."
+   - When AT flag (`0x40`) is set: `aaguid` (16 B UUID), `credIdLen` (2 B), `credentialId`,
+     and trailing CBOR COSE `credentialPublicKey` map (F1-R)."
   [auth-data-bytes]
   (let [bs (coerce-bytes auth-data-bytes)
         n (if bs (fressian/count-bytes bs) 0)]
@@ -116,19 +171,30 @@
         (if (and at-flag? (>= n 55))
           (let [aaguid-bytes (slice-bytes bs 37 16)
                 aaguid (bytes->uuid-str aaguid-bytes)
-                cred-len (u16-be bs 53)]
-            (if (< n (+ 55 cred-len))
+                cred-len (u16-be bs 53)
+                cose-offset (+ 55 cred-len)]
+            (if (< n cose-offset)
               {:ok? false :error :faucet-authdata-truncated}
-              {:ok? true
-               :rp-id-hash-hex (str/lower-case (basalt/bytes->hex rp-id-hash))
-               :flags flags
-               :up? (pos? (bit-and flags 0x01))
-               :uv? (pos? (bit-and flags 0x04))
-               :at? true
-               :sign-count sign-count
-               :aaguid aaguid
-               :credential-id (slice-bytes bs 55 cred-len)
-               :credential-id-hex (str/lower-case (basalt/bytes->hex (slice-bytes bs 55 cred-len)))}))
+              (let [cred-id (slice-bytes bs 55 cred-len)
+                    cred-id-hash (str/lower-case (basalt/bytes->hex (crypto/sha256 cred-id)))
+                    cose-parsed (when (> n cose-offset)
+                                  (try
+                                    (parse-cose-public-key
+                                     (cbor/decode (slice-bytes bs cose-offset (- n cose-offset))))
+                                    (catch #?(:clj Throwable :cljs :default) _ nil)))]
+                {:ok? true
+                 :rp-id-hash-hex (str/lower-case (basalt/bytes->hex rp-id-hash))
+                 :flags flags
+                 :up? (pos? (bit-and flags 0x01))
+                 :uv? (pos? (bit-and flags 0x04))
+                 :at? true
+                 :sign-count sign-count
+                 :aaguid aaguid
+                 :credential-id cred-id
+                 :credential-id-hex (str/lower-case (basalt/bytes->hex cred-id))
+                 :credential-id-hash cred-id-hash
+                 :cose-public-key cose-parsed
+                 :attested-hw-pubkey (:hw-pubkey cose-parsed)})))
           {:ok? true
            :rp-id-hash-hex (str/lower-case (basalt/bytes->hex rp-id-hash))
            :flags flags
@@ -293,17 +359,21 @@
         :x5c [leaf-der root-der]})))
 
 (defn- build-auth-data-bytes
-  [rp-id aaguid-str cred-id-bytes]
-  (let [rp-hash (crypto/sha256 (fressian/utf8->bytes (str rp-id)))
-        flags-and-sc #?(:clj (byte-array [(unchecked-byte 0x45) 0 0 0 1])
-                        :cljs (js/Uint8Array. #js [0x45 0 0 0 1]))
-        aaguid-bs (or (uuid-str->bytes aaguid-str)
-                      #?(:clj (byte-array 16) :cljs (js/Uint8Array. 16)))
-        clen (fressian/count-bytes cred-id-bytes)
-        clen-bs #?(:clj (byte-array [(unchecked-byte (bit-shift-right clen 8))
-                                     (unchecked-byte (bit-and clen 0xff))])
-                   :cljs (js/Uint8Array. #js [(bit-shift-right clen 8) (bit-and clen 0xff)]))]
-    (reduce fressian/concat-bytes [rp-hash flags-and-sc aaguid-bs clen-bs cred-id-bytes])))
+  ([rp-id aaguid-str cred-id-bytes]
+   (build-auth-data-bytes rp-id aaguid-str cred-id-bytes nil))
+  ([rp-id aaguid-str cred-id-bytes cose-key-bytes]
+   (let [rp-hash (crypto/sha256 (fressian/utf8->bytes (str rp-id)))
+         flags-and-sc #?(:clj (byte-array [(unchecked-byte 0x45) 0 0 0 1])
+                         :cljs (js/Uint8Array. #js [0x45 0 0 0 1]))
+         aaguid-bs (or (uuid-str->bytes aaguid-str)
+                       #?(:clj (byte-array 16) :cljs (js/Uint8Array. 16)))
+         clen (fressian/count-bytes cred-id-bytes)
+         clen-bs #?(:clj (byte-array [(unchecked-byte (bit-shift-right clen 8))
+                                      (unchecked-byte (bit-and clen 0xff))])
+                    :cljs (js/Uint8Array. #js [(bit-shift-right clen 8) (bit-and clen 0xff)]))
+         parts (cond-> [rp-hash flags-and-sc aaguid-bs clen-bs cred-id-bytes]
+                 cose-key-bytes (conj cose-key-bytes))]
+     (reduce fressian/concat-bytes parts))))
 
 (defn init-faucet-state
   "Initializes pure Sans-IO Faucet protocol state (including earmarked blinded-voucher balance, F10)."
@@ -368,16 +438,23 @@
 
 (defn build-test-hardware-attestation
   "Constructs a real CBOR-encoded WebAuthn `attestationObject` with real X.509 DER `x5c` chain
-   (ECDSA P-256 on JVM; Ed25519/DER on CLJS), `authData`, `attStmt.sig`, FIDO2 assertion,
-   and claimant PoP for tests and shells (F1)."
-  [{:keys [hw-privkey hw-pubkey claimant-privkey claimant-pubkey nonce network-uri aaguid fmt cred-hash] :as _opts}]
+   (ECDSA P-256 on JVM; Ed25519/DER on CLJS), `authData` embedding a genuine CBOR COSE
+   `credentialPublicKey`, `attStmt.sig` over `authData || expectedClientDataHash`, FIDO2
+   assertion, and optional claimant PoP (omitted in blinded voucher mode) (F1 / F1-R / F10)."
+  [{:keys [hw-privkey hw-pubkey claimant-privkey claimant-pubkey voucher-commitment nonce network-uri aaguid fmt cred-id cred-hash] :as _opts}]
   (let [hw-spki (circle/normalize-spki-pubkey hw-pubkey)
-        cl-spki (circle/normalize-spki-pubkey claimant-pubkey)
+        cl-spki (when claimant-pubkey (circle/normalize-spki-pubkey claimant-pubkey))
         eff-fmt (or fmt "packed")
         eff-aaguid (or aaguid "2fc0579f-8113-47ea-b116-bb5a8db9202a")
-        cred-id-bs (fressian/utf8->bytes (str (or cred-hash "test-cred-id")))
-        auth-data-bs (build-auth-data-bytes (str (or network-uri "devnet.bitecho.org")) eff-aaguid cred-id-bs)
-        client-data-hash (crypto/sha256 (fressian/encode-canonical ["bitecho-webauthn-clientdata-v1" (str network-uri) (str nonce)]))
+        cred-id-bs (or (coerce-bytes cred-id)
+                       (fressian/utf8->bytes (str (or cred-hash "test-cred-id"))))
+        derived-cred-hash (str/lower-case (basalt/bytes->hex (crypto/sha256 cred-id-bs)))
+        cose-key-bs (ed25519-spki->cose-bytes hw-spki)
+        auth-data-bs (build-auth-data-bytes (str (or network-uri "devnet.bitecho.org")) eff-aaguid cred-id-bs cose-key-bs)
+        subject-comm (if (and (string? voucher-commitment) (not (str/blank? voucher-commitment)))
+                       (str/lower-case (str/trim voucher-commitment))
+                       (or cl-spki ""))
+        client-data-hash (compute-expected-client-data-hash (str network-uri) (str nonce) subject-comm)
         signed-data (fressian/concat-bytes auth-data-bs client-data-hash)
         #?@(:clj [chain (or (:x509-chain _opts) (generate-test-x509-chain-jvm))
                   att-sig (let [s (Signature/getInstance "SHA256withECDSA")]
@@ -396,28 +473,33 @@
                                     "attStmt" {"alg" -7
                                                "sig" att-sig
                                                "x5c" x5c-ders}})
-        assertion-tuple ["bitecho-faucet-assertion-v1" (str network-uri) (str nonce) (str (or cred-hash ""))]
-        pop-tuple ["bitecho-faucet-claimant-pop-v1" (str network-uri) (str nonce) cl-spki]
+        assertion-tuple ["bitecho-faucet-assertion-v1" (str network-uri) (str nonce) derived-cred-hash]
         assertion-sig (str/lower-case (basalt/bytes->hex (crypto/sign-canonical hw-privkey assertion-tuple)))
-        pop-sig (str/lower-case (basalt/bytes->hex (crypto/sign-canonical claimant-privkey pop-tuple)))]
+        pop-sig (when (and claimant-privkey cl-spki)
+                  (let [pop-tuple ["bitecho-faucet-claimant-pop-v1" (str network-uri) (str nonce) cl-spki]]
+                    (str/lower-case (basalt/bytes->hex (crypto/sign-canonical claimant-privkey pop-tuple)))))]
     {:trusted-root-fingerprint root-fp
-     :attestation {:attestation-object-hex (str/lower-case (basalt/bytes->hex att-obj-bytes))
-                   :client-data-hash-hex (str/lower-case (basalt/bytes->hex client-data-hash))
-                   :hw-pubkey hw-spki
-                   :assertion-sig assertion-sig
-                   :claimant-pop-sig pop-sig
-                   :cred-hash-bound? (some? cred-hash)}}))
+     :credential-id-hash derived-cred-hash
+     :attestation (cond-> {:attestation-object-hex (str/lower-case (basalt/bytes->hex att-obj-bytes))
+                           :client-data-hash-hex (str/lower-case (basalt/bytes->hex client-data-hash))
+                           :hw-pubkey hw-spki
+                           :assertion-sig assertion-sig}
+                    pop-sig (assoc :claimant-pop-sig pop-sig))}))
 
 (defn verify-hardware-attestation
-  "Fail-closed server-side WebAuthn/FIDO2 hardware attestation verifier (BIP-024 §2.9, F1).
-   NEVER trusts any client-supplied boolean; verifies:
+  "Fail-closed server-side WebAuthn/FIDO2 hardware attestation verifier (BIP-024 §2.9, F1 / F1-R).
+   NEVER trusts any client-supplied boolean or unattested key; verifies:
    1. Real CBOR decoding of `attestationObject` (`fmt`, `authData`, `attStmt.x5c`, `attStmt.sig`).
-   2. Rejects `fmt=\"none\"` in production and checks `aaguid` + `fmt` against `attestation-roots`.
-   3. Real X.509 `x5c` certificate-chain verification against pinned `trusted-root-fingerprints`
-      and real `attStmt.sig` verification over `authData || clientDataHash`.
-   4. FIDO2 hardware assertion signature over single-use network-bound challenge.
-   5. Claimant Proof-of-Possession signature."
-  [attestation-roots trusted-root-fps {:keys [attestation network-uri nonce claimant-pubkey cred-hash]}]
+   2. Extracts COSE `credentialPublicKey` directly from `authData` and rejects missing or
+      mismatched client-supplied `:hw-pubkey` (closes COSE key-substitution, F1-R).
+   3. Derives `cred-hash` strictly from `sha256(authData.credentialId)` and rejects any
+      mismatched client-supplied `cred-hash` (F1-R).
+   4. Enforces `clientDataHash == expected-client-data-hash` derived from server challenge +
+      claimant/voucher commitment, verifying `attStmt.sig` over `authData || expected-cdh` (F1-R).
+   5. Real X.509 `x5c` certificate-chain verification against pinned `trusted-root-fingerprints`.
+   6. FIDO2 hardware assertion signature (verified with attested COSE key) + Claimant PoP
+      (in direct mode; omitted in blinded voucher mode where `voucher-commitment` is bound)."
+  [attestation-roots trusted-root-fps {:keys [attestation network-uri nonce claimant-pubkey voucher-commitment cred-hash]}]
   (let [roots-cfg (or attestation-roots spend-dac/default-faucet-attestation-roots)
         reject-none? (not (false? (:reject-fmt-none? roots-cfg)))
         pinned-fps (set (or trusted-root-fps (:trusted-root-fingerprints roots-cfg) #{}))
@@ -436,14 +518,27 @@
 
       :else
       (let [fmt (:fmt parsed)
-            aaguid (get-in parsed [:auth-data :aaguid])
+            auth-data (:auth-data parsed)
+            aaguid (:aaguid auth-data)
+            attested-hw-pk (:attested-hw-pubkey auth-data)
+            attested-cred-hash (:credential-id-hash auth-data)
             x5c (:x5c parsed)
             att-sig (coerce-bytes (:sig parsed))
             auth-data-bs (:auth-data-bytes parsed)
-            expected-cdh (crypto/sha256 (fressian/encode-canonical ["bitecho-webauthn-clientdata-v1" (str network-uri) (str nonce)]))
-            cdh-bs (or (coerce-bytes (:client-data-hash-hex attestation)) expected-cdh)
-            hw-spki (circle/normalize-spki-pubkey (:hw-pubkey attestation))
-            cl-spki (circle/normalize-spki-pubkey claimant-pubkey)
+            blinded? (and (string? voucher-commitment) (not (str/blank? voucher-commitment)))
+            cl-spki (when claimant-pubkey (circle/normalize-spki-pubkey claimant-pubkey))
+            subject-comm (if blinded?
+                           (str/lower-case (str/trim voucher-commitment))
+                           (or cl-spki ""))
+            expected-cdh (compute-expected-client-data-hash network-uri nonce subject-comm)
+            expected-cdh-hex (str/lower-case (basalt/bytes->hex expected-cdh))
+            supplied-cdh-hex (when (string? (:client-data-hash-hex attestation))
+                               (str/lower-case (str/trim (:client-data-hash-hex attestation))))
+            supplied-hw-pk (when-let [raw-hw (:hw-pubkey attestation)]
+                             (or (circle/normalize-spki-pubkey raw-hw)
+                                 (str/lower-case (str/trim (str raw-hw)))))
+            supplied-cred-hash (when (and (string? cred-hash) (not (str/blank? cred-hash)))
+                                 (str/lower-case (str/trim cred-hash)))
             assertion-sig (:assertion-sig attestation)
             pop-sig (:claimant-pop-sig attestation)
             matching-root (when (and aaguid fmt)
@@ -456,8 +551,9 @@
             assertion-tuple ["bitecho-faucet-assertion-v1"
                              (str network-uri)
                              (str nonce)
-                             (if (:cred-hash-bound? attestation) (str cred-hash) "")]
-            pop-tuple ["bitecho-faucet-claimant-pop-v1" (str network-uri) (str nonce) cl-spki]]
+                             (str attested-cred-hash)]
+            pop-tuple (when cl-spki
+                        ["bitecho-faucet-claimant-pop-v1" (str network-uri) (str nonce) cl-spki])]
         (cond
           (and reject-none? (or (nil? fmt) (= "none" fmt)))
           {:ok? false :error :faucet-attestation-fmt-rejected :reason "attestation-fmt-none-forbidden"}
@@ -468,19 +564,33 @@
           (nil? matching-root)
           {:ok? false :error :faucet-attestation-root-untrusted :reason "untrusted-aaguid-or-fmt"}
 
+          (nil? attested-hw-pk)
+          {:ok? false :error :faucet-attestation-cose-key-missing :reason "missing-cose-credential-public-key"}
+
+          (and supplied-hw-pk (not= supplied-hw-pk attested-hw-pk))
+          {:ok? false :error :faucet-attestation-key-mismatch :reason "attested-cose-key-mismatch"}
+
+          (or (nil? attested-cred-hash)
+              (and supplied-cred-hash (not= supplied-cred-hash attested-cred-hash)))
+          {:ok? false :error :faucet-credential-hash-mismatch :reason "credential-id-hash-mismatch"}
+
+          (and supplied-cdh-hex (not= supplied-cdh-hex expected-cdh-hex))
+          {:ok? false :error :faucet-client-data-hash-mismatch :reason "client-data-hash-mismatch"}
+
           :else
-          (let [x5c-res #?(:clj (verify-x5c-and-sig-jvm x5c auth-data-bs cdh-bs att-sig pinned-fps)
-                           :cljs (verify-x5c-and-sig-js x5c auth-data-bs cdh-bs att-sig pinned-fps hw-spki))]
+          (let [x5c-res #?(:clj (verify-x5c-and-sig-jvm x5c auth-data-bs expected-cdh att-sig pinned-fps)
+                           :cljs (verify-x5c-and-sig-js x5c auth-data-bs expected-cdh att-sig pinned-fps attested-hw-pk))]
             (cond
               (not (:ok? x5c-res))
               {:ok? false :error (:error x5c-res) :reason (name (:error x5c-res))}
 
-              (or (nil? hw-spki) (not (string? assertion-sig))
-                  (not (crypto/verify-with-fallback hw-spki assertion-tuple assertion-sig)))
+              (or (not (string? assertion-sig))
+                  (not (crypto/verify-with-fallback attested-hw-pk assertion-tuple assertion-sig)))
               {:ok? false :error :faucet-assertion-invalid :reason "invalid-fido2-assertion-signature"}
 
-              (or (nil? cl-spki) (not (string? pop-sig))
-                  (not (crypto/verify-with-fallback cl-spki pop-tuple pop-sig)))
+              (and (not blinded?)
+                   (or (nil? cl-spki) (not (string? pop-sig))
+                       (not (crypto/verify-with-fallback cl-spki pop-tuple pop-sig))))
               {:ok? false :error :faucet-claimant-pop-invalid :reason "invalid-claimant-pop-signature"}
 
               :else
@@ -488,23 +598,37 @@
                :root-id (:root-id matching-root)
                :root-fingerprint (:root-fingerprint x5c-res)
                :aaguid aaguid
-               :hw-pubkey hw-spki
-               :hardware-nullifier (hardware-uniqueness-nullifier network-uri aaguid hw-spki)})))))))
+               :hw-pubkey attested-hw-pk
+               :credential-id-hash attested-cred-hash
+               :hardware-nullifier (hardware-uniqueness-nullifier network-uri aaguid attested-hw-pk)})))))))
+
+(declare issue-blinded-voucher)
 
 (defn reduce-faucet-claim
-  "Pure fail-closed reducer for a faucet claim request (BIP-006 + BIP-024 §2.9, F1).
-   Ignores any client-supplied `:authenticator-verified?` flag and requires valid
-   server-verified CBOR `attestationObject`, X.509 `x5c` cert chain, `attStmt.sig`,
-   FIDO2 assertion, claimant PoP, hardware uniqueness nullifier, and per-epoch drip cap."
+  "Pure fail-closed reducer for a faucet claim request (BIP-006 + BIP-024 §2.9, F1 / F1-R / F10).
+   Supports both:
+   - Blinded voucher mode (`:voucher-commitment` present): verifies hardware attestation bound to
+     `:voucher-commitment`, earmarks balance, returns `:blinded-voucher`, and publishes ONLY the
+     unlinkable `:nullifier-blob` / `:nullifier-pointer` at `faucet/<net>/nullifiers/<hw-nullifier>`
+     (ZERO `:claimant`, ZERO `:credential-id-hash` published).
+   - Direct claim mode (`:claimant-pubkey` present): verifies hardware attestation + claimant PoP,
+     and STILL publishes ONLY the unlinkable `:nullifier-blob` at `faucet/<net>/nullifiers/<hw-nullifier>`
+     (never co-publishing `:claimant` + `:credential-id-hash` + `:hardware-nullifier` together)."
   ([state claim-req]
    (reduce-faucet-claim state claim-req (now-timestamp-ms)))
   ([state claim-req now-ms]
    (let [nonce (:nonce claim-req)
          challenge (get-in state [:challenges nonce])
          claim-net-uri (or (:network-uri claim-req) (:network-uri state))
-         cred-hash (when (string? (:credential-id-hash claim-req))
-                     (str/trim (:credential-id-hash claim-req)))
-         claimant-pk (circle/normalize-spki-pubkey (:claimant-pubkey claim-req))
+         supplied-cred-hash (when (and (string? (:credential-id-hash claim-req))
+                                       (not (str/blank? (:credential-id-hash claim-req))))
+                              (str/lower-case (str/trim (:credential-id-hash claim-req))))
+         voucher-comm (when (and (string? (:voucher-commitment claim-req))
+                                 (not (str/blank? (:voucher-commitment claim-req))))
+                        (str/lower-case (str/trim (:voucher-commitment claim-req))))
+         blinded? (some? voucher-comm)
+         claimant-pk (when-not blinded?
+                       (circle/normalize-spki-pubkey (:claimant-pubkey claim-req)))
          epoch (long (or (:epoch claim-req) 0))
          drip-amount (long (or (:drip-amount-ech state) 1000000))
          epoch-cap (long (or (:epoch-drip-cap-ech state) 100000000))
@@ -525,12 +649,12 @@
        (> (long now-ms) (long (:expires-at challenge)))
        (fail! (update state :challenges dissoc nonce) :faucet-challenge-expired "challenge-expired")
 
-       (or (str/blank? cred-hash)
-           (not (valid-claimant-pubkey? claimant-pk)))
+       (and (not blinded?) (not (valid-claimant-pubkey? claimant-pk)))
        (fail! (update state :challenges dissoc nonce) :faucet-claim-rejected "invalid-claim-parameters")
 
-       (or (contains? (:claimed-credentials state) cred-hash)
-           (contains? (:receipts state) cred-hash))
+       (and supplied-cred-hash
+            (or (contains? (:claimed-credentials state) supplied-cred-hash)
+                (contains? (:receipts state) supplied-cred-hash)))
        (fail! (update state :challenges dissoc nonce) :faucet-credential-already-claimed "credential-already-claimed")
 
        (> (+ epoch-used drip-amount) epoch-cap)
@@ -545,49 +669,35 @@
                        :network-uri net-uri
                        :nonce nonce
                        :claimant-pubkey claimant-pk
-                       :cred-hash cred-hash})]
+                       :voucher-commitment voucher-comm
+                       :cred-hash supplied-cred-hash})]
          (cond
            (not (:ok? att-res))
            (fail! (update state :challenges dissoc nonce) (:error att-res) (:reason att-res))
+
+           (or (contains? (:claimed-credentials state) (:credential-id-hash att-res))
+               (contains? (:receipts state) (:credential-id-hash att-res)))
+           (fail! (update state :challenges dissoc nonce) :faucet-credential-already-claimed "credential-already-claimed")
 
            (contains? (:claimed-hw-nullifiers state) (:hardware-nullifier att-res))
            (fail! (update state :challenges dissoc nonce) :faucet-hardware-already-claimed "hardware-nullifier-already-claimed")
 
            :else
-           (let [hw-nullifier (:hardware-nullifier att-res)
-                 receipt-path (str "faucet/" net-uri "/claims/" cred-hash)
+           (let [cred-hash (:credential-id-hash att-res)
+                 hw-nullifier (:hardware-nullifier att-res)
                  nullifier-path (str "faucet/" net-uri "/nullifiers/" hw-nullifier)
                  next-seq (inc (long (or (:claim-seq state) 0)))
                  treasury-pk (circle/normalize-spki-pubkey (:treasury-pubkey state))
                  treasury-sk (:treasury-privkey state)
-                 transfer-intent {:from        treasury-pk
-                                  :to          claimant-pk
-                                  :amount      drip-amount
-                                  :seq         next-seq
-                                  :memo        receipt-path
-                                  :network-uri net-uri}
-                 receipt {:claimed-at         (long now-ms)
-                          :claimant           claimant-pk
-                          :credential-id-hash cred-hash
-                          :hardware-nullifier hw-nullifier
-                          :amount             drip-amount
-                          :seq                next-seq
-                          :epoch              epoch
-                          :network-uri        net-uri
-                          :receipt-path       receipt-path
-                          :nullifier-path     nullifier-path}
-                 receipt-blob (data/make-blob (fressian/utf8->bytes (pr-str receipt)) "application/edn")
-                 receipt-cid (:blob/cid receipt-blob)
-                 receipt-ptr (when (and treasury-sk treasury-pk)
-                               (data/sign-pointer
-                                treasury-sk
-                                {:pointer/authority   treasury-pk
-                                 :pointer/subnet      net-uri
-                                 :pointer/path        receipt-path
-                                 :pointer/seq         1
-                                 :pointer/leader-term 1
-                                 :pointer/target      receipt-cid
-                                 :pointer/proof       {:proof/type :self}}))
+                 ;; Unlinkable nullifier record: NEVER contains :claimant or :credential-id-hash (F10)
+                 nullifier-record {:bitecho/type       :faucet/hardware-nullifier
+                                   :hardware-nullifier hw-nullifier
+                                   :claimed-at         (long now-ms)
+                                   :epoch              epoch
+                                   :network-uri        net-uri
+                                   :nullifier-path     nullifier-path}
+                 nullifier-blob (data/make-blob (fressian/utf8->bytes (pr-str nullifier-record)) "application/edn")
+                 nullifier-cid (:blob/cid nullifier-blob)
                  nullifier-ptr (when (and treasury-sk treasury-pk)
                                  (data/sign-pointer
                                   treasury-sk
@@ -596,41 +706,99 @@
                                    :pointer/path        nullifier-path
                                    :pointer/seq         1
                                    :pointer/leader-term 1
-                                   :pointer/target      receipt-cid
-                                   :pointer/proof       {:proof/type :self}}))
-                 signed-transfer (when (and treasury-sk treasury-pk)
-                                   (let [unsigned {:sender      treasury-pk
-                                                   :receiver    claimant-pk
-                                                   :amount      drip-amount
-                                                   :seq         next-seq
-                                                   :deps        []
-                                                   :network-uri net-uri}
-                                         tf (account/create-transfer treasury-sk unsigned)]
-                                     (into {} tf)))]
-             (cond-> {:ok?                true
-                      :transfer-intent    transfer-intent
-                      :receipt-path       receipt-path
-                      :nullifier-path     nullifier-path
-                      :hardware-nullifier hw-nullifier
-                      :receipt-cid        receipt-cid
-                      :receipt            receipt
-                      :receipt-blob       receipt-blob
-                      :effects            []
-                      :state              (-> state
-                                              (assoc :claim-seq next-seq)
-                                              (update :challenges dissoc nonce)
-                                              (update :claimed-credentials (fnil conj #{}) cred-hash)
-                                              (update :claimed-hw-nullifiers (fnil conj #{}) hw-nullifier)
-                                              (update-in [:epoch-dripped epoch] (fnil + 0) drip-amount)
-                                              (assoc-in [:receipts cred-hash] receipt)
-                                              (assoc-in [:blobs receipt-cid] receipt-blob)
-                                              (cond-> receipt-ptr
-                                                (assoc-in [:pointers [net-uri receipt-path]] receipt-ptr))
-                                              (cond-> nullifier-ptr
-                                                (assoc-in [:pointers [net-uri nullifier-path]] nullifier-ptr)))}
-               receipt-ptr (assoc :receipt-pointer receipt-ptr)
-               nullifier-ptr (assoc :nullifier-pointer nullifier-ptr)
-               signed-transfer (assoc :signed-transfer signed-transfer)))))))))
+                                   :pointer/target      nullifier-cid
+                                   :pointer/proof       {:proof/type :self}}))]
+             (if blinded?
+               ;; Blinded voucher flow (F10): earmark balance, issue blinded voucher, publish ONLY nullifier
+               (let [v-res (issue-blinded-voucher state voucher-comm drip-amount epoch)]
+                 (if-not (:ok? v-res)
+                   (fail! (update state :challenges dissoc nonce) (:error v-res) (name (:error v-res)))
+                   (let [st' (-> (:state v-res)
+                                 (assoc :claim-seq next-seq)
+                                 (update :challenges dissoc nonce)
+                                 (update :claimed-credentials (fnil conj #{}) cred-hash)
+                                 (update :claimed-hw-nullifiers (fnil conj #{}) hw-nullifier)
+                                 (update-in [:epoch-dripped epoch] (fnil + 0) drip-amount)
+                                 (assoc-in [:blobs nullifier-cid] nullifier-blob)
+                                 (cond-> nullifier-ptr
+                                   (assoc-in [:pointers [net-uri nullifier-path]] nullifier-ptr)))]
+                     (cond-> {:ok?                true
+                              :mode               :blinded-voucher
+                              :blinded-voucher    (:voucher v-res)
+                              :nullifier-path     nullifier-path
+                              :nullifier-cid      nullifier-cid
+                              :nullifier-record   nullifier-record
+                              :nullifier-blob     nullifier-blob
+                              :hardware-nullifier hw-nullifier
+                              :effects            []
+                              :state              st'}
+                       nullifier-ptr (assoc :nullifier-pointer nullifier-ptr)))))
+               ;; Direct claim flow: receipt omits :hardware-nullifier; nullifier-blob omits :claimant & :credential-id-hash
+               (let [receipt-path (str "faucet/" net-uri "/claims/" cred-hash)
+                     transfer-intent {:from        treasury-pk
+                                      :to          claimant-pk
+                                      :amount      drip-amount
+                                      :seq         next-seq
+                                      :memo        receipt-path
+                                      :network-uri net-uri}
+                     receipt {:claimed-at         (long now-ms)
+                              :claimant           claimant-pk
+                              :credential-id-hash cred-hash
+                              :amount             drip-amount
+                              :seq                next-seq
+                              :epoch              epoch
+                              :network-uri        net-uri
+                              :receipt-path       receipt-path}
+                     receipt-blob (data/make-blob (fressian/utf8->bytes (pr-str receipt)) "application/edn")
+                     receipt-cid (:blob/cid receipt-blob)
+                     receipt-ptr (when (and treasury-sk treasury-pk)
+                                   (data/sign-pointer
+                                    treasury-sk
+                                    {:pointer/authority   treasury-pk
+                                     :pointer/subnet      net-uri
+                                     :pointer/path        receipt-path
+                                     :pointer/seq         1
+                                     :pointer/leader-term 1
+                                     :pointer/target      receipt-cid
+                                     :pointer/proof       {:proof/type :self}}))
+                     signed-transfer (when (and treasury-sk treasury-pk)
+                                       (let [unsigned {:sender      treasury-pk
+                                                       :receiver    claimant-pk
+                                                       :amount      drip-amount
+                                                       :seq         next-seq
+                                                       :deps        []
+                                                       :network-uri net-uri}
+                                             tf (account/create-transfer treasury-sk unsigned)]
+                                         (into {} tf)))]
+                 (cond-> {:ok?                true
+                          :mode               :direct
+                          :transfer-intent    transfer-intent
+                          :receipt-path       receipt-path
+                          :nullifier-path     nullifier-path
+                          :nullifier-cid      nullifier-cid
+                          :nullifier-record   nullifier-record
+                          :nullifier-blob     nullifier-blob
+                          :hardware-nullifier hw-nullifier
+                          :receipt-cid        receipt-cid
+                          :receipt            receipt
+                          :receipt-blob       receipt-blob
+                          :effects            []
+                          :state              (-> state
+                                                  (assoc :claim-seq next-seq)
+                                                  (update :challenges dissoc nonce)
+                                                  (update :claimed-credentials (fnil conj #{}) cred-hash)
+                                                  (update :claimed-hw-nullifiers (fnil conj #{}) hw-nullifier)
+                                                  (update-in [:epoch-dripped epoch] (fnil + 0) drip-amount)
+                                                  (assoc-in [:receipts cred-hash] receipt)
+                                                  (assoc-in [:blobs receipt-cid] receipt-blob)
+                                                  (assoc-in [:blobs nullifier-cid] nullifier-blob)
+                                                  (cond-> receipt-ptr
+                                                    (assoc-in [:pointers [net-uri receipt-path]] receipt-ptr))
+                                                  (cond-> nullifier-ptr
+                                                    (assoc-in [:pointers [net-uri nullifier-path]] nullifier-ptr)))}
+                   receipt-ptr (assoc :receipt-pointer receipt-ptr)
+                   nullifier-ptr (assoc :nullifier-pointer nullifier-ptr)
+                   signed-transfer (assoc :signed-transfer signed-transfer)))))))))))
 
 ;; =============================================================================
 ;; 3. Unlinkable Blinded Voucher Funding & Redemption (BIP-024 §2.9 item 4, F10)

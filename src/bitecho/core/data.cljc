@@ -470,6 +470,8 @@
       (assoc :pointer/leader-term (long (:pointer/leader-term pointer)))
       (some? (:pointer/expires pointer))
       (assoc :pointer/expires (long (:pointer/expires pointer)))
+      (some? (:pointer/issued-epoch pointer))
+      (assoc :pointer/issued-epoch (long (:pointer/issued-epoch pointer)))
       (some? (:pointer/expires-epoch pointer))
       (assoc :pointer/expires-epoch (long (:pointer/expires-epoch pointer))))))
 
@@ -1191,11 +1193,13 @@
        (let [now-ms (if (map? time-or-opts) (:now-ms time-or-opts) time-or-opts)
              anchor-epoch (when (map? time-or-opts) (or (:anchor-epoch time-or-opts) (:current-epoch time-or-opts)))
              exp (:pointer/expires ptr)
+             issued-ep (or (:pointer/issued-epoch ptr) (:pointer/epoch ptr))
              exp-ep (:pointer/expires-epoch ptr)
              skew (pointer-skew-tolerance-ms ptr nil)
              ms-expired? (and (some? exp) (some? now-ms) (>= (long now-ms) (+ (long exp) skew)))
-             ep-expired? (and (some? exp-ep) (some? anchor-epoch) (>= (long anchor-epoch) (long exp-ep)))]
-         (if (or ms-expired? ep-expired?)
+             ep-expired? (and (some? exp-ep) (some? anchor-epoch) (>= (long anchor-epoch) (long exp-ep)))
+             ep-future? (and (some? issued-ep) (some? anchor-epoch) (> (long issued-ep) (long anchor-epoch)))]
+         (if (or ms-expired? ep-expired? ep-future?)
            nil
            ptr))))))
 

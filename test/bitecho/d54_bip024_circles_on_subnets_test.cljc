@@ -14,6 +14,7 @@
             [bitecho.crypto :as crypto]
             [bitecho.economy.puzzle :as puzzle]
             [bitecho.fressian :as fressian]
+            [bitecho.light-node.cli :as cli]
             [bitecho.light-node.core :as light-core]
             [bitecho.memento.constants :as mem-const]
             [bitecho.shell.browser :as browser]
@@ -505,6 +506,7 @@
                      :hw-pubkey (:spki-hex hw-kp)
                      :claimant-privkey (:private claimant)
                      :claimant-pubkey (:spki-hex claimant)
+                     :cred-hash "cred-1"
                      :nonce n2
                      :network-uri "devnet.bitecho.org"
                      :fmt "none"})
@@ -512,7 +514,7 @@
                         (assoc (:state ch2) :trusted-root-fingerprints #{(:trusted-root-fingerprint att-none)})
                         (assoc att-none
                                :nonce n2
-                               :credential-id-hash "cred-1"
+                               :credential-id-hash (:credential-id-hash att-none)
                                :claimant-pubkey (:spki-hex claimant)
                                :network-uri "devnet.bitecho.org")
                         10300)
@@ -524,6 +526,7 @@
                         :hw-pubkey (:spki-hex hw-kp)
                         :claimant-privkey (:private claimant)
                         :claimant-pubkey (:spki-hex claimant)
+                        :cred-hash "cred-1"
                         :nonce n3
                         :network-uri "devnet.bitecho.org"
                         :aaguid "2fc0579f-8113-47ea-b116-bb5a8db9202a"
@@ -533,7 +536,7 @@
                               (assoc (:state ch3) :trusted-root-fingerprints #{})
                               (assoc att-payload
                                      :nonce n3
-                                     :credential-id-hash "cred-1"
+                                     :credential-id-hash (:credential-id-hash att-payload)
                                      :claimant-pubkey (:spki-hex claimant)
                                      :network-uri "devnet.bitecho.org"
                                      :epoch 50)
@@ -548,6 +551,7 @@
                           :hw-pubkey (:spki-hex hw-kp)
                           :claimant-privkey (:private claimant)
                           :claimant-pubkey (:spki-hex claimant)
+                          :cred-hash "cred-1"
                           :nonce n3b
                           :network-uri "devnet.bitecho.org"
                           :aaguid "2fc0579f-8113-47ea-b116-bb5a8db9202a"
@@ -557,7 +561,7 @@
                   st3b
                   (assoc att-payload-b
                          :nonce n3b
-                         :credential-id-hash "cred-1"
+                         :credential-id-hash (:credential-id-hash att-payload-b)
                          :claimant-pubkey (:spki-hex claimant)
                          :network-uri "devnet.bitecho.org"
                          :epoch 50)
@@ -570,6 +574,7 @@
                           :hw-pubkey (:spki-hex hw-kp)
                           :claimant-privkey (:private claimant)
                           :claimant-pubkey (:spki-hex claimant)
+                          :cred-hash "cred-2-different"
                           :nonce n4
                           :network-uri "devnet.bitecho.org"
                           :aaguid "2fc0579f-8113-47ea-b116-bb5a8db9202a"
@@ -578,7 +583,7 @@
                      (assoc (:state ch4) :trusted-root-fingerprints #{(:trusted-root-fingerprint att-payload-2)})
                      (assoc att-payload-2
                             :nonce n4
-                            :credential-id-hash "cred-2-different"
+                            :credential-id-hash (:credential-id-hash att-payload-2)
                             :claimant-pubkey (:spki-hex claimant)
                             :network-uri "devnet.bitecho.org"
                             :epoch 50)
@@ -958,3 +963,180 @@
       (is (:ok? (data/verify-pointer ptr {:subnet net :path-acl acl :current-epoch 4999 :now-ms 1800000000000})))
       ;; now-ms is 1 (<< 5000), but current-epoch 5000 >= 5000 -> MUST FAIL CLOSED
       (is (= :pointer-expired (:error (data/verify-pointer ptr {:subnet net :path-acl acl :current-epoch 5000 :now-ms 1})))))))
+
+(deftest test-bip024-seq3-f1r-f10-f11-v3-hardening
+  (testing "F1-R: COSE key-substitution, cred-hash mismatch, and clientDataHash mismatch are rejected fail-closed"
+    (let [treasury (gen-kp)
+          claimant (gen-kp)
+          genuine-hw (gen-kp)
+          attacker-hw (gen-kp)
+          rng (crypto/make-random 9901)
+          st0 (faucet/init-faucet-state {:network-uri "devnet.bitecho.org"
+                                         :network-genesis-cid test-genesis-cid
+                                         :treasury-pubkey (:spki-hex treasury)
+                                         :treasury-privkey (:private treasury)
+                                         :drip-amount-ech 1000})
+          ;; 1. COSE key-substitution attack: genuine YubiKey attestation replayed with substituted attacker hw-pubkey
+          ch1 (faucet/issue-faucet-challenge st0 {:network-uri "devnet.bitecho.org" :rng rng} 20000)
+          n1 (get-in ch1 [:challenge :nonce])
+          att1 (faucet/build-test-hardware-attestation
+                {:hw-privkey (:private genuine-hw)
+                 :hw-pubkey (:spki-hex genuine-hw)
+                 :claimant-privkey (:private claimant)
+                 :claimant-pubkey (:spki-hex claimant)
+                 :cred-hash "cred-genuine-1"
+                 :nonce n1
+                 :network-uri "devnet.bitecho.org"})
+          sub-sig (str/lower-case
+                   (basalt/bytes->hex
+                    (crypto/sign-canonical (:private attacker-hw)
+                                           ["bitecho-faucet-assertion-v1" "devnet.bitecho.org" n1 (:credential-id-hash att1)])))
+          key-sub-res (faucet/reduce-faucet-claim
+                       (assoc (:state ch1) :trusted-root-fingerprints #{(:trusted-root-fingerprint att1)})
+                       {:nonce n1
+                        :credential-id-hash (:credential-id-hash att1)
+                        :claimant-pubkey (:spki-hex claimant)
+                        :network-uri "devnet.bitecho.org"
+                        :attestation (assoc (:attestation att1)
+                                            :hw-pubkey (:spki-hex attacker-hw)
+                                            :assertion-sig sub-sig)}
+                       20100)
+          ;; 2. cred-hash mismatch attack: client supplies arbitrary cred-hash != sha256(authData.credentialId)
+          ch2 (faucet/issue-faucet-challenge (:state key-sub-res) {:network-uri "devnet.bitecho.org" :rng rng} 20200)
+          n2 (get-in ch2 [:challenge :nonce])
+          att2 (faucet/build-test-hardware-attestation
+                {:hw-privkey (:private genuine-hw)
+                 :hw-pubkey (:spki-hex genuine-hw)
+                 :claimant-privkey (:private claimant)
+                 :claimant-pubkey (:spki-hex claimant)
+                 :cred-hash "cred-genuine-2"
+                 :nonce n2
+                 :network-uri "devnet.bitecho.org"})
+          cred-mismatch-res (faucet/reduce-faucet-claim
+                             (assoc (:state ch2) :trusted-root-fingerprints #{(:trusted-root-fingerprint att2)})
+                             {:nonce n2
+                              :credential-id-hash "forged-arbitrary-cred-hash-does-not-match"
+                              :claimant-pubkey (:spki-hex claimant)
+                              :network-uri "devnet.bitecho.org"
+                              :attestation (:attestation att2)}
+                             20300)
+          ;; 3. clientDataHash mismatch attack: client supplies tampered clientDataHash
+          ch3 (faucet/issue-faucet-challenge (:state cred-mismatch-res) {:network-uri "devnet.bitecho.org" :rng rng} 20400)
+          n3 (get-in ch3 [:challenge :nonce])
+          att3 (faucet/build-test-hardware-attestation
+                {:hw-privkey (:private genuine-hw)
+                 :hw-pubkey (:spki-hex genuine-hw)
+                 :claimant-privkey (:private claimant)
+                 :claimant-pubkey (:spki-hex claimant)
+                 :cred-hash "cred-genuine-3"
+                 :nonce n3
+                 :network-uri "devnet.bitecho.org"})
+          cdh-mismatch-res (faucet/reduce-faucet-claim
+                            (assoc (:state ch3) :trusted-root-fingerprints #{(:trusted-root-fingerprint att3)})
+                            {:nonce n3
+                             :credential-id-hash (:credential-id-hash att3)
+                             :claimant-pubkey (:spki-hex claimant)
+                             :network-uri "devnet.bitecho.org"
+                             :attestation (assoc (:attestation att3)
+                                                 :client-data-hash-hex
+                                                 "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")}
+                            20500)]
+      (is (false? (:ok? key-sub-res)))
+      (is (= :faucet-attestation-key-mismatch (:error key-sub-res)))
+      (is (= 1 (get-in key-sub-res [:state :diagnostics :faucet-attestation-key-mismatch])))
+      (is (false? (:ok? cred-mismatch-res)))
+      (is (= :faucet-credential-hash-mismatch (:error cred-mismatch-res)))
+      (is (false? (:ok? cdh-mismatch-res)))
+      (is (= :faucet-client-data-hash-mismatch (:error cdh-mismatch-res)))))
+
+  (testing "F10: Blinded voucher claim via reduce-faucet-claim publishes ONLY unlinkable nullifier record"
+    (let [treasury (gen-kp)
+          claimant (gen-kp)
+          hw-kp (gen-kp)
+          rng (crypto/make-random 9902)
+          secret "blind-secret-seq3-001"
+          comm (faucet/blind-voucher-commitment secret (:spki-hex claimant))
+          st0 (faucet/init-faucet-state {:network-uri "devnet.bitecho.org"
+                                         :network-genesis-cid test-genesis-cid
+                                         :treasury-pubkey (:spki-hex treasury)
+                                         :treasury-privkey (:private treasury)
+                                         :drip-amount-ech 2500
+                                         :faucet-balance 10000})
+          ch (faucet/issue-faucet-challenge st0 {:network-uri "devnet.bitecho.org" :rng rng} 30000)
+          n (get-in ch [:challenge :nonce])
+          att (faucet/build-test-hardware-attestation
+               {:hw-privkey (:private hw-kp)
+                :hw-pubkey (:spki-hex hw-kp)
+                :voucher-commitment comm
+                :cred-hash "cred-blind-1"
+                :nonce n
+                :network-uri "devnet.bitecho.org"})
+          res (faucet/reduce-faucet-claim
+               (assoc (:state ch) :trusted-root-fingerprints #{(:trusted-root-fingerprint att)})
+               {:nonce n
+                :voucher-commitment comm
+                :network-uri "devnet.bitecho.org"
+                :epoch 77
+                :attestation (:attestation att)}
+               30100)
+          redeemed (faucet/redeem-blinded-voucher (:state res) (:blinded-voucher res) secret (:spki-hex claimant) 78)]
+      (is (:ok? res))
+      (is (= :blinded-voucher (:mode res)))
+      (is (map? (:blinded-voucher res)))
+      (is (nil? (:receipt res)))
+      (is (nil? (:receipt-blob res)))
+      (is (contains? (:nullifier-record res) :hardware-nullifier))
+      (is (not (contains? (:nullifier-record res) :claimant)))
+      (is (not (contains? (:nullifier-record res) :credential-id-hash)))
+      (is (= 7500 (:faucet-balance (:state res))))
+      (is (= 2500 (:earmarked-voucher-balance (:state res))))
+      (is (:ok? redeemed))
+      (is (= 0 (:earmarked-voucher-balance (:state redeemed))))
+      (is (= 2500 (get-in (:state redeemed) [:ledger (:spki-hex claimant) :balance])))))
+
+  (testing "F11: compute-merkle-root :anchor-epoch filters future-issued and expired pointers non-vacuously"
+    (let [auth (gen-kp)
+          net "devnet.bitecho.org"
+          cid1 (circle/descriptor-cid {:f11 1})
+          cid2 (circle/descriptor-cid {:f11 2})
+          p-early (data/sign-pointer (:private auth)
+                                     {:pointer/authority (:spki-hex auth)
+                                      :pointer/subnet net
+                                      :pointer/path "dir/root/early"
+                                      :pointer/seq 1
+                                      :pointer/issued-epoch 5
+                                      :pointer/expires-epoch 15
+                                      :pointer/target cid1
+                                      :pointer/proof {:proof/type :self}})
+          p-late (data/sign-pointer (:private auth)
+                                    {:pointer/authority (:spki-hex auth)
+                                     :pointer/subnet net
+                                     :pointer/path "dir/root/late"
+                                     :pointer/seq 1
+                                     :pointer/issued-epoch 20
+                                     :pointer/expires-epoch 100
+                                     :pointer/target cid2
+                                     :pointer/proof {:proof/type :self}})
+          ptrs {["dir/root/early"] p-early
+                ["dir/root/late"] p-late}
+          root-ep10 (data/compute-merkle-root ptrs {:anchor-epoch 10})
+          root-ep25 (data/compute-merkle-root ptrs {:anchor-epoch 25})
+          root-ep10-repeat (data/compute-merkle-root ptrs {:anchor-epoch 10})]
+      (is (string? root-ep10))
+      (is (string? root-ep25))
+      (is (= root-ep10 root-ep10-repeat))
+      (is (not= root-ep10 root-ep25))))
+
+  (testing "V3: CLI directory-register / lookup / verify preserves hierarchical slash paths"
+    (let [reg-cmd (cli/parse-cli-command "directory-register --name root/protocol/dev/nexus --domain devnet.bitecho.org --local-only")
+          reg-dom-cmd (cli/parse-cli-command "directory-register --name devnet.bitecho.org/root/protocol/dev/nexus --local-only")
+          lookup-cmd (cli/parse-cli-command "directory-lookup --name root/protocol/dev/nexus --domain devnet.bitecho.org")
+          verify-cmd (cli/parse-cli-command "directory-verify --name devnet.bitecho.org/root/protocol/dev/nexus")]
+      (is (= "directory-register" (:cmd reg-cmd)))
+      (is (= "root/protocol/dev/nexus" (get-in reg-cmd [:cmd-map "nickname"])))
+      (is (= "devnet.bitecho.org" (get-in reg-cmd [:cmd-map "domain"])))
+      (is (= "root/protocol/dev/nexus" (get-in reg-dom-cmd [:cmd-map "nickname"])))
+      (is (= "devnet.bitecho.org" (get-in reg-dom-cmd [:cmd-map "domain"])))
+      (is (= "root/protocol/dev/nexus" (get-in lookup-cmd [:cmd-map "nickname"])))
+      (is (= "root/protocol/dev/nexus" (get-in verify-cmd [:cmd-map "nickname"])))
+      (is (= "devnet.bitecho.org" (get-in verify-cmd [:cmd-map "domain"]))))))

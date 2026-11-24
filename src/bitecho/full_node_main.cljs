@@ -2413,6 +2413,7 @@
                    nonce (get body-json "nonce")
                    cred-hash (or (get body-json "credential_id_hash") (get body-json "credential_hash"))
                    claimant-pk (or (get body-json "claimant_pubkey") (get body-json "pubkey"))
+                   voucher-comm (or (get body-json "voucher_commitment") (get body-json "voucher-commitment"))
                    claim-net (or (get body-json "network_uri") (:network-uri config) "devnet.bitecho.org")
                    raw-att (get body-json "attestation")
                    attestation (when (map? raw-att)
@@ -2426,12 +2427,13 @@
                                   :assertion-sig (or (get raw-att "assertion_sig") (get raw-att "assertion-sig"))
                                   :claimant-pop-sig (or (get raw-att "claimant_pop_sig") (get raw-att "claimant-pop-sig"))
                                   :cred-hash-bound? (boolean (or (get raw-att "cred_hash_bound?") (get raw-att "cred-hash-bound?")))})
-                   ;; BIP-024 §2.9 (Blocker 5 / MUT-11): Fail closed; NEVER trust client-supplied authenticator_verified
+                   ;; BIP-024 §2.9 (Blocker 5 / MUT-11 / F10): Fail closed; NEVER trust client-supplied authenticator_verified
                    claim-req (cond-> {:nonce nonce
                                       :credential-id-hash cred-hash
                                       :claimant-pubkey claimant-pk
                                       :network-uri claim-net
                                       :authenticator-verified? false}
+                               voucher-comm (assoc :voucher-commitment voucher-comm)
                                attestation (assoc :attestation attestation))
                    res-box (atom nil)
                    _ (swap! faucet-atom
@@ -2445,19 +2447,29 @@
                                       :error (name (or (:error claim-res) :faucet-claim-rejected))
                                       :reason (:reason claim-res)})
                  (do
-                   (when (and (:receipt-blob claim-res) (:receipt-pointer claim-res))
+                   ;; BIP-024 §2.9 item 4 (F10): publish ONLY the unlinkable hardware-nullifier blob & pointer
+                   (when (and (:nullifier-blob claim-res) (:nullifier-pointer claim-res))
                      (submit-subnet-event! rt {:type :put-blob
-                                               :blob (:receipt-blob claim-res)
+                                               :blob (:nullifier-blob claim-res)
                                                :sender (:default-sender rt)
                                                :now-ms now-ms})
                      (submit-subnet-event! rt {:type :publish-pointer
-                                               :pointer (:receipt-pointer claim-res)
+                                               :pointer (:nullifier-pointer claim-res)
                                                :sender (:default-sender rt)
                                                :now-ms now-ms}))
                    (send-json! res 200 (cond-> {:ok true
-                                                :transfer_intent (:transfer-intent claim-res)
-                                                :receipt_path (:receipt-path claim-res)
-                                                :receipt_cid (:receipt-cid claim-res)}
+                                                :mode (name (or (:mode claim-res) :direct))
+                                                :nullifier_path (:nullifier-path claim-res)
+                                                :nullifier_cid (:nullifier-cid claim-res)
+                                                :hardware_nullifier (:hardware-nullifier claim-res)}
+                                         (:blinded-voucher claim-res)
+                                         (assoc :blinded_voucher (:blinded-voucher claim-res))
+                                         (:transfer-intent claim-res)
+                                         (assoc :transfer_intent (:transfer-intent claim-res))
+                                         (:receipt-path claim-res)
+                                         (assoc :receipt_path (:receipt-path claim-res))
+                                         (:receipt-cid claim-res)
+                                         (assoc :receipt_cid (:receipt-cid claim-res))
                                          (:signed-transfer claim-res)
                                          (assoc :signed_transfer (:signed-transfer claim-res)))))))))))
 
@@ -5175,6 +5187,34 @@
                      (or (nil? expected-token) (nil? owner-tok) (= (str expected-token) (str owner-tok))))
             (try (.unlinkSync ^js node-fs lock-path) (catch :default _ false))))))))
 
+(defn apply-startup-cold-root-recovery!
+  "BIP-024 §2.5 (F4): Loads a Cold-Root Emergency Recovery bundle by `--cold-root-recovery-cid`
+   from `<state-dir>/blobs/<cid>` or `<state-dir>/recovery/<cid>.fressian`, verifies SHA-256 == CID
+   and Root Association signatures, and applies it to `state-atom`."
+  [state-atom state-dir recovery-cid cfg]
+  (when (and recovery-cid (not (str/blank? (str recovery-cid))))
+    (let [norm-cid (str/lower-case (str/trim (str recovery-cid)))
+          sdir (str (or state-dir "data"))
+          candidates [(.join node-path sdir "blobs" norm-cid)
+                      (.join node-path sdir "recovery" (str norm-cid ".fressian"))
+                      (.join node-path sdir "recovery" norm-cid)]
+          found (first (filter #(.existsSync node-fs %) candidates))
+          raw-bytes (when found (js/Uint8Array. (.readFileSync node-fs found)))
+          ctx {:root-owner-multisig (or (:root-owner-multisig cfg)
+                                        (:root-owner-multisig @state-atom))
+               :network-uri (or (:network-uri cfg) (:network-uri @state-atom))
+               :network-genesis-cid (or (:network-genesis-cid cfg) (:network-genesis-cid @state-atom))
+               :advisory-twin-pubkeys (:advisory-twin-pubkeys @state-atom)}
+          res-box (atom nil)]
+      (swap! state-atom
+             (fn [st]
+               (let [r (circle/verify-and-apply-cold-root-recovery-by-cid st norm-cid raw-bytes ctx)]
+                 (reset! res-box r)
+                 (if (:ok? r)
+                   (:state r)
+                   (update-in st [:diagnostics (or (:error r) :cold-root-recovery-rejected)] (fnil inc 0))))))
+      @res-box)))
+
 (defn start-infra-node!
   "Starts the complete Node.js infra-node stack (`runtime`, `dns`, `http`, `https`+`CONNECT`, `smtp`, `diag`, `heartbeat`).
    Enforces OS-atomic `serve.lock` single-instance guard (BIP-022 Stage B Row 10)."
@@ -5276,6 +5316,13 @@
                 :tls-ctx-atom tls-ctx-atom
                 :tls-pem-atom tls-pem-atom}
             _ (reset! rt-atom rt)
+            ;; BIP-024 §2.5 (F4): Consume --cold-root-recovery-cid on Node infra-node startup
+            _ (when-let [rec-cid (:cold-root-recovery-cid config)]
+                (let [r (apply-startup-cold-root-recovery! (:subnet-atom rt) state-dir rec-cid config)]
+                  (when-not (:ok? r)
+                    (apply-shell-event! rt-shell-atom {:type :diagnose :reason (or (:error r) :cold-root-recovery-rejected)})
+                    (js/console.error (str "FATAL: --cold-root-recovery-cid failed verification: " (name (or (:error r) :cold-root-recovery-rejected))))
+                    (.exit js/process 1))))
             _ (when-let [{:keys [cert-pem key-pem]} (load-tls-cert-key-from-disk-or-subnet! rt)]
                 (try
                   (reset! tls-ctx-atom (.createSecureContext node-tls #js {:cert cert-pem :key key-pem}))
@@ -5635,26 +5682,35 @@
       (.exit js/process 1))))
 
 (defn- cmd-run!
-  [config-file]
-  (let [cfg (read-config-file-or-exit! config-file)
-        node (start-validator-mesh-node!
-              cfg
-              {:on-ready (fn [{:keys [http-port]}]
-                           (let [node-id (or (:node/id cfg) (:node-id cfg) :node1)
-                                 state-dir (or (:state-dir cfg) "data")
-                                 ident (load-or-create-node-identity! state-dir node-id)
-                                 pubkey (:pubkey-hex ident)
-                                 fp (:fingerprint ident)]
-                             (println (str "Bitecho node started: id=" (name node-id)
-                                           " pubkey=" pubkey
-                                           " fingerprint=" fp
-                                           " http=:" (or http-port (get-in cfg [:http :port] 8080))))))})
-        shutdown! (fn []
-                    (println "Shutting down Bitecho node...")
-                    (try ((:stop! node)) (catch :default _ nil))
-                    (.exit js/process 0))]
-    (.on js/process "SIGTERM" shutdown!)
-    (.on js/process "SIGINT" shutdown!)))
+  ([config-file]
+   (cmd-run! config-file nil))
+  ([config-file extra-opts]
+   (let [cfg (merge (read-config-file-or-exit! config-file) extra-opts)
+         node (start-validator-mesh-node!
+               cfg
+               {:on-ready (fn [{:keys [http-port]}]
+                            (let [node-id (or (:node/id cfg) (:node-id cfg) :node1)
+                                  state-dir (or (:state-dir cfg) "data")
+                                  ident (load-or-create-node-identity! state-dir node-id)
+                                  pubkey (:pubkey-hex ident)
+                                  fp (:fingerprint ident)]
+                              (println (str "Bitecho node started: id=" (name node-id)
+                                            " pubkey=" pubkey
+                                            " fingerprint=" fp
+                                            " http=:" (or http-port (get-in cfg [:http :port] 8080))))))})
+         ;; BIP-024 §2.5 (F4): Consume --cold-root-recovery-cid at Node full-node startup
+         _ (when-let [rec-cid (:cold-root-recovery-cid cfg)]
+             (when-let [sa (:state-atom node)]
+               (let [r (apply-startup-cold-root-recovery! sa (:state-dir cfg) rec-cid cfg)]
+                 (when-not (:ok? r)
+                   (js/console.error (str "FATAL: --cold-root-recovery-cid failed verification: " (name (or (:error r) :cold-root-recovery-rejected))))
+                   (.exit js/process 1)))))
+         shutdown! (fn []
+                     (println "Shutting down Bitecho node...")
+                     (try ((:stop! node)) (catch :default _ nil))
+                     (.exit js/process 0))]
+     (.on js/process "SIGTERM" shutdown!)
+     (.on js/process "SIGINT" shutdown!))))
 
 (defn- cmd-print-identity!
   [config-file]
@@ -5782,34 +5838,6 @@
     (when (and (>= idx 0) (< (inc idx) (count argv)))
       (nth argv (inc idx)))))
 
-(defn apply-startup-cold-root-recovery!
-  "BIP-024 §2.5 (F4): Loads a Cold-Root Emergency Recovery bundle by `--cold-root-recovery-cid`
-   from `<state-dir>/blobs/<cid>` or `<state-dir>/recovery/<cid>.fressian`, verifies SHA-256 == CID
-   and Root Association signatures, and applies it to `state-atom`."
-  [state-atom state-dir recovery-cid cfg]
-  (when (and recovery-cid (not (str/blank? (str recovery-cid))))
-    (let [norm-cid (str/lower-case (str/trim (str recovery-cid)))
-          sdir (str (or state-dir "data"))
-          candidates [(.join node-path sdir "blobs" norm-cid)
-                      (.join node-path sdir "recovery" (str norm-cid ".fressian"))
-                      (.join node-path sdir "recovery" norm-cid)]
-          found (first (filter #(.existsSync node-fs %) candidates))
-          raw-bytes (when found (js/Uint8Array. (.readFileSync node-fs found)))
-          ctx {:root-owner-multisig (or (:root-owner-multisig cfg)
-                                        (:root-owner-multisig @state-atom))
-               :network-uri (or (:network-uri cfg) (:network-uri @state-atom))
-               :network-genesis-cid (or (:network-genesis-cid cfg) (:network-genesis-cid @state-atom))
-               :advisory-twin-pubkeys (:advisory-twin-pubkeys @state-atom)}
-          res-box (atom nil)]
-      (swap! state-atom
-             (fn [st]
-               (let [r (circle/verify-and-apply-cold-root-recovery-by-cid st norm-cid raw-bytes ctx)]
-                 (reset! res-box r)
-                 (if (:ok? r)
-                   (:state r)
-                   (update-in st [:diagnostics (or (:error r) :cold-root-recovery-rejected)] (fnil inc 0))))))
-      @res-box)))
-
 (defn -main
   "CLI entry point for the Node.js full validator & infrastructure node."
   [& args]
@@ -5845,7 +5873,7 @@
                      :commands #js ["run" "infra-node" "print-identity" "print-fingerprint" "validate-config" "gen-keypair" "--check-pointer" "--attest-root" "--self-test" "--version" "--help"]}))
 
       (= first-arg "run")
-      (cmd-run! (second argv))
+      (cmd-run! (second argv) (when cold-rec-cid {:cold-root-recovery-cid cold-rec-cid}))
 
       (= first-arg "infra-node")
       (let [cfg (cond-> (parse-infra-cli-config argv)

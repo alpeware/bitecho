@@ -2017,6 +2017,7 @@
                     nonce (get body-json "nonce")
                     cred-hash (or (get body-json "credential_id_hash") (get body-json "credential_hash"))
                     claimant-pk (or (get body-json "claimant_pubkey") (get body-json "pubkey"))
+                    voucher-comm (or (get body-json "voucher_commitment") (get body-json "voucher-commitment"))
                     claim-net (or (get body-json "network_uri") (:network-uri config) "devnet.bitecho.org")
                     raw-att (get body-json "attestation")
                     attestation (when (map? raw-att)
@@ -2030,12 +2031,13 @@
                                    :assertion-sig (or (get raw-att "assertion_sig") (get raw-att "assertion-sig"))
                                    :claimant-pop-sig (or (get raw-att "claimant_pop_sig") (get raw-att "claimant-pop-sig"))
                                    :cred-hash-bound? (boolean (or (get raw-att "cred_hash_bound?") (get raw-att "cred-hash-bound?")))})
-                    ;; BIP-024 §2.9 (Blocker 5 / MUT-11): Fail closed; NEVER trust client-supplied authenticator_verified
+                    ;; BIP-024 §2.9 (Blocker 5 / MUT-11 / F10): Fail closed; NEVER trust client-supplied authenticator_verified
                     claim-req (cond-> {:nonce nonce
                                        :credential-id-hash cred-hash
                                        :claimant-pubkey claimant-pk
                                        :network-uri claim-net
                                        :authenticator-verified? false}
+                                voucher-comm (assoc :voucher-commitment voucher-comm)
                                 attestation (assoc :attestation attestation))
                     res-box (atom nil)
                     _ (swap! faucet-atom
@@ -2052,25 +2054,41 @@
                                                                   "error" (name (or (:error claim-res) :faucet-claim-rejected))
                                                                   "reason" (:reason claim-res)})})
                   (do
-                    (when (and target-rt (:subnet-atom target-rt) (:receipt-blob claim-res))
+                    ;; BIP-024 §2.9 item 4 (F10): publish ONLY the unlinkable hardware-nullifier blob & pointer
+                    (when (and target-rt (:subnet-atom target-rt) (:nullifier-blob claim-res))
                       (try
                         (swap! (:subnet-atom target-rt)
                                (fn [inst]
-                                 (let [b (:receipt-blob claim-res)
-                                       ptr (:receipt-pointer claim-res)
-                                       bs (:blob-store inst (data/init-blob-store))
-                                       bs' (:store (data/put-blob bs b {:pinned? true}))]
-                                   (cond-> (assoc inst :blob-store bs')
-                                     ptr (assoc-in [:pointers [(:pointer/path ptr)]] ptr)))))
+                                 (let [nb (:nullifier-blob claim-res)
+                                       nptr (:nullifier-pointer claim-res)
+                                       bs (or (get-in inst [:data :blobs])
+                                              (:blob-store inst)
+                                              (data/init-blob-store))
+                                       bs' (-> (:store (data/put-blob bs nb now-ms))
+                                               (data/pin-blob (:blob/cid nb)))]
+                                   (cond-> (-> inst
+                                               (assoc-in [:data :blobs] bs')
+                                               (assoc :blob-store bs'))
+                                     nptr (-> (assoc-in [:data :pointers [(:pointer/subnet nptr) (:pointer/path nptr)]] nptr)
+                                              (assoc-in [:pointers [(:pointer/path nptr)]] nptr))))))
                         (catch Exception _ nil)))
                     (send-response exchange
                                    {:response/status 200
                                     :response/headers {"Content-Type" "application/json; charset=utf-8"}
                                     :response/body (json/write-str
                                                     (cond-> {"ok" true
-                                                             "transfer_intent" (:transfer-intent claim-res)
-                                                             "receipt_path" (:receipt-path claim-res)
-                                                             "receipt_cid" (:receipt-cid claim-res)}
+                                                             "mode" (name (or (:mode claim-res) :direct))
+                                                             "nullifier_path" (:nullifier-path claim-res)
+                                                             "nullifier_cid" (:nullifier-cid claim-res)
+                                                             "hardware_nullifier" (:hardware-nullifier claim-res)}
+                                                      (:blinded-voucher claim-res)
+                                                      (assoc "blinded_voucher" (:blinded-voucher claim-res))
+                                                      (:transfer-intent claim-res)
+                                                      (assoc "transfer_intent" (:transfer-intent claim-res))
+                                                      (:receipt-path claim-res)
+                                                      (assoc "receipt_path" (:receipt-path claim-res))
+                                                      (:receipt-cid claim-res)
+                                                      (assoc "receipt_cid" (:receipt-cid claim-res))
                                                       (:signed-transfer claim-res)
                                                       (assoc "signed_transfer" (:signed-transfer claim-res))))})))))))
 

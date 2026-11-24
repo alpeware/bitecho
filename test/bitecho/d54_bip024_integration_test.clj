@@ -19,6 +19,7 @@
             [bitecho.state-machine :as sm]
             [bitecho.streamlet.core :as streamlet]
             [clojure.data.json :as json]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing]])
   (:import [java.net URI]
            [java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers HttpResponse$BodyHandlers]
@@ -119,12 +120,13 @@
                              :hw-pubkey (:spki-hex hw-kp)
                              :claimant-privkey (:private claimant)
                              :claimant-pubkey (:spki-hex claimant)
+                             :cred-hash "cred-valid-1"
                              :nonce nonce
                              :network-uri "devnet.bitecho.org"})
                 att (:attestation att-bundle)
                 _ (swap! faucet-atom assoc :trusted-root-fingerprints #{(:trusted-root-fingerprint att-bundle)})
                 valid-body (json/write-str {"nonce" nonce
-                                            "credential_id_hash" "cred-valid-1"
+                                            "credential_id_hash" (:credential-id-hash att-bundle)
                                             "claimant_pubkey" (:spki-hex claimant)
                                             "network_uri" "devnet.bitecho.org"
                                             "attestation" {"attestation_object_hex" (:attestation-object-hex att)
@@ -139,7 +141,53 @@
                 cl-resp (.send client cl-req (HttpResponse$BodyHandlers/ofString))
                 cl-json (json/read-str (.body cl-resp))]
             (is (= 200 (.statusCode cl-resp)))
-            (is (true? (get cl-json "ok"))))))
+            (is (true? (get cl-json "ok")))))
+
+        (testing "F10: Blinded voucher /faucet/v1/claim issues blinded_voucher & publishes ONLY unlinkable nullifier blob"
+          (let [hw-kp2 (gen-kp)
+                claimant2 (gen-kp)
+                blinding-secret "blind-secret-http-001"
+                voucher-comm (faucet/blind-voucher-commitment blinding-secret (:spki-hex claimant2))
+                ch-req (-> (HttpRequest/newBuilder (URI/create (str "http://127.0.0.1:" port "/faucet/v1/challenge")))
+                           (.GET)
+                           (.build))
+                ch-resp (.send client ch-req (HttpResponse$BodyHandlers/ofString))
+                nonce (get-in (json/read-str (.body ch-resp)) ["challenge" "nonce"])
+                att-bundle (faucet/build-test-hardware-attestation
+                            {:hw-privkey (:private hw-kp2)
+                             :hw-pubkey (:spki-hex hw-kp2)
+                             :voucher-commitment voucher-comm
+                             :cred-hash "cred-blinded-1"
+                             :nonce nonce
+                             :network-uri "devnet.bitecho.org"})
+                att (:attestation att-bundle)
+                _ (swap! faucet-atom update :trusted-root-fingerprints (fnil conj #{}) (:trusted-root-fingerprint att-bundle))
+                blind-body (json/write-str {"nonce" nonce
+                                            "voucher_commitment" voucher-comm
+                                            "network_uri" "devnet.bitecho.org"
+                                            "attestation" {"attestation_object_hex" (:attestation-object-hex att)
+                                                           "client_data_hash_hex" (:client-data-hash-hex att)
+                                                           "hw_pubkey" (:hw-pubkey att)
+                                                           "assertion_sig" (:assertion-sig att)}})
+                cl-req (-> (HttpRequest/newBuilder (URI/create (str "http://127.0.0.1:" port "/faucet/v1/claim")))
+                           (.header "Content-Type" "application/json")
+                           (.POST (HttpRequest$BodyPublishers/ofString blind-body StandardCharsets/UTF_8))
+                           (.build))
+                cl-resp (.send client cl-req (HttpResponse$BodyHandlers/ofString))
+                cl-json (json/read-str (.body cl-resp))
+                nullifier-cid (get cl-json "nullifier_cid")
+                stored-blob (:blob (data/get-blob (get-in @(:subnet-atom rt) [:data :blobs]) nullifier-cid))
+                stored-text (when stored-blob (String. ^bytes (:blob/bytes stored-blob) StandardCharsets/UTF_8))]
+            (is (= 200 (.statusCode cl-resp)))
+            (is (true? (get cl-json "ok")))
+            (is (= "blinded-voucher" (get cl-json "mode")))
+            (is (map? (get cl-json "blinded_voucher")))
+            (is (nil? (get cl-json "receipt_path")))
+            (is (string? stored-text))
+            (is (str/includes? stored-text ":hardware-nullifier"))
+            (is (not (str/includes? stored-text ":claimant")))
+            (is (not (str/includes? stored-text ":credential-id-hash")))
+            (is (not (str/includes? stored-text (:spki-hex claimant2)))))))
       (finally
         (http/stop-http-servers! srv)))))
 

@@ -356,6 +356,7 @@
                 :hw-pubkey hw-pk
                 :claimant-privkey (kp->sk claimant-kp)
                 :claimant-pubkey claimant-pk
+                :cred-id (fressian/utf8->bytes (str "yubikey-cred-" cred-suffix))
                 :nonce nonce1
                 :network-uri net-uri})
          claim1 (faucet/reduce-faucet-claim
@@ -373,6 +374,7 @@
                 :hw-pubkey hw-pk
                 :claimant-privkey (kp->sk claimant-kp)
                 :claimant-pubkey claimant-pk
+                :cred-id (fressian/utf8->bytes (str "yubikey-cred-" cred-suffix))
                 :nonce nonce2
                 :network-uri net-uri})
          claim2 (faucet/reduce-faucet-claim
@@ -647,6 +649,7 @@
                             :hw-pubkey (kp->pk-hex hw-kp)
                             :claimant-privkey (kp->sk claimant-kp)
                             :claimant-pubkey claimant-pk
+                            :cred-id (fressian/utf8->bytes "yubikey-5-cred-001")
                             :nonce nonce
                             :network-uri "devnet.bitecho.org"})
               att1 (:attestation att1-bundle)
