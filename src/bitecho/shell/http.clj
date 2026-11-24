@@ -2241,8 +2241,11 @@
                                       :response/body body}))
                     (send-response exchange
                                    {:response/status 416
-                                    :response/headers {"Content-Range" (str "bytes */" total-size)
-                                                       "Accept-Ranges" "bytes"}
+                                    :response/headers (chunk-const/safe-blob-response-headers
+                                                       {:cid (:blob/cid b)
+                                                        :content-type ct
+                                                        :content-length 0
+                                                        :content-range (str "bytes */" total-size)})
                                     :response/body nil}))
                   (let [hdrs (chunk-const/safe-blob-response-headers
                               {:cid (:blob/cid b)

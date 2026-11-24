@@ -28,7 +28,8 @@
                       [bitecho.shell.http :as http-shell]
                       [bitecho.shell.infra :as infra]
                       [bitecho.shell.mesh :as mesh-shell]
-                      [clojure.java.io :as io]]))
+                      [clojure.java.io :as io]
+                      [datachannel.api :as dc-api]]))
   #?(:clj (:import [java.net URI]
                    [java.net.http HttpClient HttpRequest HttpResponse$BodyHandlers]
                    [java.nio.file Files]
@@ -631,7 +632,10 @@
              (is (= 1024 (alength ^bytes (.body r206))))
              (is (= (vec (slice-bs payload 1024 2048)) (vec ^bytes (.body r206))))
              (is (= 416 (.statusCode r416)))
-             (is (= "bytes */4096" (.orElse (.firstValue (.headers r416) "Content-Range") nil))))
+             (is (= "bytes */4096" (.orElse (.firstValue (.headers r416) "Content-Range") nil)))
+             (is (= "bytes" (.orElse (.firstValue (.headers r416) "Accept-Ranges") nil)))
+             (is (= "nosniff" (.orElse (.firstValue (.headers r416) "X-Content-Type-Options") nil)))
+             (is (= cid (.orElse (.firstValue (.headers r416) "X-Bitecho-Blob-Cid") nil))))
            (finally
              (http-shell/stop-http-servers! http-srv)
              (infra/stop-subnet-runtime! rt)
@@ -658,9 +662,86 @@
            (finally
              (try (run! io/delete-file (reverse (file-seq tmp-dir))) (catch Exception _ nil))))))))
 
+(deftest http-206-final-chunk-hash-mismatch-exhaustion-test
+  (testing "F2: 206 final-chunk hash-mismatch exhaustion emits BOTH :light-update-hash-mismatch and :light-update-blob-fetch-failed"
+    (let [auth-kp (gen-kp 5208)
+          chunk-sz 1024
+          total-sz 2048
+          payload (make-payload total-sz "Q")
+          target-cid (deploy/sha256-hex payload)
+          ptr (make-signed-ptr auth-kp {:seq 11 :light-node-cid target-cid :artifact-size-bytes total-sz})
+          ;; Single relay so exhaustion happens immediately after corrupted final 206 chunk
+          st0 (init-test-updater auth-kp {:relay-origins [] :range-chunk-bytes chunk-sz})
+          [st1 _] (deploy/reduce-light-update-tick st0 {:type :pointer-seen :pointer ptr :mesh-connected? false :generation 1})
+          [st2 _] (deploy/reduce-light-update-tick st1 {:type :blob-fetch-failed
+                                                        :aborted-mid-body? true
+                                                        :received-bytes 128
+                                                        :total-bytes total-sz
+                                                        :reason "aborted"
+                                                        :generation (:generation st1)})
+          [st3 _] (deploy/reduce-light-update-tick st2 {:type :http-retry-timer-fired :generation (:generation st2)})
+          [st4 _] (deploy/reduce-light-update-tick st3 {:type :http-range-chunk-fetched
+                                                        :status 206
+                                                        :start 0
+                                                        :end 1023
+                                                        :total-bytes total-sz
+                                                        :bytes (slice-bs payload 0 1024)
+                                                        :etag target-cid
+                                                        :generation (:generation st3)})
+          ;; Corrupt final chunk
+          [st5 effs5] (deploy/reduce-light-update-tick st4 {:type :http-range-chunk-fetched
+                                                            :status 206
+                                                            :start 1024
+                                                            :end 2047
+                                                            :total-bytes total-sz
+                                                            :bytes (flip-byte-at (slice-bs payload 1024 2048) 17)
+                                                            :etag target-cid
+                                                            :generation (:generation st4)})]
+      (is (= :watching (:phase st5)))
+      (is (= 1 (get-in st5 [:diagnostics :causes :light-update-hash-mismatch])))
+      (is (= 1 (get-in st5 [:diagnostics :causes :light-update-blob-fetch-failed])))
+      (is (some #(and (= :diagnose (:effect %)) (= :light-update-hash-mismatch (:reason %))) effs5))
+      (is (some #(and (= :diagnose (:effect %)) (= :light-update-blob-fetch-failed (:reason %))) effs5))
+      (is (= (:dropped st5) (causes-sum st5))))))
+
+#?(:clj
+   (deftest jvm-full-node-peer-mesh-chunk-fetch-test
+     (testing "F1 & F6: JVM full-node fetch-mesh-chunks-from-peers! sends real :artifact-blob-chunk-req frames over open peer DataChannels and reassembles verified bytes"
+       (let [payload (byte-array (map #(unchecked-byte (mod % 251)) (range 3000)))
+             target-cid (deploy/sha256-hex payload)
+             sent-reqs (atom [])
+             fake-peer-node ::mock-peer-dc
+             empty-mesh {:peer-conns (atom {"p0" {:phase :connecting :node fake-peer-node}})}
+             open-mesh {:peer-conns (atom {"peer-1" {:phase :open :node fake-peer-node :channel-id 7}})}
+             handlers-var #'mesh-shell/peer-mesh-chunk-handlers-atom]
+         (is (false? (mesh-shell/has-open-mesh-peers? empty-mesh))
+             "F6: has-open-mesh-peers? must be false when 0 peers are :open")
+         (is (true? (mesh-shell/has-open-mesh-peers? open-mesh))
+             "F6: has-open-mesh-peers? must be true when >= 1 peer is :open")
+         (with-redefs [dc-api/send! (fn [_node wire-bytes _ch-id]
+                                      (let [req (fressian/decode-wire wire-bytes)
+                                            _ (swap! sent-reqs conj req)
+                                            resp (deploy/serve-mesh-blob-chunk payload req)]
+                                        (when-let [q (get @@handlers-var (:req-id req))]
+                                          (.offer ^java.util.concurrent.LinkedBlockingQueue q resp))))]
+           (let [res (mesh-shell/fetch-mesh-chunks-from-peers!
+                      open-mesh
+                      target-cid
+                      {:generation 2
+                       :chunk-size-bytes 1024
+                       :probe-timeout-ms 2000
+                       :chunk-timeout-ms 2000
+                       :total-timeout-ms 5000})]
+             (is (true? (:ok? res)))
+             (is (= :mesh (:source res)))
+             (is (= "peer-1" (:peer res)))
+             (is (= 3 (count @sent-reqs)) "3000-byte blob with 1024-byte chunks must send 3 :artifact-blob-chunk-req frames")
+             (is (every? #(= :artifact-blob-chunk-req (:type %)) @sent-reqs))
+             (is (= target-cid (deploy/sha256-hex (:bytes res))))))))))
+
 #?(:clj
    (deftest stage-d1-closure-advanced-and-wiring-audit-test
-     (testing "full_node_main.cljs uses bounded positional fh.read + semaphore (not full-file read-disk-blob-async!) on :artifact-blob-chunk-req"
+     (testing "full_node_main.cljs uses bounded positional fh.read + semaphore, peer mesh chunk fetch, strict open-peer check, and positional Range serving"
        (let [full-src (slurp "src/bitecho/full_node_main.cljs")]
          (is (str/includes? full-src "read-disk-blob-slice-async!"))
          (is (str/includes? full-src ":mesh-chunk-read-throttled"))
@@ -668,14 +749,18 @@
          (is (str/includes? full-src "headersTimeout"))
          (is (str/includes? full-src "requestTimeout"))
          (is (str/includes? full-src ":fetch-bundle-mesh-chunks")
-             "Full node auto-updater must wire :fetch-bundle-mesh-chunks")))
+             "Full node auto-updater must wire :fetch-bundle-mesh-chunks")
+         (is (str/includes? full-src "fetch-bundle-from-peer-mesh-async!")
+             "F1: Full node must query open DataChannel peers with :artifact-blob-chunk-req")
+         (is (str/includes? full-src "list-open-peer-conns")
+             "F6: Full node :mesh-connected? must require open peer DataChannels")))
      (testing "node_main.cljs hardens http-get-bytes! with agent: false, Connection: close, aborted/complete checks, and req-id-only mesh dispatch"
        (let [node-src (slurp "src/bitecho/node_main.cljs")]
          (is (str/includes? node-src "\"aborted\""))
          (is (str/includes? node-src ":schedule-http-retry"))
          (is (str/includes? node-src ":http-range-chunk-fetched"))
          (is (str/includes? node-src "--auto-update-force-http"))))
-     (testing "JVM callers (shell/light_node.clj & main.clj) wire :mesh-connected-fn and :mesh-chunk-fetch-fn"
+     (testing "JVM callers (shell/light_node.clj & main.clj) wire :mesh-connected-fn, :mesh-chunk-fetch-fn, and ByteArrayOutputStream partial-prefix preservation"
        (let [ln-src (slurp "src/bitecho/shell/light_node.clj")
              main-src (slurp "src/bitecho/main.clj")
              upd-src (slurp "src/bitecho/shell/updater.clj")]
@@ -683,5 +768,7 @@
          (is (str/includes? ln-src ":mesh-chunk-fetch-fn"))
          (is (str/includes? main-src ":mesh-connected-fn"))
          (is (str/includes? main-src ":mesh-chunk-fetch-fn"))
+         (is (str/includes? main-src "mesh/fetch-mesh-chunks-from-peers!"))
+         (is (str/includes? upd-src "ByteArrayOutputStream"))
          (is (str/includes? upd-src ":schedule-http-retry"))
          (is (str/includes? upd-src ":http-range-chunk-fetched"))))))

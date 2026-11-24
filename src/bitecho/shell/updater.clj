@@ -8,7 +8,8 @@
             [bitecho.deploy.core :as deploy]
             [clojure.edn :as edn]
             [clojure.string :as str])
-  (:import [java.net URI]
+  (:import [java.io ByteArrayOutputStream InputStream]
+           [java.net URI]
            [java.net.http HttpClient HttpRequest HttpResponse$BodyHandlers]
            [java.nio.charset StandardCharsets]
            [java.nio.file Files Path StandardCopyOption]
@@ -33,6 +34,9 @@
       (catch Exception _ nil))))
 
 (defn- fetch-bytes!
+  "Fetches raw bytes from `url-str` over HTTP/HTTPS, streaming via `InputStream` into a
+   `ByteArrayOutputStream` so mid-body `IOException`/premature EOF preserves already-received
+   `:partial-bytes` for `206 Range` resume (BIP-022 Stage D.1 F5)."
   ([^HttpClient client ^String url-str timeout-ms]
    (fetch-bytes! client url-str timeout-ms nil))
   ([^HttpClient client ^String url-str timeout-ms {:keys [range]}]
@@ -44,31 +48,55 @@
            _ (when (and (vector? range) (= 2 (count range)))
                (.header b "Range" (str "bytes=" (first range) "-" (second range))))
            req (.build b)
-           resp (.send client req (HttpResponse$BodyHandlers/ofByteArray))
+           resp (.send client req (HttpResponse$BodyHandlers/ofInputStream))
            status (.statusCode resp)
-           body ^bytes (.body resp)
            hdrs (.headers resp)
            cl-str (.orElse (.firstValue hdrs "content-length") nil)
            expected-len (when cl-str
                           (try (Long/parseLong (str/trim cl-str)) (catch Exception _ nil)))
            cr-str (.orElse (.firstValue hdrs "content-range") nil)
            etag (.orElse (.firstValue hdrs "etag") nil)
-           actual-len (if body (alength body) 0)]
-       (if (and (>= status 200) (< status 300) expected-len (< actual-len expected-len))
-         {:ok? false
-          :status status
-          :aborted-mid-body? true
-          :received-bytes actual-len
-          :total-bytes expected-len
-          :partial-bytes (when (pos? actual-len) body)
-          :etag etag
-          :error "truncated-body"}
-         {:ok? (and (>= status 200) (< status 300))
-          :status status
-          :bytes body
-          :content-range cr-str
-          :etag etag
-          :total-bytes expected-len}))
+           baos (ByteArrayOutputStream.)]
+       (try
+         (with-open [^InputStream is (.body resp)]
+           (let [buf (byte-array 16384)]
+             (loop []
+               (let [n (.read is buf)]
+                 (when (pos? n)
+                   (.write baos buf 0 n)
+                   (recur))))))
+         (let [body (.toByteArray baos)
+               actual-len (alength body)]
+           (if (and (>= status 200) (< status 300) expected-len (< actual-len expected-len))
+             {:ok? false
+              :status status
+              :aborted-mid-body? true
+              :received-bytes actual-len
+              :total-bytes expected-len
+              :partial-bytes (when (pos? actual-len) body)
+              :etag etag
+              :error "truncated-body"}
+             {:ok? (and (>= status 200) (< status 300))
+              :status status
+              :bytes body
+              :content-range cr-str
+              :etag etag
+              :total-bytes expected-len}))
+         (catch Exception e
+           (let [partial-bs (.toByteArray baos)
+                 n (alength partial-bs)]
+             {:ok? false
+              :status status
+              :aborted-mid-body? (or (pos? n)
+                                     (boolean (and (.getMessage e)
+                                                   (or (str/includes? (str/lower-case (.getMessage e)) "eof")
+                                                       (str/includes? (str/lower-case (.getMessage e)) "reset")
+                                                       (str/includes? (str/lower-case (.getMessage e)) "aborted")))))
+              :received-bytes n
+              :total-bytes expected-len
+              :partial-bytes (when (pos? n) partial-bs)
+              :etag etag
+              :error (or (.getMessage e) (str e))}))))
      (catch Exception e
        {:ok? false
         :status 500
@@ -168,7 +196,11 @@
                         (if (and (:ok? mres) (bytes? (:bytes mres)))
                           (do
                             (reset! staged-bytes-atom (:bytes mres))
-                            (dispatch! {:type :blob-fetched :cid cid :bytes (:bytes mres) :generation gen}))
+                            (dispatch! {:type :blob-fetched
+                                        :cid cid
+                                        :bytes (:bytes mres)
+                                        :source (or (:source mres) :mesh)
+                                        :generation gen}))
                           (dispatch! {:type :mesh-fetch-failed
                                       :cid cid
                                       :reason (or (:reason mres) (:error mres) :mesh-chunk-fetch-failed)

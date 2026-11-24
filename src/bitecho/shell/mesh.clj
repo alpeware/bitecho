@@ -29,7 +29,7 @@
            [java.nio.channels FileChannel]
            [java.nio.charset StandardCharsets]
            [java.nio.file OpenOption StandardOpenOption]
-           [java.util.concurrent Executors Semaphore TimeUnit]))
+           [java.util.concurrent Executors LinkedBlockingQueue Semaphore TimeUnit]))
 
 (defn log-mesh-error
   "Logs an error message and exception with context for mesh operations."
@@ -45,6 +45,87 @@
 
 (def ^:private max-concurrent-mesh-chunk-reads 2)
 (defonce ^:private mesh-chunk-read-semaphore (Semaphore. max-concurrent-mesh-chunk-reads true))
+(defonce ^:private peer-mesh-chunk-handlers-atom (atom {}))
+
+(defn has-open-mesh-peers?
+  "Returns true ONLY when at least one peer DataChannel in `mesh-node` is `:open` (BIP-022 Stage D.1 F1/F6)."
+  [mesh-node]
+  (let [pc (:peer-conns mesh-node)]
+    (boolean
+     (and pc
+          (some (fn [[_ c]] (and (= :open (:phase c)) (some? (:node c))))
+                @pc)))))
+
+(defn fetch-mesh-chunks-from-peers!
+  "Queries connected open DataChannel peers in `mesh-node` with real `:artifact-blob-chunk-req`
+   frames using `deploy/init-mesh-chunk-assembly` -> `deploy/reduce-mesh-chunk-response`,
+   scoped strictly by `:req-id`, with 1 per-chunk retry and peer failover (BIP-022 Stage D.1 F1)."
+  [mesh-node cid eff]
+  (let [pc (:peer-conns mesh-node)
+        open-peers (if pc
+                     (->> @pc
+                          (filter (fn [[_ c]] (and (= :open (:phase c)) (some? (:node c)))))
+                          vec)
+                     [])]
+    (if (empty? open-peers)
+      {:ok? false :reason :mesh-disconnected}
+      (let [gen (long (or (:generation eff) 1))
+            chunk-bytes (long (or (:chunk-size-bytes eff) deploy/default-mesh-chunk-size-bytes))
+            probe-ms (long (or (:probe-timeout-ms eff) deploy/default-mesh-probe-timeout-ms))
+            chunk-ms (long (or (:chunk-timeout-ms eff) deploy/default-mesh-chunk-timeout-ms))
+            total-ms (long (or (:total-timeout-ms eff) (deploy/compute-mesh-fetch-ceiling-ms 0)))
+            deadline-ms (+ (System/currentTimeMillis) total-ms)]
+        (loop [rem-peers open-peers
+               last-err :not-found]
+          (if (empty? rem-peers)
+            {:ok? false :reason last-err}
+            (let [[peer-hex conn] (first rem-peers)
+                  peer-node (:node conn)
+                  ch-id (or (:channel-id conn) 0)
+                  req-id (str "jvm-peer-upd-" gen "-" (subs (str cid) 0 (min 8 (count (str cid)))) "-" (System/nanoTime))
+                  q (LinkedBlockingQueue.)]
+              (swap! peer-mesh-chunk-handlers-atom assoc req-id q)
+              (let [peer-res
+                    (try
+                      (loop [asm (deploy/init-mesh-chunk-assembly cid chunk-bytes)
+                             offset 0
+                             length chunk-bytes
+                             wait-ms probe-ms
+                             retried? false]
+                        (let [remaining (- deadline-ms (System/currentTimeMillis))]
+                          (if (<= remaining 0)
+                            {:ok? false :reason :mesh-total-timeout}
+                            (let [req (deploy/build-mesh-chunk-request cid offset length req-id)
+                                  sent-ok? (try
+                                             (api/send! peer-node (fressian/encode-wire req) ch-id)
+                                             true
+                                             (catch Exception _ false))]
+                              (if-not sent-ok?
+                                {:ok? false :reason :mesh-send-failed}
+                                (let [resp (.poll q (min wait-ms remaining) TimeUnit/MILLISECONDS)]
+                                  (if (nil? resp)
+                                    (if-not retried?
+                                      (recur asm offset length chunk-ms true)
+                                      {:ok? false :reason :mesh-chunk-timeout})
+                                    (let [step (deploy/reduce-mesh-chunk-response asm resp)]
+                                      (cond
+                                        (not (:ok? step))
+                                        {:ok? false :reason (or (:error step) :mesh-chunk-error)}
+
+                                        (:done? step)
+                                        {:ok? true :bytes (:bytes step) :source :mesh :peer peer-hex}
+
+                                        :else
+                                        (recur (:state step)
+                                               (long (get-in step [:next-req :offset]))
+                                               (long (get-in step [:next-req :length]))
+                                               chunk-ms
+                                               false))))))))))
+                      (finally
+                        (swap! peer-mesh-chunk-handlers-atom dissoc req-id)))]
+                (if (:ok? peer-res)
+                  peer-res
+                  (recur (rest rem-peers) (or (:reason peer-res) last-err)))))))))))
 
 (defn read-disk-blob-chunk-positional
   "Bounded positional `FileChannel` read of `[offset, offset + min(length, 192 KiB))` from disk CAS
@@ -2023,6 +2104,26 @@
                                                (when (>= (count snaps) (long (or (:target-count waiter) 5)))
                                                  (deliver (:done-promise waiter) true))))))
                                        (catch Exception _ nil))
+                                     :artifact-blob-chunk-req
+                                     (let [req-cid (str (:cid msg))
+                                           ch-id (or (:channel-id evt) (conn-channel-id updated) 0)
+                                           st (or (when-let [sa (:state-atom shell-node)] @sa)
+                                                  (when shell-node (query-node-state shell-node 500)))
+                                           blob-bs (get-in st [:data :blob-store :entries req-cid :bytes])
+                                           res-map (if (fressian/bytes? blob-bs)
+                                                     (deploy/serve-mesh-blob-chunk blob-bs msg)
+                                                     (if-let [sdir (or (:state-dir shell-node)
+                                                                       (get-in shell-node [:config :state-dir]))]
+                                                       (serve-disk-blob-chunk-req sdir msg)
+                                                       (deploy/serve-mesh-blob-chunk nil msg)))]
+                                       (try
+                                         (api/send! node (fressian/encode-wire res-map) ch-id)
+                                         (catch Exception e
+                                           (log-mesh-error "Failed to send peer artifact-blob-chunk-res" e))))
+                                     :artifact-blob-chunk-res
+                                     (when-let [req-id (:req-id msg)]
+                                       (when-let [^LinkedBlockingQueue q (get @peer-mesh-chunk-handlers-atom req-id)]
+                                         (.offer q msg)))
                                      (let [event (assoc msg
                                                         :sender peer-hex
                                                         :sender-pubkey-bytes (basalt/hex->bytes peer-hex)

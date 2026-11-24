@@ -448,86 +448,89 @@
 
 (def ^:private max-concurrent-mesh-chunk-reads 2)
 (defonce ^:private mesh-chunk-read-active-atom (atom 0))
+(defonce ^:private peer-mesh-chunk-handlers-atom (atom {}))
 
 (defn- read-disk-blob-slice-async!
-  "Bounded positional `fs.promises.open` + `fh.read` CAS chunk reader (`<= 192 KiB` per read)
-   gated by a `max=2` concurrency semaphore (BIP-022 Stage D.1). Eliminates full-file reads
-   and `arrayBuffers` spikes on `:artifact-blob-chunk-req`.
+  "Bounded positional `fs.promises.open` + `fh.read` CAS chunk reader (`<= 192 KiB` default for
+   mesh chunks, or configurable `:max-len` for HTTP `206 Range` slices) gated by a `max=2`
+   concurrency semaphore (BIP-022 Stage D.1). Eliminates full-file reads and `arrayBuffers` spikes.
    Accepts a single `state-dir` string or a vector of candidate directories."
-  [state-dirs cid offset length shell-atom cb]
-  (let [ncid (core-infra/normalize-cid cid)
-        off (max 0 (long (or offset 0)))
-        req-len (max 1 (min deploy/default-mesh-chunk-size-bytes
-                            (long (or length deploy/default-mesh-chunk-size-bytes))))
-        dirs (vec (distinct (remove str/blank? (if (sequential? state-dirs) state-dirs [state-dirs]))))
-        paths (vec (keep #(blob-file-path % ncid) dirs))]
-    (cond
-      (empty? paths)
-      (cb {:ok? false :error :not-found})
+  ([state-dirs cid offset length shell-atom cb]
+   (read-disk-blob-slice-async! state-dirs cid offset length shell-atom nil cb))
+  ([state-dirs cid offset length shell-atom opts cb]
+   (let [ncid (core-infra/normalize-cid cid)
+         off (max 0 (long (or offset 0)))
+         max-len (long (or (:max-len opts) deploy/default-mesh-chunk-size-bytes))
+         req-len (max 1 (min max-len (long (or length deploy/default-mesh-chunk-size-bytes))))
+         dirs (vec (distinct (remove str/blank? (if (sequential? state-dirs) state-dirs [state-dirs]))))
+         paths (vec (keep #(blob-file-path % ncid) dirs))]
+     (cond
+       (empty? paths)
+       (cb {:ok? false :error :not-found})
 
-      (>= @mesh-chunk-read-active-atom max-concurrent-mesh-chunk-reads)
-      (do
-        (when shell-atom
-          (apply-shell-event! shell-atom {:type :diagnose :reason :mesh-chunk-read-throttled :cid ncid}))
-        (cb {:ok? false :error :busy}))
+       (>= @mesh-chunk-read-active-atom max-concurrent-mesh-chunk-reads)
+       (do
+         (when shell-atom
+           (apply-shell-event! shell-atom {:type :diagnose :reason :mesh-chunk-read-throttled :cid ncid}))
+         (cb {:ok? false :error :busy}))
 
-      :else
-      (do
-        (swap! mesh-chunk-read-active-atom inc)
-        (let [released? (atom false)
-              release! (fn []
-                         (when (compare-and-set! released? false true)
-                           (swap! mesh-chunk-read-active-atom #(max 0 (dec %)))))
-              try-path! (fn try-path! [idx]
-                          (if (>= idx (count paths))
-                            (do
-                              (release!)
-                              (cb {:ok? false :error :not-found}))
-                            (let [fpath (nth paths idx)
-                                  fh-box (atom nil)]
-                              (-> (.open node-fsp fpath "r")
-                                  (.then (fn [^js fh]
-                                           (reset! fh-box fh)
-                                           (.stat fh)))
-                                  (.then (fn [^js st]
-                                           (let [total-len (long (gobj/get st "size"))]
-                                             (if (and (pos? total-len) (>= off total-len))
-                                               {:ok? false :error :offset-out-of-range :total-bytes total-len}
-                                               (let [actual-len (int (min req-len (max 0 (- total-len off))))
-                                                     buf (.allocUnsafe js/Buffer actual-len)
-                                                     ^js fh @fh-box]
-                                                 (-> (.read fh buf 0 actual-len off)
-                                                     (.then (fn [^js r]
-                                                              (let [nread (long (gobj/get r "bytesRead"))
-                                                                    slice-buf (.subarray buf 0 nread)
-                                                                    u8 (crypto/compact-u8 slice-buf)]
-                                                                {:ok? true
-                                                                 :bytes u8
-                                                                 :offset off
-                                                                 :length nread
-                                                                 :total-bytes total-len
-                                                                 :eof? (>= (+ off nread) total-len)})))))))))
-                                  (.then (fn [res]
-                                           (let [^js fh @fh-box
-                                                 close-p (if fh (-> (.close fh) (.catch (fn [_] nil))) (js/Promise.resolve nil))]
-                                             (-> close-p
-                                                 (.then (fn [_]
-                                                          (release!)
-                                                          (cb res)))))))
-                                  (.catch (fn [^js e]
+       :else
+       (do
+         (swap! mesh-chunk-read-active-atom inc)
+         (let [released? (atom false)
+               release! (fn []
+                          (when (compare-and-set! released? false true)
+                            (swap! mesh-chunk-read-active-atom #(max 0 (dec %)))))
+               try-path! (fn try-path! [idx]
+                           (if (>= idx (count paths))
+                             (do
+                               (release!)
+                               (cb {:ok? false :error :not-found}))
+                             (let [fpath (nth paths idx)
+                                   fh-box (atom nil)]
+                               (-> (.open node-fsp fpath "r")
+                                   (.then (fn [^js fh]
+                                            (reset! fh-box fh)
+                                            (.stat fh)))
+                                   (.then (fn [^js st]
+                                            (let [total-len (long (gobj/get st "size"))]
+                                              (if (and (pos? total-len) (>= off total-len))
+                                                {:ok? false :error :offset-out-of-range :total-bytes total-len}
+                                                (let [actual-len (int (min req-len (max 0 (- total-len off))))
+                                                      buf (.allocUnsafe js/Buffer actual-len)
+                                                      ^js fh @fh-box]
+                                                  (-> (.read fh buf 0 actual-len off)
+                                                      (.then (fn [^js r]
+                                                               (let [nread (long (gobj/get r "bytesRead"))
+                                                                     slice-buf (.subarray buf 0 nread)
+                                                                     u8 (crypto/compact-u8 slice-buf)]
+                                                                 {:ok? true
+                                                                  :bytes u8
+                                                                  :offset off
+                                                                  :length nread
+                                                                  :total-bytes total-len
+                                                                  :eof? (>= (+ off nread) total-len)})))))))))
+                                   (.then (fn [res]
                                             (let [^js fh @fh-box
-                                                  code (when e (gobj/get e "code"))
                                                   close-p (if fh (-> (.close fh) (.catch (fn [_] nil))) (js/Promise.resolve nil))]
                                               (-> close-p
                                                   (.then (fn [_]
-                                                           (if (= "ENOENT" code)
-                                                             (try-path! (inc idx))
-                                                             (do
-                                                               (release!)
-                                                               (when shell-atom
-                                                                 (apply-shell-event! shell-atom {:type :diagnose :reason :blob-fs-io-error :cid ncid :detail (or (when e (gobj/get e "message")) (str e))}))
-                                                               (cb {:ok? false :error :io-error})))))))))))))]
-          (try-path! 0))))))
+                                                           (release!)
+                                                           (cb res)))))))
+                                   (.catch (fn [^js e]
+                                             (let [^js fh @fh-box
+                                                   code (when e (gobj/get e "code"))
+                                                   close-p (if fh (-> (.close fh) (.catch (fn [_] nil))) (js/Promise.resolve nil))]
+                                               (-> close-p
+                                                   (.then (fn [_]
+                                                            (if (= "ENOENT" code)
+                                                              (try-path! (inc idx))
+                                                              (do
+                                                                (release!)
+                                                                (when shell-atom
+                                                                  (apply-shell-event! shell-atom {:type :diagnose :reason :blob-fs-io-error :cid ncid :detail (or (when e (gobj/get e "message")) (str e))}))
+                                                                (cb {:ok? false :error :io-error})))))))))))))]
+           (try-path! 0)))))))
 
 (defn- read-disk-blob-async!
   "Zero-Sync-IO async CAS blob read (`fs.promises`), invoking `(cb result-map)`."
@@ -1765,36 +1768,102 @@
       (if-not (contains? #{"GET" "HEAD"} method)
         (send-json! res 405 {:ok false :error "method-not-allowed"})
         (let [cid (subs clean-path (count "/artifact/v1/blob/"))
-              range-hdr (get-header req "range")]
-          (resolve-cid-blob-async!
-           rt cid now-ms
-           (fn [r]
-             (if (:ok? r)
-               (let [b (:blob r)
-                     ^js buf (u8->buf (:blob/bytes b))
-                     total-size (.-length buf)
-                     ct (or (:blob/media-type b) "application/octet-stream")]
-                 (if range-hdr
-                   (if-let [[start end] (core-infra/parse-byte-range range-hdr total-size)]
-                     (let [^js slice (.subarray buf start (inc end))
-                           hdrs (chunk-const/safe-blob-response-headers
-                                 {:cid (:blob/cid b)
-                                  :content-type ct
-                                  :content-length (.-length slice)
-                                  :content-range (str "bytes " start "-" end "/" total-size)})]
-                       (.writeHead res 206 (clj->js hdrs))
-                       (if (= method "HEAD") (.end res) (stream-buf-response! res slice)))
-                     (do
-                       (.writeHead res 416 #js {"Content-Range" (str "bytes */" total-size)
-                                                "Accept-Ranges" "bytes"})
-                       (.end res)))
-                   (let [hdrs (chunk-const/safe-blob-response-headers
-                               {:cid (:blob/cid b)
-                                :content-type ct
-                                :content-length total-size})]
-                     (.writeHead res 200 (clj->js hdrs))
-                     (if (= method "HEAD") (.end res) (stream-buf-response! res buf)))))
-               (send-json! res 404 {:ok false :error "blob-not-found" :cid cid}))))))
+              ncid (core-infra/normalize-cid cid)
+              range-hdr (get-header req "range")
+              send-416! (fn [blob-cid ct total-size]
+                          (let [hdrs (chunk-const/safe-blob-response-headers
+                                      {:cid blob-cid
+                                       :content-type ct
+                                       :content-length 0
+                                       :content-range (str "bytes */" total-size)})]
+                            (.writeHead res 416 (clj->js hdrs))
+                            (.end res)))
+              serve-full-or-range-from-mem!
+              (fn [b]
+                (let [^js buf (u8->buf (:blob/bytes b))
+                      total-size (.-length buf)
+                      ct (or (:blob/media-type b) "application/octet-stream")]
+                  (if range-hdr
+                    (if-let [[start end] (core-infra/parse-byte-range range-hdr total-size)]
+                      (let [^js slice (.subarray buf start (inc end))
+                            hdrs (chunk-const/safe-blob-response-headers
+                                  {:cid (:blob/cid b)
+                                   :content-type ct
+                                   :content-length (.-length slice)
+                                   :content-range (str "bytes " start "-" end "/" total-size)})]
+                        (.writeHead res 206 (clj->js hdrs))
+                        (if (= method "HEAD") (.end res) (stream-buf-response! res slice)))
+                      (send-416! (:blob/cid b) ct total-size))
+                    (let [hdrs (chunk-const/safe-blob-response-headers
+                                {:cid (:blob/cid b)
+                                 :content-type ct
+                                 :content-length total-size})]
+                      (.writeHead res 200 (clj->js hdrs))
+                      (if (= method "HEAD") (.end res) (stream-buf-response! res buf))))))]
+          (if range-hdr
+            ;; BIP-022 Stage D.1 F4: Positional disk Range serving (zero full-file load on disk CAS)
+            (let [inst @(:subnet-atom rt)
+                  sid (:subnet-id inst)
+                  denied (into #{} (map core-infra/normalize-cid) (get-in inst [:policy :subnet/denied-cids] #{}))]
+              (if (or (nil? ncid) (contains? denied ncid))
+                (send-json! res 404 {:ok false :error "blob-not-found" :cid cid})
+                (let [r-box (atom nil)
+                      _ (swap! (:subnet-atom rt)
+                               (fn [cur]
+                                 (let [r (data/get-blob (get-in cur [:data :blobs]) ncid {:subnet sid :now-ms now-ms})]
+                                   (reset! r-box r)
+                                   (assoc-in cur [:data :blobs] (:store r)))))
+                      r1 @r-box]
+                  (if (:hit? r1)
+                    (serve-full-or-range-from-mem! (:blob r1))
+                    (let [fpath (blob-file-path (:state-dir rt) ncid)
+                          mpath (blob-meta-path (:state-dir rt) ncid)]
+                      (if-not fpath
+                        (send-json! res 404 {:ok false :error "blob-not-found" :cid cid})
+                        (-> (.stat node-fsp fpath)
+                            (.then (fn [^js st]
+                                     (let [total-size (long (gobj/get st "size"))]
+                                       (-> (if mpath
+                                             (-> (.readFile node-fsp mpath "utf8")
+                                                 (.then (fn [s] (try (edn/read-string s) (catch :default _ nil))))
+                                                 (.catch (fn [_] nil)))
+                                             (js/Promise.resolve nil))
+                                           (.then (fn [meta-map]
+                                                    (let [ct (or (:media-type meta-map) "application/octet-stream")]
+                                                      (if-let [[start end] (core-infra/parse-byte-range range-hdr total-size)]
+                                                        (let [part-len (inc (- end start))]
+                                                          (if (= method "HEAD")
+                                                            (let [hdrs (chunk-const/safe-blob-response-headers
+                                                                        {:cid ncid
+                                                                         :content-type ct
+                                                                         :content-length part-len
+                                                                         :content-range (str "bytes " start "-" end "/" total-size)})]
+                                                              (.writeHead res 206 (clj->js hdrs))
+                                                              (.end res))
+                                                            (read-disk-blob-slice-async!
+                                                             (:state-dir rt) ncid start part-len (:shell-atom rt)
+                                                             {:max-len (* 4 1024 1024)}
+                                                             (fn [sres]
+                                                               (if (:ok? sres)
+                                                                 (let [^js slice-buf (u8->buf (:bytes sres))
+                                                                       hdrs (chunk-const/safe-blob-response-headers
+                                                                             {:cid ncid
+                                                                              :content-type ct
+                                                                              :content-length (.-length slice-buf)
+                                                                              :content-range (str "bytes " start "-" (+ start (dec (.-length slice-buf))) "/" total-size)})]
+                                                                   (.writeHead res 206 (clj->js hdrs))
+                                                                   (stream-buf-response! res slice-buf))
+                                                                 (send-json! res (if (= :busy (:error sres)) 503 500)
+                                                                             {:ok false :error (name (or (:error sres) :blob-read-failed))}))))))
+                                                        (send-416! ncid ct total-size)))))))))
+                            (.catch (fn [_]
+                                      (send-json! res 404 {:ok false :error "blob-not-found" :cid cid}))))))))))
+            (resolve-cid-blob-async!
+             rt cid now-ms
+             (fn [r]
+               (if (:ok? r)
+                 (serve-full-or-range-from-mem! (:blob r))
+                 (send-json! res 404 {:ok false :error "blob-not-found" :cid cid})))))))
 
       (= clean-path "/artifact/v1/pointer")
       (if (not= method "POST")
@@ -3494,6 +3563,51 @@
                                                  (when-let [done-fn (:done-fn waiter)]
                                                    (done-fn)))))))
                                        (catch :default _ nil))
+                                     :artifact-blob-chunk-req
+                                     (let [req-cid (str (:cid msg))
+                                           req-id (:req-id msg)
+                                           ch-id (or (:channel-id evt) (core-mesh/conn-channel-id updated) 0)
+                                           st @state-atom
+                                           hot-bytes (get-in st [:data :blob-store :entries req-cid :bytes])
+                                           send-res! (fn [res-map]
+                                                       (try
+                                                         (api/send! node (fressian/encode-wire res-map) ch-id)
+                                                         (catch :default e
+                                                           (log-diagnostic! {:effect :diagnose :reason :peer-mesh-chunk-send-failed :cid req-cid :detail (.-message e)}))))]
+                                       (if (fressian/bytes? hot-bytes)
+                                         (send-res! (deploy/serve-mesh-blob-chunk hot-bytes msg))
+                                         (let [sdirs (vec (remove nil?
+                                                                  [(:state-dir ctx)
+                                                                   (get-in ctx [:config :state-dir])
+                                                                   (get-in ctx [:config :infra-state-dir])]))]
+                                           (if (seq sdirs)
+                                             (read-disk-blob-slice-async!
+                                              sdirs req-cid (:offset msg) (:length msg) (:shell-atom ctx)
+                                              (fn [disk-res]
+                                                (if (:ok? disk-res)
+                                                  (send-res! (cond-> {:type :artifact-blob-chunk-res
+                                                                      :ok? true
+                                                                      :cid req-cid
+                                                                      :offset (:offset disk-res)
+                                                                      :length (:length disk-res)
+                                                                      :total-bytes (:total-bytes disk-res)
+                                                                      :eof? (:eof? disk-res)
+                                                                      :bytes (:bytes disk-res)}
+                                                               req-id (assoc :req-id req-id)))
+                                                  (send-res! (cond-> {:type :artifact-blob-chunk-res
+                                                                      :ok? false
+                                                                      :error (or (:error disk-res) :not-found)
+                                                                      :cid req-cid}
+                                                               (:total-bytes disk-res) (assoc :total-bytes (:total-bytes disk-res))
+                                                               req-id (assoc :req-id req-id))))))
+                                             (send-res! (deploy/serve-mesh-blob-chunk nil msg))))))
+                                     :artifact-blob-chunk-res
+                                     (when-let [req-id (:req-id msg)]
+                                       (when-let [handler (get @peer-mesh-chunk-handlers-atom req-id)]
+                                         (try
+                                           (handler msg)
+                                           (catch :default e
+                                             (log-diagnostic! {:effect :diagnose :reason :peer-mesh-chunk-dispatch-error :cid (str (:cid msg)) :detail (or (ex-message e) (str e))})))))
                                      (let [event (assoc msg
                                                         :sender peer-hex
                                                         :sender-pubkey-bytes (basalt/hex->bytes peer-hex)
@@ -4103,6 +4217,99 @@
        (catch :default e
          (done! {:ok? false :status 500 :error (str e)}))))))
 
+(defn- list-open-peer-conns
+  "Returns a vector of `[peer-hex conn]` entries whose DataChannel is strictly `:open` (BIP-022 Stage D.1 F6)."
+  [peer-conns]
+  (if peer-conns
+    (->> @peer-conns
+         (filter (fn [[_ c]] (and (= :open (:phase c)) (some? (:node c)))))
+         vec)
+    []))
+
+(defn- fetch-bundle-from-peer-mesh-async!
+  "Queries connected open DataChannel peers with real `:artifact-blob-chunk-req` frames
+   via `deploy/init-mesh-chunk-assembly` -> `deploy/reduce-mesh-chunk-response`, scoped strictly
+   by `:req-id`, with 1 per-chunk retry and peer failover (BIP-022 Stage D.1 F1)."
+  [peer-conns cid eff cb]
+  (let [open-peers (list-open-peer-conns peer-conns)]
+    (if (empty? open-peers)
+      (cb {:ok? false :reason :mesh-disconnected})
+      (let [gen (long (or (:generation eff) 1))
+            chunk-bytes (long (or (:chunk-size-bytes eff) deploy/default-mesh-chunk-size-bytes))
+            probe-ms (long (or (:probe-timeout-ms eff) deploy/default-mesh-probe-timeout-ms))
+            chunk-ms (long (or (:chunk-timeout-ms eff) deploy/default-mesh-chunk-timeout-ms))
+            total-ms (long (or (:total-timeout-ms eff) (deploy/compute-mesh-fetch-ceiling-ms 0)))
+            overall-settled? (atom false)
+            overall-timer (atom nil)
+            finish! (fn [res]
+                      (when (compare-and-set! overall-settled? false true)
+                        (when-let [t @overall-timer]
+                          (js/clearTimeout t)
+                          (reset! overall-timer nil))
+                        (cb res)))
+            try-peer!
+            (fn try-peer! [idx last-err]
+              (when-not @overall-settled?
+                (if (>= idx (count open-peers))
+                  (finish! {:ok? false :reason (or last-err :not-found)})
+                  (let [[peer-hex conn] (nth open-peers idx)
+                        peer-node (:node conn)
+                        ch-id (or (core-mesh/conn-channel-id conn) 0)
+                        req-id (str "full-mesh-upd-" gen "-" idx "-" (subs (str cid) 0 (min 8 (count (str cid)))) "-" (.now js/Date))
+                        asm-atom (atom (deploy/init-mesh-chunk-assembly cid chunk-bytes))
+                        peer-settled? (atom false)
+                        chunk-timer (atom nil)
+                        cleanup-peer! (fn []
+                                        (swap! peer-mesh-chunk-handlers-atom dissoc req-id)
+                                        (when-let [t @chunk-timer]
+                                          (js/clearTimeout t)
+                                          (reset! chunk-timer nil)))
+                        fail-peer! (fn [reason]
+                                     (when (compare-and-set! peer-settled? false true)
+                                       (cleanup-peer!)
+                                       (try-peer! (inc idx) reason)))
+                        send-chunk! (fn send-chunk! [offset length timeout-ms retried?]
+                                      (when (and (not @overall-settled?) (not @peer-settled?))
+                                        (when-let [t @chunk-timer]
+                                          (js/clearTimeout t))
+                                        (reset! chunk-timer
+                                                (js/setTimeout
+                                                 (fn []
+                                                   (if (and (not @overall-settled?) (not @peer-settled?) (not retried?))
+                                                     (send-chunk! offset length chunk-ms true)
+                                                     (fail-peer! :mesh-chunk-timeout)))
+                                                 timeout-ms))
+                                        (try
+                                          (let [req (deploy/build-mesh-chunk-request cid offset length req-id)]
+                                            (api/send! peer-node (fressian/encode-wire req) ch-id))
+                                          (catch :default _
+                                            (fail-peer! :mesh-send-failed)))))
+                        on-res (fn [res]
+                                 (when (and (not @overall-settled?)
+                                            (not @peer-settled?)
+                                            (= req-id (:req-id res)))
+                                   (let [step (deploy/reduce-mesh-chunk-response @asm-atom res)]
+                                     (cond
+                                       (not (:ok? step))
+                                       (fail-peer! (or (:error step) :mesh-chunk-error))
+
+                                       (:done? step)
+                                       (when (compare-and-set! peer-settled? false true)
+                                         (cleanup-peer!)
+                                         (finish! {:ok? true :bytes (:bytes step) :source :mesh :peer peer-hex}))
+
+                                       :else
+                                       (do
+                                         (reset! asm-atom (:state step))
+                                         (send-chunk! (get-in step [:next-req :offset])
+                                                      (get-in step [:next-req :length])
+                                                      chunk-ms
+                                                      false))))))]
+                    (swap! peer-mesh-chunk-handlers-atom assoc req-id on-res)
+                    (send-chunk! 0 chunk-bytes probe-ms false)))))]
+        (reset! overall-timer (js/setTimeout #(finish! {:ok? false :reason :mesh-total-timeout}) total-ms))
+        (try-peer! 0 nil)))))
+
 (defn- start-full-node-auto-updater!
   "P-UPD-1 / D40.1 / BIP-022 Stage D.1: Generation-tagged `deploy/reduce-light-update-tick`
    self-update loop for Node.js full & infra nodes (`:artifact-role :full-node`).
@@ -4136,9 +4343,7 @@
            rt (:rt mesh-ctx)
            state-atom (:state-atom mesh-ctx)
            mesh-available? (fn []
-                             (boolean (or (and peer-conns (seq @peer-conns))
-                                          rt
-                                          state-atom)))
+                             (pos? (count (list-open-peer-conns peer-conns))))
            dispatch! (fn dispatch! [ev]
                        (let [effs-box (atom [])]
                          (swap! updater-atom
@@ -4168,12 +4373,29 @@
                              :fetch-bundle-mesh-chunks
                              (let [gen (:generation eff)
                                    cid (:cid eff)
-                                   hot-bs (when state-atom (get-in @state-atom [:data :blob-store :entries cid :bytes]))]
+                                   hot-bs (when state-atom (get-in @state-atom [:data :blob-store :entries cid :bytes]))
+                                   query-peers!
+                                   (fn []
+                                     (fetch-bundle-from-peer-mesh-async!
+                                      peer-conns cid eff
+                                      (fn [mres]
+                                        (if (and (:ok? mres) (fressian/bytes? (:bytes mres)))
+                                          (do
+                                            (reset! staged-bytes-atom (:bytes mres))
+                                            (dispatch! {:type :blob-fetched
+                                                        :cid cid
+                                                        :bytes (:bytes mres)
+                                                        :source :mesh
+                                                        :generation gen}))
+                                          (dispatch! {:type :mesh-fetch-failed
+                                                      :cid cid
+                                                      :reason (or (:reason mres) :not-found)
+                                                      :generation gen})))))]
                                (cond
                                  (fressian/bytes? hot-bs)
                                  (do
                                    (reset! staged-bytes-atom hot-bs)
-                                   (dispatch! {:type :blob-fetched :cid cid :bytes hot-bs :source :mesh :generation gen}))
+                                   (dispatch! {:type :blob-fetched :cid cid :bytes hot-bs :source :local-cas :generation gen}))
 
                                  rt
                                  (resolve-cid-blob-async!
@@ -4182,11 +4404,11 @@
                                     (if (and (:ok? r) (fressian/bytes? (get-in r [:blob :blob/bytes])))
                                       (let [bs (get-in r [:blob :blob/bytes])]
                                         (reset! staged-bytes-atom bs)
-                                        (dispatch! {:type :blob-fetched :cid cid :bytes bs :source :mesh :generation gen}))
-                                      (dispatch! {:type :mesh-fetch-failed :cid cid :reason :not-found :generation gen}))))
+                                        (dispatch! {:type :blob-fetched :cid cid :bytes bs :source :local-cas :generation gen}))
+                                      (query-peers!))))
 
                                  :else
-                                 (dispatch! {:type :mesh-fetch-failed :cid cid :reason :not-found :generation gen})))
+                                 (query-peers!)))
 
                              :schedule-http-retry
                              (let [gen (:generation eff)

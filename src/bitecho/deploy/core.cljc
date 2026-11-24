@@ -2481,17 +2481,7 @@
                                 st1 (-> state
                                         (assoc :http-fallback fb' :last-error :light-update-hash-mismatch)
                                         (record-light-diag :light-update-hash-mismatch))]
-                            (if (< (inc relay-idx) (count urls))
-                              (failover-or-exhaust-http st1 ep cur-gen :light-update-hash-mismatch [diag] {:reset-range? true})
-                              (let [st2 (-> st1
-                                            (assoc :phase :watching
-                                                   :pending-update nil
-                                                   :http-fallback (reset-http-fallback st1 []))
-                                            (update :generation inc))
-                                    [st3 obs-eff] (light-update-obs-record st2 ep :refused {:reason :light-update-hash-mismatch
-                                                                                            :expected-cid target-cid
-                                                                                            :actual-cid actual-cid})]
-                                [st3 [diag obs-eff]])))))
+                            (failover-or-exhaust-http st1 ep cur-gen :light-update-hash-mismatch [diag] {:reset-range? true}))))
                       [(assoc state :http-fallback fb')
                        [{:effect :fetch-bundle-blob
                          :cid target-cid
