@@ -220,6 +220,8 @@
             "stale_serve_lock_reclaimed" (max 0 stale-reclaimed)
             "browser_tab_leader_handoff" (max 0 tab-handoff)})))
 
+(declare build-storage-telemetry build-latency-telemetry)
+
 (defn render-status
   "Single canonical Sans-IO status renderer shared by Browser, Node.js Light,
    and JVM Light nodes (plus canonical observability projection for Full Node).
@@ -388,7 +390,92 @@
      "unread_events" (count (or (safe-map-get st :event-queue) []))
      "inbox_count" (count inbox-items)
      "petnames" petnames-sorted
-     "wire_protocol" wire-proto}))
+     "wire_protocol" wire-proto
+     "storage" (build-storage-telemetry (or (safe-map-get rctx :storage) (safe-map-get st :storage)))
+     "latency" (build-latency-telemetry (or (safe-map-get rctx :latency) (safe-map-get st :latency)))}))
+
+(def default-latency-ring-max
+  "BIP-025 §5.3: Bounded 60-sample ring buffer window for latency telemetry."
+  60)
+
+(def default-latency-thresholds
+  "BIP-025 §5.3: Default threshold (ms) for loud Rule 5 latency diagnostics."
+  {:state-save-ms 250
+   :ctl-ms 200
+   :event-loop-lag-ms 500
+   :snapshot-encode-ms 250})
+
+(defn record-latency-sample
+  "BIP-025 §5.3: Purely appends `sample-ms` to a bounded latency ring buffer (default 60 samples).
+   If `warn-ms` is exceeded, emits a counted Rule 5 `:diagnose` effect with `diag-reason`.
+   Returns `[new-ring effects]`."
+  ([ring sample-ms]
+   (record-latency-sample ring sample-ms nil))
+  ([ring sample-ms {:keys [max-samples warn-ms diag-reason]}]
+   (let [cap (max 1 (long (or max-samples default-latency-ring-max)))
+         val-ms (max 0 (long (or sample-ms 0)))
+         v (conj (vec (or ring [])) val-ms)
+         trimmed (if (> (count v) cap)
+                   (subvec v (- (count v) cap))
+                   v)
+         effs (if (and (number? warn-ms) (> val-ms (long warn-ms)) (some? diag-reason))
+                [{:effect :diagnose
+                  :reason diag-reason
+                  :value-ms val-ms
+                  :threshold-ms (long warn-ms)}]
+                [])]
+     [trimmed effs])))
+
+(defn summarize-latency-ring
+  "BIP-025 §5.3: Purely summarizes a latency sample sequence into `{\"last\" n \"p95\" n \"max\" n}`
+   satisfying `0 <= last, p95 <= max`."
+  [samples]
+  (let [xs (mapv #(max 0 (long %)) (filter number? (or samples [])))]
+    (if (empty? xs)
+      {"last" 0 "p95" 0 "max" 0}
+      (let [sorted (vec (sort xs))
+            n (count sorted)
+            p95-idx (min (dec n) (max 0 (dec (long #?(:clj (Math/ceil (* 0.95 (double n)))
+                                                      :cljs (js/Math.ceil (* 0.95 (double n))))))))]
+        {"last" (peek xs)
+         "p95" (nth sorted p95-idx)
+         "max" (peek sorted)}))))
+
+(defn build-storage-telemetry
+  "BIP-025 §5.3: Normalizes optional storage metrics into canonical snake_case wire map."
+  [storage-ctx]
+  (let [s (or storage-ctx {})
+        by-tier (or (safe-map-get s :cache-entries-by-tier)
+                    (safe-map-get s "cache_entries_by_tier")
+                    {})]
+    {"state_bytes" (max 0 (long (or (safe-map-get s :state-bytes) (safe-map-get s "state_bytes") 0)))
+     "cache_bytes" (max 0 (long (or (safe-map-get s :cache-bytes) (safe-map-get s "cache_bytes") 0)))
+     "cache_index_bytes" (max 0 (long (or (safe-map-get s :cache-index-bytes) (safe-map-get s "cache_index_bytes") 0)))
+     "cache_entries" (max 0 (long (or (safe-map-get s :cache-entries) (safe-map-get s "cache_entries") 0)))
+     "cache_entries_by_tier" {"pinned" (max 0 (long (or (safe-map-get by-tier :pinned) (safe-map-get by-tier "pinned") 0)))
+                              "active_pointer" (max 0 (long (or (safe-map-get by-tier :active-pointer) (safe-map-get by-tier "active_pointer") 0)))
+                              "historical_unreferenced" (max 0 (long (or (safe-map-get by-tier :historical-unreferenced) (safe-map-get by-tier "historical_unreferenced") 0)))}
+     "cache_budget_bytes" (max 0 (long (or (safe-map-get s :cache-budget-bytes) (safe-map-get s "cache_budget_bytes") 0)))
+     "events_log_bytes" (max 0 (long (or (safe-map-get s :events-log-bytes) (safe-map-get s "events_log_bytes") 0)))
+     "events_log_max_bytes" (max 0 (long (or (safe-map-get s :events-log-max-bytes) (safe-map-get s "events_log_max_bytes") 0)))
+     "host_free_disk_bytes" (let [hf (or (safe-map-get s :host-free-disk-bytes) (safe-map-get s "host_free_disk_bytes"))]
+                              (when (number? hf) (max 0 (long hf))))}))
+
+(defn build-latency-telemetry
+  "BIP-025 §5.3: Normalizes latency ring buffers into canonical `last`/`p95`/`max` summaries."
+  [latency-ctx]
+  (let [l (or latency-ctx {})
+        norm (fn [k-kw k-str]
+               (let [v (or (safe-map-get l k-kw) (safe-map-get l k-str))]
+                 (if (map? v)
+                   {"last" (max 0 (long (or (safe-map-get v "last") (safe-map-get v :last) 0)))
+                    "p95" (max 0 (long (or (safe-map-get v "p95") (safe-map-get v :p95) 0)))
+                    "max" (max 0 (long (or (safe-map-get v "max") (safe-map-get v :max) 0)))}
+                   (summarize-latency-ring v))))]
+    {"state_save_latency_ms" (norm :state-save-ms "state_save_latency_ms")
+     "ctl_latency_ms" (norm :ctl-ms "ctl_latency_ms")
+     "event_loop_lag_ms" (norm :event-loop-lag-ms "event_loop_lag_ms")
+     "snapshot_encode_ms" (norm :snapshot-encode-ms "snapshot_encode_ms")}))
 
 (defn project-browser-status
   "Thin pure projection over `(render-status state runtime-ctx)` for Browser JS consumers:
@@ -452,15 +539,25 @@
                              {:duplicate_serve_instance_rejected (long (or (safe-map-get lock-diags :duplicate-serve-instance-rejected) 0))
                               :stale_serve_lock_reclaimed (long (or (safe-map-get lock-diags :stale-serve-lock-reclaimed) 0))}
                              {"duplicate_serve_instance_rejected" (long (or (safe-map-get lock-diags :duplicate-serve-instance-rejected) 0))
-                              "stale_serve_lock_reclaimed" (long (or (safe-map-get lock-diags :stale-serve-lock-reclaimed) 0))}))]
+                              "stale_serve_lock_reclaimed" (long (or (safe-map-get lock-diags :stale-serve-lock-reclaimed) 0))}))
+        storage-wire (build-storage-telemetry (or (safe-map-get rctx :storage)
+                                                  (safe-map-get base :storage)
+                                                  (safe-map-get base "storage")))
+        latency-wire (build-latency-telemetry (or (safe-map-get rctx :latency)
+                                                  (safe-map-get base :latency)
+                                                  (safe-map-get base "latency")))]
     (if kw-keys?
       (assoc base
              :schema_version status-schema-version
              :security_flags sec-flags-norm
              :instance_lock lock-wire
-             :diagnostics merged-diag)
+             :diagnostics merged-diag
+             :storage storage-wire
+             :latency latency-wire)
       (assoc base
              "schema_version" status-schema-version
              "security_flags" sec-flags-norm
              "instance_lock" lock-wire
-             "diagnostics" merged-diag))))
+             "diagnostics" merged-diag
+             "storage" storage-wire
+             "latency" latency-wire))))

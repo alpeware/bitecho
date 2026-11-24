@@ -1,0 +1,17 @@
+{:bip-id "BIP-025"
+ :bip/id "BIP-025"
+ :title "BIP-025: Core State / Local Cache Split, Value-Aware Retention, Bounded Full-Node Snapshots, Log Rotation & Latency Telemetry"
+ :bip/title "BIP-025: Core State / Local Cache Split, Value-Aware Retention, Bounded Full-Node Snapshots, Log Rotation & Latency Telemetry"
+ :version "v0.23.22"
+ :bip/version "0.23.22"
+ :milestone "D53"
+ :bip/milestone "D53"
+ :bip/status :consented
+ :date "2026-11-24"
+ :subnet-id "bitecho.org/dev"
+ :bip/subnet-id "bitecho.org/dev"
+ :change-class :storage-persistence-observability
+ :draft-2-cid "83984cf37d31b232dfad10429395a5a061aaadaa76c304509117a92524d936cc"
+ :consensus-impact :none
+ :consensus-impact-note "Zero wire-protocol breaking changes or flag-day upgrades. All changes are node-local: structural Core-State vs Value-Aware Local Cache split (bitecho.cache.core), crash-safe extract-before-compact migration with ENOSPC fail-closed guardrails, BIP-022 backup Core-State-only boundary, Browser IndexedDB v2 upgrade with Closure-safe accessors, full-node O(1) snapshot retention caps, off-heap GC hysteresis/backoff, hot-LRU hysteresis & scan-resistant admission, 5s SIGTERM hard-exit watchdog, rotate-1 --events-out with inode-aware wait-event tailing, and storage/latency telemetry in bitecho.status/v1 and /statusz."
+ :open-findings []}

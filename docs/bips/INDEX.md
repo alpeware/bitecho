@@ -1,6 +1,6 @@
 # Bitecho Improvement Proposals Index (`docs/bips/INDEX.md`)
 
-Complete registry of committed Bitecho Improvement Proposals (**BIP-000** through **BIP-023**) with status, target version/milestone, and full 64-character SHA-256 CIDs (`P-DOCS-3` / `S-D41-3`).
+Complete registry of committed Bitecho Improvement Proposals (**BIP-000** through **BIP-025**) with status, target version/milestone, and full 64-character SHA-256 CIDs (`P-DOCS-3` / `S-D41-3`).
 
 > [!NOTE]
 > BIP-002 through BIP-005 were pre-D32 on-network / inline milestone proposals (Tokenomics/Publishing/Unification III documented in [`../SPEC.md`](../SPEC.md) and [`../releases/`](../releases/)). Starting at BIP-006 (`D32`), every BIP EDN receipt is co-committed in `docs/bips/`.
@@ -23,6 +23,7 @@ Complete registry of committed Bitecho Improvement Proposals (**BIP-000** throug
 | **BIP-017a** | D43 / `v0.23.19` | `:consented` | [`bip-017a-v02319.edn`](bip-017a-v02319.edn) ([Spec](bip-017a-chunked-storage-spec.md)) | `99780163a3c4bb193191baf4ebbdc174b7b0720ccc1f2d7f5f955c60200f73ba` |
 | **BIP-017b** | D44 / `v0.23.20` | `:consented` | [`bip-017b-v02320.edn`](bip-017b-v02320.edn) ([Spec](bip-017b-web-app-release-spec.md)) | `d8c0d3ca715f41e4012e8b0859ddf3cf9a7910a4818c48312eb17b968ac5c0da` |
 | **BIP-023** | Host Policy / `v0.23.21` | `:consented` | [`bip-023-gentoo-host-update-policy.edn`](bip-023-gentoo-host-update-policy.edn) ([Policy](bip-023-gentoo-host-update-policy.md)) | `8a7b7cadeb65234c724d4457ddcafd0a5d5377197af7e195d56d1e3bb1aa94bc` |
+| **BIP-025** | D53 / `v0.23.22` | `:consented` | [`bip-025-v02322.edn`](bip-025-v02322.edn) | `9b55c2cf9575e15a8df7fab78f3af43de82ffe8444eb9def1684b1ce52793995` |
 
 ## Verification
 

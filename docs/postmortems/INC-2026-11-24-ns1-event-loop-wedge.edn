@@ -1,0 +1,41 @@
+{:schema :bitecho/incident-postmortem-v1
+ :incident-id "INC-2026-11-24-ns1-event-loop-wedge"
+ :severity :sev-2
+ :window-utc "2026-11-24T00:00:00Z/2026-11-24T08:00:00Z"
+ :window-cst "2026-11-23 18:00:00 CST -> 2026-11-24 02:00:00 CST"
+ :affected-nodes ["ns1.bitecho.org"]
+ :healthy-nodes ["ns2.bitecho.org" "ns3.bitecho.org"]
+ :twin-circle-receipt {:rendered-bip-path "docs/bips/bip-025-v02322.edn"
+                       :rendered-bip-cid "83984cf37d31b232dfad10429395a5a061aaadaa76c304509117a92524d936cc"}
+ :slo-breakdown {:consensus-finality {:target-pct 99.9999
+                                      :finality-halt-sec 0.0
+                                      :six-nines-met? true}
+                 :edge-fleet {:target-pct 99.99
+                              :degraded-nodes ["ns1.bitecho.org"]
+                              :healthy-nodes ["ns2.bitecho.org" "ns3.bitecho.org"]}}
+ :hypotheses [{:claim "Unbounded :executed-root-depths (12,029), oversized :expired-gossip-ids (5,846), and orphaned :epoch-to-message-roles (1,189) bloated ns1 snapshots to 6.69 MB"
+               :status :verified}
+              {:claim "Aggressive 8 MiB / 16 MiB / 30s off-heap GC monitor triggered 1,188 stop-the-world global.gc() pauses every ~36s without backoff"
+               :status :verified}
+              {:claim "Missing low-water hysteresis in evict-hot-lru caused 1,702 blob-hot-evicted boundary thrashing events"
+               :status :verified}
+              {:claim "Global consensus halted during ns1 event-loop wedge"
+               :status :falsified
+               :falsifier "ns2 and ns3 continuously finalized epochs with zero consensus halt"}]
+ :action-items [{:bip-id "BIP-025"
+                 :track :track-1
+                 :summary "Enforce strict O(1) caps on :executed-root-depths (512), :expired-gossip-ids/order (1024), and :epoch-to-message-roles (gossip-ttl-epochs + 4)"
+                 :invariant-test "bitecho.d53-bip025-cache-persistence-telemetry-test/prop-full-node-bounded-snapshot-caps"}
+                {:bip-id "BIP-025"
+                 :track :track-2
+                 :summary "Raise off-heap GC thresholds to 32 MiB AB / 64 MiB ext with 120s cooldown and exponential backoff to 600s on <10% reclaim"
+                 :invariant-test "bitecho.d53-bip025-cache-persistence-telemetry-test/prop-offheap-gc-hysteresis-and-ineffective-backoff"}
+                {:bip-id "BIP-025"
+                 :track :track-3
+                 :summary "Add 0.85 low-water hysteresis & 2-hit scan-resistant admission in core.data and 5s SIGTERM hard-exit watchdog (exit 124)"
+                 :invariant-test "bitecho.d53-bip025-cache-persistence-telemetry-test/prop-blob-store-hot-hysteresis-and-scan-resistance"}
+                {:bip-id "BIP-025"
+                 :track :track-4
+                 :summary "Split Core State from Value-Aware Local Cache (bitecho.cache.core), migrate hot-path saves to async, rotate --events-out, and expose storage/latency telemetry"
+                 :invariant-test "bitecho.d53-bip025-cache-persistence-telemetry-test/prop-latency-ring-buffer-and-threshold-diagnostics"}]
+ :evidence-cids ["83984cf37d31b232dfad10429395a5a061aaadaa76c304509117a92524d936cc"]}

@@ -518,6 +518,7 @@
             "broadcast-gap-detected" "foreign-unicast-dropped" "events-out-mismatch"
             ;; BIP-018 blob-store persistence keys
             "blob-hot-evicted" "max-pinned-app-bytes" "max-hot-blob-bytes"
+            "hot-evict-low-water-ratio" "scan-resistant-admission?" "pinned-cids"
             "pinned-app-bytes" "pinned-app-cap-exceeded" "blob-stored-cold"
             ;; v0.23.22 client hotfix diagnostic keys
             "subnet-id-startup-override" "ctl-socket-error"

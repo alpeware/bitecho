@@ -136,6 +136,34 @@
       (pos? d2) d2
       :else nil)))
 
+(def default-max-executed-root-depths
+  "BIP-025 §4.1: Strict O(1) cap on `:executed-root-depths` entries retained in snapshots."
+  512)
+
+(defn prune-executed-root-depths
+  "BIP-025 §4.1: Prunes `:executed-root-depths` to retain all `protected-hashes`
+   (`protected-anchors ∪ pruned-exec-blocks ∪ keys(:blocks) ∪ referenced-parents`)
+   plus highest-depth entries up to `max-entries` (default 512), keeping `lookup-known-depth`
+   100% exact for all active blocks while preventing unbounded snapshot growth."
+  ([state protected-hashes]
+   (prune-executed-root-depths state protected-hashes default-max-executed-root-depths))
+  ([state protected-hashes max-entries]
+   (let [existing (or (:executed-root-depths state) {})
+         cap (max 1 (long (or max-entries default-max-executed-root-depths)))]
+     (if (<= (count existing) cap)
+       state
+       (let [prot-set (set (or protected-hashes #{}))
+             kept-protected (select-keys existing prot-set)
+             rem-slots (max 0 (- cap (count kept-protected)))
+             extras (if (pos? rem-slots)
+                      (->> existing
+                           (remove (fn [[h _]] (contains? prot-set h)))
+                           (sort-by (fn [[h d]] [(- (long (or d 0))) (str h)]))
+                           (take rem-slots))
+                      [])
+             pruned (into kept-protected extras)]
+         (assoc state :executed-root-depths pruned))))))
+
 (defn record-executed-root-depths
   "Immutably records true positive topological depths of `hashes` into `:executed-root-depths`.
    Never overwrites an existing positive entry in `:executed-root-depths`."

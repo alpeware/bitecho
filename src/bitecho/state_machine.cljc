@@ -817,7 +817,14 @@
                                            (or (:message-epochs state) {}))
         expired-ids (set/union expired-from-epoch-map expired-from-msg-epochs)
         pruned-epoch-to-messages (reduce dissoc epoch-to-messages expired-epochs)
-        pruned-epoch-to-roles (reduce dissoc (or (:epoch-to-message-roles state) {}) expired-epochs)
+        raw-epoch-to-roles (or (:epoch-to-message-roles state) {})
+        expired-role-epochs (filterv #(< (long %) cutoff-epoch) (keys raw-epoch-to-roles))
+        role-cap (+ (long gossip-ttl-epochs) 4)
+        pruned-epoch-to-roles-ttl (reduce dissoc raw-epoch-to-roles expired-role-epochs)
+        pruned-epoch-to-roles (if (> (count pruned-epoch-to-roles-ttl) role-cap)
+                                (let [keep-eps (set (take role-cap (sort > (keys pruned-epoch-to-roles-ttl))))]
+                                  (select-keys pruned-epoch-to-roles-ttl keep-eps))
+                                pruned-epoch-to-roles-ttl)
         pruned-epochs (reduce dissoc (or (:message-epochs state) {}) expired-ids)
         pruned-messages (reduce dissoc (:messages state) expired-ids)
         pruned-known-ids (set/difference (ensure-set (:contagion-known-ids state)) expired-ids)
@@ -926,12 +933,27 @@
                   kept (subvec ord overflow)]
               [(reduce disj s evicted) kept])
             [s ord]))
+        max-expired-gossip (long (or (:max-expired-gossip-ids cfg) 1024))
         [pruned-expired-gossip pruned-expired-gossip-ord]
-        (reduce (fn [[s ord] mid]
-                  (fifo-track s ord mid max-tracked))
-                [(ensure-set (:expired-gossip-ids state))
-                 (or (:expired-gossip-order state) [])]
-                (sort expired-ids))
+        (let [[s0 ord0] (reduce (fn [[s ord] mid]
+                                  (fifo-track s ord mid max-expired-gossip))
+                                [(ensure-set (:expired-gossip-ids state))
+                                 (vec (or (:expired-gossip-order state) []))]
+                                (sort expired-ids))]
+          (if (> (count ord0) max-expired-gossip)
+            (let [overflow (- (count ord0) max-expired-gossip)
+                  evicted (subvec ord0 0 overflow)
+                  kept (subvec ord0 overflow)]
+              [(reduce disj s0 evicted) kept])
+            [s0 ord0]))
+        max-exec-root-depths (long (or (:max-executed-root-depths cfg)
+                                       streamlet/default-max-executed-root-depths))
+        protected-depth-hashes (let [blks (or (:blocks state) {})]
+                                 (cond-> (into #{} (concat (keys blks)
+                                                           (keep :parent-hash (vals blks))
+                                                           pruned-exec-blocks))
+                                   (:latest-finalized-block-hash state)
+                                   (conj (:latest-finalized-block-hash state))))
         pruned-pending-receipts (if (seq (:pending-receipts state))
                                   (filterv #(not (contains? pruned-tracked-exec (:receipt-id %)))
                                            (:pending-receipts state))
@@ -975,6 +997,7 @@
                :settled-escrow-ids pruned-tracked-settled-escrows
                :settled-escrow-order pruned-settled-escrows-ord
                :murmur-cache pruned-murmur-cache)
+        (streamlet/prune-executed-root-depths protected-depth-hashes max-exec-root-depths)
         (prune-rendezvous-retention-state rdv-cutoff)
         (prune-treasury-epoch-state new-epoch cfg))))
 

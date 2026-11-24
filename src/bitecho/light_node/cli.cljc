@@ -247,7 +247,10 @@
    "--node-role" "--retention-max-entries" "--retention-max-bytes" "--rotate-every"
    "--grace-epochs" "--lkg-cid" "--walk-depth-cap" "--owner-pubkey" "--cache-incentive"
    "--chunk-size" "--concurrency" "--resume-dir" "--max-bytes"
-   "--release-cid" "--genesis-anchor-cid" "--lkg-release-cid" "--headers-config-cid"])
+   "--release-cid" "--genesis-anchor-cid" "--lkg-release-cid" "--headers-config-cid"
+   "--max-cache-bytes" "--min-free-disk-bytes" "--min-free-disk-pct"
+   "--max-events-log-bytes" "--state-save-warn-ms" "--ctl-warn-ms"
+   "--event-loop-lag-warn-ms" "--snapshot-encode-warn-ms"])
 
 ;; =============================================================================
 ;; 2. Pure CLI Tokenizer & JSONL Command Splitter (Rule 2)
@@ -1940,3 +1943,75 @@
     {:ok? false
      :error :invalid-input
      :supported-verbs supported-cli-verbs}))
+
+;; =============================================================================
+;; 7. BIP-025 Pure Bounded Rotate-1 Events Log & Inode-Aware Tail Model (V1)
+;; =============================================================================
+
+(def default-max-events-log-bytes
+  "BIP-025 §5.2 (V1): Default rotate-1 cap for `--events-out` (`events.jsonl` / `stdout.jsonl`): 32 MiB."
+  (* 32 1024 1024))
+
+(defn step-events-log-append-model
+  "Pure Sans-IO model of atomic rotate-1 append to `--events-out` (BIP-025 §5.2 / V1).
+   When `(count active-bytes) + (count line) > max-bytes` and `active-bytes` is non-empty,
+   atomically rotates active -> `.1` (new inode for active) and emits counted `:events-log-rotated`.
+   Returns `{:fs' updated-fs :effects [...]}`."
+  [fs line max-bytes]
+  (let [cap (max 1 (long (or max-bytes default-max-events-log-bytes)))
+        cur (str (or (:active-bytes fs) ""))
+        line-str (str line)
+        need-rotate? (and (pos? (count cur))
+                          (> (+ (count cur) (count line-str)) cap))]
+    (if need-rotate?
+      (let [next-ino (inc (long (or (:next-ino fs) 2)))
+            new-ino (long (or (:next-ino fs) 2))
+            diag {:effect :diagnose
+                  :reason :events-log-rotated
+                  :rotated-bytes (count cur)
+                  :max-bytes cap}]
+        {:fs' {:active-ino new-ino
+               :active-bytes line-str
+               :rotated-ino (:active-ino fs)
+               :rotated-bytes cur
+               :next-ino next-ino}
+         :effects [diag]})
+      {:fs' (assoc fs :active-bytes (str cur line-str))
+       :effects []})))
+
+(defn step-events-tail-model
+  "Pure Sans-IO model of `wait-event` inode-aware tailing across rotate-1 boundaries (BIP-025 §5.2 / V1).
+   When `active-ino != (:ino cursor)`, drains any unread tail from `.1` if `rotated-ino == (:ino cursor)`
+   and `(count rotated-bytes) > (:offset cursor)`, then resets to `{:offset 0 :ino active-ino}` and reads
+   complete lines from active. Returns `{:cursor' {:offset n :ino i} :lines [...]}`."
+  [fs cursor]
+  (let [last-off (max 0 (long (or (:offset cursor) 0)))
+        last-ino (:ino cursor)
+        active-ino (:active-ino fs)
+        active-str (str (or (:active-bytes fs) ""))
+        extract-lines (fn [s off]
+                        (if (<= (count s) off)
+                          [[] off]
+                          (let [slice (subs s off)
+                                last-nl (str/last-index-of slice "\n")]
+                            (if (nil? last-nl)
+                              [[] off]
+                              (let [chunk (subs slice 0 (inc last-nl))
+                                    lines (->> (str/split-lines chunk)
+                                               (map str/trim)
+                                               (remove str/blank?)
+                                               vec)]
+                                [lines (+ off (inc last-nl))])))))]
+    (if (and (some? last-ino) (not= last-ino active-ino))
+      (let [rot-str (str (or (:rotated-bytes fs) ""))
+            [tail-lines _] (if (and (= last-ino (:rotated-ino fs))
+                                    (> (count rot-str) last-off))
+                             (extract-lines rot-str last-off)
+                             [[] 0])
+            [new-lines new-off] (extract-lines active-str 0)]
+        {:cursor' {:offset new-off :ino active-ino}
+         :lines (into tail-lines new-lines)})
+      (let [safe-off (if (< (count active-str) last-off) 0 last-off)
+            [lines new-off] (extract-lines active-str safe-off)]
+        {:cursor' {:offset new-off :ino active-ino}
+         :lines lines}))))
