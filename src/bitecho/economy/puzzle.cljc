@@ -420,18 +420,29 @@
                   :allocate
                   (let [target-v (:target-vault-id c)
                         amt (long (or (:amount c) (:value c) 0))]
-                    (if-not (and vault-mode? (string? target-v) (not (str/blank? target-v)) (pos? amt))
+                    (cond
+                      (not vault-mode?)
+                      {:valid? false :error :escrow-vault-condition-forbidden}
+
+                      (not (and (string? target-v) (not (str/blank? target-v)) (pos? amt)))
                       {:valid? false :error :invalid-puzzle-conditions}
+
+                      :else
                       (recur (rest rem) (conj out-conds {:type :allocate :target-vault-id target-v :amount amt}))))
 
                   :relock
                   (let [amt (long (or (:amount c) (:value c) 0))
                         next-ph (:next-puzzle-hash c)]
-                    (if-not (and vault-mode?
-                                 (not (neg? amt))
-                                 (string? next-ph)
-                                 (not (str/blank? next-ph)))
+                    (cond
+                      (not vault-mode?)
+                      {:valid? false :error :escrow-vault-condition-forbidden}
+
+                      (not (and (not (neg? amt))
+                                (string? next-ph)
+                                (not (str/blank? next-ph))))
                       {:valid? false :error :invalid-puzzle-conditions}
+
+                      :else
                       (recur (rest rem) (conj out-conds {:type :relock :amount amt :next-puzzle-hash (str/lower-case (str/trim next-ph))}))))
 
                   (:refund :refund-remainder)

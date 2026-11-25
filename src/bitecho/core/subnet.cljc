@@ -1074,24 +1074,37 @@
           true)))
     (catch #?(:clj Exception :cljs :default) _ false)))
 
+(defn- normalize-spki-hex
+  "Canonicalizes 64-char raw or 88-char SPKI DER Ed25519 hex to lowercase 88-char SPKI DER hex."
+  [s]
+  (when-let [h (normalize-hex s)]
+    (cond
+      (and (= 88 (count h)) (str/starts-with? h ed25519-spki-prefix-hex)) h
+      (= 64 (count h)) (str ed25519-spki-prefix-hex h)
+      :else h)))
+
 (defn sign-directory-pointer
-  "Wraps a directory attestation into a Canonical Fressian `Blob` + signed `Pointer` after verifying PoP."
+  "Wraps a directory attestation into a Canonical Fressian `Blob` + signed `Pointer` after verifying PoP.
+   Constructs a BIP-024/BIP-026 `:directory-entity` proof (`threshold = 1`, canonical 88-char SPKI)
+   that passes both `data/verify-pointer` and `subnet/verify-directory-pointer` (P5.3, B7)."
   [directory-privkey directory-pubkey pop-map {:keys [subnet issued-epoch expires-epoch mailbox] seq-num :seq}]
   (when (verify-directory-pop-payload pop-map)
-    (let [norm-dir (normalize-hex directory-pubkey)
+    (let [norm-dir (normalize-spki-hex directory-pubkey)
           domain (str/lower-case (str/trim (or (:domain pop-map) "bitecho.org")))
           nick (str/lower-case (str/trim (str (:nickname pop-map))))
           agent-pub (normalize-hex (:pubkey pop-map))
           hs (vec (sort (distinct (keep rendezvous/normalize-home-node (:home-set pop-map)))))
+          ep (long (or (:epoch pop-map) issued-epoch 0))
+          exp-ep (if (some? expires-epoch) (long expires-epoch) (+ ep 26280))
           desc (cond-> {:bitecho/type :directory-descriptor
                         :domain domain
                         :nickname nick
                         :uri (str domain "/" nick)
                         :pubkey agent-pub
                         :home-set hs
-                        :epoch (long (or (:epoch pop-map) issued-epoch 0))
+                        :epoch ep
                         :issued-epoch (long (or issued-epoch 0))
-                        :expires-epoch (long (or expires-epoch 0))
+                        :expires-epoch exp-ep
                         :pop-signature (:pop-signature pop-map)
                         :directory-pubkey norm-dir}
                  mailbox (assoc :mailbox mailbox)
@@ -1101,22 +1114,31 @@
           blob (data/make-blob (fressian/encode-canonical desc) "application/fressian")
           sub-id (str (or subnet "global"))
           path (str "dir/" nick)
+          seq-n (long (or seq-num 1))
+          dir-proof (data/create-directory-entity-proof
+                     [{:pubkey norm-dir :privkey directory-privkey}]
+                     sub-id path seq-n (:blob/cid blob) 1 [norm-dir])
           ptr (data/sign-pointer directory-privkey
                                  {:pointer/authority norm-dir
                                   :pointer/subnet sub-id
                                   :pointer/path path
-                                  :pointer/seq (long (or seq-num 1))
+                                  :pointer/seq seq-n
                                   :pointer/target (:blob/cid blob)
-                                  :pointer/proof {:proof/type :self}})]
+                                  :pointer/expires-epoch exp-ep
+                                  :pointer/proof dir-proof})]
       {:blob blob :pointer ptr :descriptor desc})))
 
 (defn verify-directory-pointer
   "Verifies a directory `Pointer` + target `Blob` (including agent PoP signature) against `trusted-directory-pubkey` and `current-epoch`."
   [pointer blob trusted-directory-pubkey current-epoch]
-  (let [norm-dir (normalize-hex trusted-directory-pubkey)
+  (let [norm-dir (normalize-spki-hex trusted-directory-pubkey)
         put-res (data/put-blob (data/init-blob-store) blob)
-        ctx {:subnet (:pointer/subnet pointer)
-             :path-acl [{:pattern "dir/*" :principal {:type :pubkey :pubkey norm-dir}}]}]
+        ctx (cond-> {:subnet (:pointer/subnet pointer)
+                     :path-acl [{:pattern "dir/*"
+                                 :principal {:type :directory-entity
+                                             :authority norm-dir
+                                             :owner-multisig {:threshold 1 :pubkeys [norm-dir]}}}]}
+              (integer? current-epoch) (assoc :current-epoch (long current-epoch)))]
     (cond
       (not (:ok? put-res))
       {:ok? false :error :blob-cid-mismatch}

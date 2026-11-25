@@ -117,14 +117,136 @@
     :vault-spend-dacs       (or (:vault-spend-dacs opts) {})
     :diagnostics            (or (:diagnostics opts) {})}))
 
+(defn vault-create-signing-tuple
+  "Returns the domain-separated Canonical Fressian tuple for `:vault-create` authorization (BIP-026 §1.1 P1.4, B1):
+   [\"bitecho-vault-create-v1\" network-uri network-genesis-cid vault-id entity-uri custody-bucket puzzle-hash payer balance created-epoch]."
+  [{:keys [network-uri network-genesis-cid vault-id entity-uri custody-bucket puzzle-hash payer balance created-epoch]}]
+  ["bitecho-vault-create-v1"
+   (str network-uri)
+   (str/lower-case (str network-genesis-cid))
+   (str vault-id)
+   (str entity-uri)
+   custody-bucket
+   (str/lower-case (str/trim (str puzzle-hash)))
+   (when payer (or (circle/normalize-spki-pubkey payer) (str payer)))
+   (long (or balance 0))
+   (long (or created-epoch 0))])
+
+(defn dac-issue-signing-tuple
+  "Domain-separated Canonical Fressian tuple for `:vault-spend-dac-issue` authorization (BIP-026 B1)."
+  [{:keys [network-uri network-genesis-cid dac-id vault-id holder-pubkey max-per-epoch-bps issued-epoch expires-epoch]}]
+  ["bitecho-vault-dac-issue-v1"
+   (str network-uri)
+   (str/lower-case (str network-genesis-cid))
+   (str dac-id)
+   (str vault-id)
+   (or (circle/normalize-spki-pubkey holder-pubkey) (str holder-pubkey))
+   (long (or max-per-epoch-bps default-max-dac-spend-per-epoch-bps))
+   (long (or issued-epoch 0))
+   (long (or expires-epoch 0))])
+
+(defn dac-revoke-signing-tuple
+  "Domain-separated Canonical Fressian tuple for `:vault-spend-dac-revoke` authorization (BIP-026 B1)."
+  [{:keys [network-uri network-genesis-cid dac-id vault-id]}]
+  ["bitecho-vault-dac-revoke-v1"
+   (str network-uri)
+   (str/lower-case (str network-genesis-cid))
+   (str dac-id)
+   (str vault-id)])
+
+(defn dac-spend-signing-tuple
+  "Domain-separated Canonical Fressian tuple for `:vault-spend-dac-spend` authorization (BIP-026 B1)."
+  [{:keys [network-uri network-genesis-cid dac-id vault-id receiver amount epoch]}]
+  ["bitecho-vault-dac-spend-v1"
+   (str network-uri)
+   (str/lower-case (str network-genesis-cid))
+   (str dac-id)
+   (str vault-id)
+   (or (circle/normalize-spki-pubkey receiver) (str receiver))
+   (long (or amount 0))
+   (long (or epoch 0))])
+
+(defn- count-valid-multisig-sigs
+  [sigs allowed-pubkeys tuple twin-set]
+  (let [allowed-set (set (circle/dedup-spki-pubkeys allowed-pubkeys))
+        valid (keep (fn [[pk sig]]
+                      (let [spki (circle/normalize-spki-pubkey pk)]
+                        (when (and spki
+                                   (contains? allowed-set spki)
+                                   (not (circle/advisory-twin? twin-set spki))
+                                   (string? sig)
+                                   (crypto/verify-with-fallback spki tuple sig))
+                          spki)))
+                    (or sigs {}))]
+    (count (distinct valid))))
+
+(defn- vault-authority-multisig
+  "Resolves the authorizing `:owner-multisig` for a vault (vault-level, entity-descriptor, or root-owner-multisig)."
+  [state v]
+  (or (:owner-multisig v)
+      (when-let [euri (:entity-uri v)]
+        (or (get-in state [:entity-descriptors euri :owner-multisig])
+            (let [net-prefix (str (:network-uri state) "/")]
+              (when (str/starts-with? (str euri) net-prefix)
+                (get-in state [:entity-descriptors (subs (str euri) (count net-prefix)) :owner-multisig])))))
+      (:root-owner-multisig state)
+      (get-in state [:config :root-owner-multisig])))
+
+(defn- authorized-vault-action?
+  "Verifies authority over a vault action via multisig signatures or authorized single-signer Ed25519 signature."
+  [state v tuple {:keys [owner-signatures root-signatures signatures signer-pubkey issuer-pubkey revoker-pubkey signature]}]
+  (let [twin-set (or (:advisory-twin-pubkeys state) #{})
+        ms (vault-authority-multisig state v)
+        sig-map (or owner-signatures root-signatures signatures)
+        single-pk (circle/normalize-spki-pubkey (or signer-pubkey issuer-pubkey revoker-pubkey))
+        vault-payer (circle/normalize-spki-pubkey (:payer v))]
+    (cond
+      (and (map? ms) (seq (:pubkeys ms)) (map? sig-map))
+      (let [th (long (or (:threshold ms) 1))]
+        (and (>= th 1)
+             (>= (count-valid-multisig-sigs sig-map (:pubkeys ms) tuple twin-set) th)))
+
+      (and single-pk (string? signature) (not (circle/advisory-twin? twin-set single-pk)))
+      (let [allowed? (or (and vault-payer (= single-pk vault-payer))
+                         (and (map? ms)
+                              (= 1 (long (or (:threshold ms) 1)))
+                              (contains? (set (circle/dedup-spki-pubkeys (:pubkeys ms))) single-pk)))]
+        (boolean (and allowed? (crypto/verify-with-fallback single-pk tuple signature))))
+
+      :else false)))
+
+(defn- lookup-ledger-key
+  [ledger raw-pk norm-pk]
+  (cond
+    (and norm-pk (contains? ledger norm-pk)) norm-pk
+    (and raw-pk (contains? ledger raw-pk)) raw-pk
+    :else nil))
+
 (defn create-vault
   "Creates a new persistent vault in dedicated `[:vaults vault-id]` state map.
-   Enforces `:max-vaults` cap and `:min-vault-balance-ech` dust floor."
-  [state {:keys [vault-id entity-uri custody-bucket puzzle-hash balance created-epoch]}]
+   Enforces `:max-vaults` cap, `:min-vault-balance-ech` dust floor, cryptographic Ed25519 / Root
+   multisig authorization, and atomic funding debit from `[:ledger payer]` or `:root-unallocated`
+   (BIP-026 §1.1 P1.4, B1)."
+  [state {:keys [vault-id entity-uri custody-bucket puzzle-hash balance created-epoch
+                 payer signature funding-source root-signatures signatures owner-signatures]}]
   (let [bal (long (or balance 0))
         max-v (long (or (:max-vaults state) default-max-vaults))
         min-bal (long (or (:min-vault-balance-ech state) default-min-vault-balance-ech))
-        active-count (count (filter #(= :active (:status (val %))) (:vaults state)))]
+        active-count (count (filter #(= :active (:status (val %))) (:vaults state)))
+        twin-set (or (:advisory-twin-pubkeys state) #{})
+        norm-payer (circle/normalize-spki-pubkey payer)
+        root-funding? (or (= :root-unallocated funding-source)
+                          (and (nil? payer) (or (seq root-signatures) (seq signatures) (seq owner-signatures))))
+        tuple (vault-create-signing-tuple
+               {:network-uri (or (:network-uri state) (get-in state [:config :network-uri]) "")
+                :network-genesis-cid (or (:network-genesis-cid state) (get-in state [:config :network-genesis-cid]) "")
+                :vault-id vault-id
+                :entity-uri entity-uri
+                :custody-bucket custody-bucket
+                :puzzle-hash puzzle-hash
+                :payer (if root-funding? nil (or norm-payer payer))
+                :balance bal
+                :created-epoch created-epoch})]
     (cond
       (or (not (string? vault-id)) (str/blank? vault-id))
       (diag-fail state :invalid-vault-id)
@@ -144,19 +266,69 @@
       (not (contains? circle/valid-custody-buckets custody-bucket))
       (diag-fail state :invalid-custody-bucket)
 
+      root-funding?
+      (let [root-ms (or (:root-owner-multisig state) (get-in state [:config :root-owner-multisig]))
+            sigs (or root-signatures signatures owner-signatures)
+            th (long (or (:threshold root-ms) 1))
+            valid-cnt (if (and (map? root-ms) (seq (:pubkeys root-ms)))
+                        (count-valid-multisig-sigs sigs (:pubkeys root-ms) tuple twin-set)
+                        0)
+            unalloc (long (or (:root-unallocated state) 0))]
+        (cond
+          (or (not (map? root-ms)) (< th 1) (< valid-cnt th))
+          (diag-fail state :unauthorized-vault-create {:vault-id vault-id})
+
+          (< unalloc bal)
+          (diag-fail state :insufficient-funds {:vault-id vault-id :available unalloc :required bal})
+
+          :else
+          (let [entry (cond-> {:vault-id vault-id
+                               :entity-uri (str entity-uri)
+                               :custody-bucket custody-bucket
+                               :puzzle-hash (str/lower-case (str/trim puzzle-hash))
+                               :balance bal
+                               :vault-seq 1
+                               :created-epoch (long (or created-epoch 0))
+                               :status :active}
+                        (map? root-ms) (assoc :owner-multisig root-ms))]
+            {:ok? true
+             :vault entry
+             :state (-> state
+                        (update :root-unallocated (fnil - 0) bal)
+                        (assoc-in [:vaults vault-id] entry))
+             :effects []})))
+
       :else
-      (let [entry {:vault-id vault-id
-                   :entity-uri (str entity-uri)
-                   :custody-bucket custody-bucket
-                   :puzzle-hash (str/lower-case (str/trim puzzle-hash))
-                   :balance bal
-                   :vault-seq 1
-                   :created-epoch (long (or created-epoch 0))
-                   :status :active}]
-        {:ok? true
-         :vault entry
-         :state (assoc-in state [:vaults vault-id] entry)
-         :effects []}))))
+      (let [sig-ok? (and norm-payer
+                         (not (circle/advisory-twin? twin-set norm-payer))
+                         (string? signature)
+                         (not (str/blank? signature))
+                         (crypto/verify-with-fallback norm-payer tuple signature))
+            ledger-k (lookup-ledger-key (:ledger state) payer norm-payer)
+            payer-bal (if ledger-k (long (or (get-in state [:ledger ledger-k :balance]) 0)) 0)]
+        (cond
+          (not sig-ok?)
+          (diag-fail state :unauthorized-vault-create {:vault-id vault-id})
+
+          (or (nil? ledger-k) (< payer-bal bal))
+          (diag-fail state :insufficient-funds {:vault-id vault-id :payer norm-payer :available payer-bal :required bal})
+
+          :else
+          (let [entry {:vault-id vault-id
+                       :entity-uri (str entity-uri)
+                       :custody-bucket custody-bucket
+                       :puzzle-hash (str/lower-case (str/trim puzzle-hash))
+                       :payer norm-payer
+                       :balance bal
+                       :vault-seq 1
+                       :created-epoch (long (or created-epoch 0))
+                       :status :active}]
+            {:ok? true
+             :vault entry
+             :state (-> state
+                        (update-in [:ledger ledger-k :balance] - bal)
+                        (assoc-in [:vaults vault-id] entry))
+             :effects []}))))))
 
 (defn reject-vault-refund
   "BIP-024 §2.8.2 (MUT-10): `:refund-intent` is unconditionally forbidden on persistent vaults."
@@ -222,6 +394,13 @@
                 releases (filter #(= :release (:type %)) conds)
                 relock-amt (reduce + 0 (map (comp long :amount) relocks))
                 next-puzzle-hash (or (:next-puzzle-hash (first relocks)) (:puzzle-hash v))
+                alloc-custody-mismatch? (some (fn [a]
+                                                (let [tid (:target-vault-id a)
+                                                      tv (get-in state [:vaults tid])]
+                                                  (and (some? tv)
+                                                       (some? (:custody-bucket v))
+                                                       (not= (:custody-bucket v) (:custody-bucket tv)))))
+                                              allocs)
                 alloc-valid? (every? (fn [a]
                                        (let [tid (:target-vault-id a)
                                              tv (get-in state [:vaults tid])]
@@ -229,7 +408,8 @@
                                               (some? (:custody-bucket v))
                                               (contains? chartered tid)
                                               (some? tv)
-                                              (= :active (:status tv)))))
+                                              (= :active (:status tv))
+                                              (= (:custody-bucket v) (:custody-bucket tv)))))
                                      allocs)]
             (cond
               (> (count relocks) 1)
@@ -238,30 +418,33 @@
               (and (pos? relock-amt) (< relock-amt min-bal))
               (diag-fail state :vault-relock-below-min-balance {:vault-id vault-id :relock-amount relock-amt :min-balance min-bal})
 
+              (and (seq allocs) alloc-custody-mismatch?)
+              (diag-fail state :custody-bucket-mismatch {:vault-id vault-id :custody-bucket (:custody-bucket v)})
+
               (and (seq allocs) (not alloc-valid?))
               (diag-fail state :unauthorized-zero-take-allocate {:vault-id vault-id})
 
               :else
-              (let [;; Apply commercial :release outputs (always paying non-waivable settlement-take-bps)
-                    rel-applied (reduce (fn [acc r]
-                                          (let [amt (long (:amount r))
-                                                take-amt (escrow/calculate-escrow-settlement-take amt take-bps)
-                                                net-amt (- amt take-amt)
-                                                rec (or (circle/normalize-spki-pubkey (:receiver r)) (:receiver r))]
-                                            (-> acc
-                                                (update-in [:ledger rec :balance] (fnil + 0) net-amt)
-                                                (update :total-burned (fnil + 0) take-amt))))
-                                        state
-                                        releases)
-                    ;; Apply chartered 0-take :allocate outputs preserving :custody-bucket
+              (let [;; Apply commercial :release outputs using Hamilton largest-remainder apportionment (B5)
+                    ;; Custody vault burns go to :total-burned ONLY, NEVER :epoch-settlement-takes (B2)
+                    apportioned (escrow/apportion-settlement-take releases take-bps)
+                    total-take (reduce + 0 (map :take apportioned))
+                    custody-vault? (some? (:custody-bucket v))
+                    ep (long (or epoch 0))
+                    rel-applied (-> (reduce (fn [acc r]
+                                              (let [net-amt (long (:net r))
+                                                    rec (or (circle/normalize-spki-pubkey (:receiver r)) (:receiver r))]
+                                                (update-in acc [:ledger rec :balance] (fnil + 0) net-amt)))
+                                            state
+                                            apportioned)
+                                    (update :total-burned (fnil + 0) total-take)
+                                    (cond-> (and (not custody-vault?) (pos? total-take))
+                                      (update-in [:epoch-settlement-takes ep] (fnil + 0) total-take)))
+                    ;; Apply chartered 0-take :allocate outputs preserving exact :custody-bucket
                     alloc-applied (reduce (fn [acc a]
                                             (let [tid (:target-vault-id a)
                                                   amt (long (:amount a))]
-                                              (-> acc
-                                                  (update-in [:vaults tid :balance] (fnil + 0) amt)
-                                                  (assoc-in [:vaults tid :custody-bucket]
-                                                            (or (get-in acc [:vaults tid :custody-bucket])
-                                                                (:custody-bucket v))))))
+                                              (update-in acc [:vaults tid :balance] (fnil + 0) amt)))
                                           rel-applied
                                           allocs)
                     rotated? (not= next-puzzle-hash (:puzzle-hash v))
@@ -280,16 +463,30 @@
                  :effects []}))))))))
 
 (defn issue-vault-spend-dac
-  "Issues a dedicated `:vault-spend-dac` bounded by `:max-per-epoch-bps` (default 500 bps)."
-  [state {:keys [dac-id vault-id holder-pubkey max-per-epoch-bps issued-epoch expires-epoch]}]
+  "Issues a dedicated `:vault-spend-dac` bounded by `:max-per-epoch-bps` (default 500 bps).
+   Requires valid cryptographic authorization from the vault's owner/Root authority (BIP-026 B1)."
+  [state {:keys [dac-id vault-id holder-pubkey max-per-epoch-bps issued-epoch expires-epoch] :as params}]
   (let [v (get-in state [:vaults vault-id])
         bps (long (or max-per-epoch-bps default-max-dac-spend-per-epoch-bps))
-        norm-holder (circle/normalize-spki-pubkey holder-pubkey)]
+        norm-holder (circle/normalize-spki-pubkey holder-pubkey)
+        twin-set (or (:advisory-twin-pubkeys state) #{})
+        tuple (dac-issue-signing-tuple
+               {:network-uri (or (:network-uri state) (get-in state [:config :network-uri]) "")
+                :network-genesis-cid (or (:network-genesis-cid state) (get-in state [:config :network-genesis-cid]) "")
+                :dac-id dac-id
+                :vault-id vault-id
+                :holder-pubkey norm-holder
+                :max-per-epoch-bps bps
+                :issued-epoch issued-epoch
+                :expires-epoch expires-epoch})]
     (cond
       (nil? v) (diag-fail state :vault-not-found {:vault-id vault-id})
       (not= :active (:status v)) (diag-fail state :vault-not-active {:vault-id vault-id})
       (nil? norm-holder) (diag-fail state :invalid-dac-holder-pubkey)
+      (circle/advisory-twin? twin-set norm-holder) (diag-fail state :advisory-twin-signing-forbidden {:pubkey norm-holder})
       (or (<= bps 0) (> bps 10000)) (diag-fail state :invalid-dac-bps)
+      (not (authorized-vault-action? state v tuple params))
+      (diag-fail state :unauthorized-dac-issue {:dac-id dac-id :vault-id vault-id})
       :else
       (let [dac {:dac-id dac-id
                  :vault-id vault-id
@@ -305,28 +502,64 @@
          :effects []}))))
 
 (defn revoke-vault-spend-dac
-  "Atomically revokes a `:vault-spend-dac`."
-  [state dac-id]
-  (if-not (contains? (:vault-spend-dacs state) dac-id)
-    (diag-fail state :vault-dac-not-found {:dac-id dac-id})
-    {:ok? true
-     :state (assoc-in state [:vault-spend-dacs dac-id :revoked?] true)
-     :effects []}))
+  "Atomically revokes a `:vault-spend-dac`.
+   Requires valid cryptographic authorization from the vault's owner/Root authority (BIP-026 B1)."
+  ([state dac-id-or-params]
+   (if (map? dac-id-or-params)
+     (let [dac-id (:dac-id dac-id-or-params)
+           dac (get-in state [:vault-spend-dacs dac-id])
+           v (when dac (get-in state [:vaults (:vault-id dac)]))]
+       (cond
+         (nil? dac) (diag-fail state :vault-dac-not-found {:dac-id dac-id})
+         (nil? v) (diag-fail state :vault-not-found {:vault-id (:vault-id dac)})
+         :else
+         (let [tuple (dac-revoke-signing-tuple
+                      {:network-uri (or (:network-uri state) (get-in state [:config :network-uri]) "")
+                       :network-genesis-cid (or (:network-genesis-cid state) (get-in state [:config :network-genesis-cid]) "")
+                       :dac-id dac-id
+                       :vault-id (:vault-id dac)})]
+           (if-not (authorized-vault-action? state v tuple dac-id-or-params)
+             (diag-fail state :unauthorized-dac-revoke {:dac-id dac-id :vault-id (:vault-id dac)})
+             {:ok? true
+              :state (assoc-in state [:vault-spend-dacs dac-id :revoked?] true)
+              :effects []}))))
+     (diag-fail state :unauthorized-dac-revoke {:dac-id dac-id-or-params})))
+  ([state dac-id auth-opts]
+   (revoke-vault-spend-dac state (assoc (or auth-opts {}) :dac-id dac-id))))
 
 (defn spend-via-vault-dac
-  "Debits a vault via a non-revoked, non-expired `:vault-spend-dac` within its per-epoch bps cap."
-  [state {:keys [dac-id receiver amount epoch]}]
+  "Debits a vault via a non-revoked, non-expired `:vault-spend-dac` within its per-epoch bps cap.
+   Requires valid Ed25519 signature from the delegated `:holder-pubkey` (BIP-026 B1) and
+   isolates custody vault burns from `:epoch-settlement-takes` (BIP-026 B2)."
+  [state {:keys [dac-id receiver amount epoch signature]}]
   (let [dac (get-in state [:vault-spend-dacs dac-id])
         v (when dac (get-in state [:vaults (:vault-id dac)]))
         ep (long (or epoch 0))
         amt (long (or amount 0))
-        take-bps (long (or (:settlement-take-bps state) default-settlement-take-bps))]
+        take-bps (long (or (:settlement-take-bps state) default-settlement-take-bps))
+        twin-set (or (:advisory-twin-pubkeys state) #{})
+        holder-pk (:holder-pubkey dac)
+        tuple (when dac
+                (dac-spend-signing-tuple
+                 {:network-uri (or (:network-uri state) (get-in state [:config :network-uri]) "")
+                  :network-genesis-cid (or (:network-genesis-cid state) (get-in state [:config :network-genesis-cid]) "")
+                  :dac-id dac-id
+                  :vault-id (:vault-id dac)
+                  :receiver receiver
+                  :amount amt
+                  :epoch ep}))]
     (cond
       (nil? dac) (diag-fail state :vault-dac-not-found {:dac-id dac-id})
       (:revoked? dac) (diag-fail state :vault-dac-revoked {:dac-id dac-id})
       (>= ep (long (:expires-epoch dac))) (diag-fail state :vault-dac-expired {:dac-id dac-id})
       (or (nil? v) (not= :active (:status v))) (diag-fail state :vault-not-active {:vault-id (:vault-id dac)})
       (<= amt 0) (diag-fail state :invalid-dac-spend-amount)
+      (or (nil? holder-pk)
+          (circle/advisory-twin? twin-set holder-pk)
+          (not (string? signature))
+          (str/blank? signature)
+          (not (crypto/verify-with-fallback holder-pk tuple signature)))
+      (diag-fail state :unauthorized-dac-spend {:dac-id dac-id :vault-id (:vault-id dac)})
       :else
       (let [already-spent (long (get-in dac [:epoch-spent ep] 0))
             epoch-start-bal (+ (long (:balance v)) already-spent)
@@ -342,18 +575,23 @@
           (let [take-amt (escrow/calculate-escrow-settlement-take amt take-bps)
                 net-amt (- amt take-amt)
                 rec (or (circle/normalize-spki-pubkey receiver) receiver)
+                custody-vault? (some? (:custody-bucket v))
                 st' (-> state
                         (update-in [:vaults (:vault-id dac) :balance] - amt)
                         (update-in [:vault-spend-dacs dac-id :epoch-spent ep] (fnil + 0) amt)
                         (update-in [:ledger rec :balance] (fnil + 0) net-amt)
-                        (update :total-burned (fnil + 0) take-amt))]
+                        (update :total-burned (fnil + 0) take-amt)
+                        (cond-> (and (not custody-vault?) (pos? take-amt))
+                          (update-in [:epoch-settlement-takes ep] (fnil + 0) take-amt)))]
             {:ok? true :state st' :net-amount net-amt :take-amount take-amt :effects []}))))))
 
 (defn apply-bootstrap-sunset
   "At `current-epoch >= bootstrap-sunset-epoch` (default 26,280), burns strictly unspent
    `:custody-bucket :bootstrap` vault balances into `:sunset-custody-burned` (preserving `INV-C1`)."
   [state current-epoch]
-  (let [sunset-ep (long (or (:bootstrap-sunset-epoch state) default-bootstrap-sunset-epoch))]
+  (let [sunset-ep (long (or (:bootstrap-sunset-epoch state)
+                            (get-in state [:config :bootstrap-sunset-epoch])
+                            default-bootstrap-sunset-epoch))]
     (if (< (long current-epoch) sunset-ep)
       {:ok? true :burned 0 :state state :effects []}
       (let [[vaults' burned]
@@ -382,7 +620,10 @@
   (let [sum-bal (fn [m] (reduce + 0 (map (fn [[_ v]] (long (or (:balance v) (:amount v) 0))) (or m {}))))
         liquid (sum-bal (:ledger state))
         escrows (reduce + 0 (keep (fn [[_ e]] (when (= :locked (:status e)) (long (or (:amount e) 0)))) (or (:escrows state) {})))
-        bounties (reduce + 0 (keep (fn [[_ b]] (when (= :open (:status b)) (long (or (:reward-amount b) (:amount b) 0)))) (or (:bounty-escrows state) {})))
+        bounties (reduce + 0 (keep (fn [[_ b]]
+                                     (when (#{:open :locked} (:status b))
+                                       (long (or (:gross-amount b) (:reward-amount b) (:amount b) 0))))
+                                   (or (:bounty-escrows state) {})))
         vaults (sum-bal (:vaults state))
         unalloc (long (or (:root-unallocated state) 0))
         burned (long (or (:total-burned state) 0))

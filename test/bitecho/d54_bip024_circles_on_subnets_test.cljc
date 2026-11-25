@@ -209,25 +209,41 @@
                       pubkeys [(:spki-hex k1) (:spki-hex k2) (:spki-hex k3)]
                       puzzle-src (vault/canonical-multisig-treasury-puzzle-source 2 pubkeys)
                       p-hash (puzzle/puzzle-cid puzzle-src)
-                      st0 (vault/init-vaults-state {:network-uri "devnet.bitecho.org"
-                                                    :network-genesis-cid test-genesis-cid
-                                                    :genesis-custody-supply (+ initial-bal 1000000)
-                                                    :root-unallocated 1000000
-                                                    :chartered-vaults #{"vault:devnet.bitecho.org/root"
-                                                                        "vault:devnet.bitecho.org/root/protocol"}})
-                      c-root (vault/create-vault st0 {:vault-id "vault:devnet.bitecho.org/root"
-                                                      :entity-uri "devnet.bitecho.org/root"
-                                                      :custody-bucket :bootstrap
-                                                      :puzzle-hash p-hash
-                                                      :balance initial-bal
-                                                      :created-epoch 10})
-                      c-child (vault/create-vault (:state c-root) {:vault-id "vault:devnet.bitecho.org/root/protocol"
-                                                                   :entity-uri "devnet.bitecho.org/root/protocol"
-                                                                   :custody-bucket :bootstrap
-                                                                   :puzzle-hash p-hash
-                                                                   :balance 2000
-                                                                   :created-epoch 10})
-                      st1 (update (:state c-child) :genesis-custody-supply + 2000)
+                      root-ms {:threshold 2 :pubkeys [(:spki-hex k1) (:spki-hex k2) (:spki-hex k3)]}
+                      sign-root (fn [tuple]
+                                  {(:spki-hex k1) (basalt/bytes->hex (crypto/sign-canonical (:private k1) tuple))
+                                   (:spki-hex k2) (basalt/bytes->hex (crypto/sign-canonical (:private k2) tuple))})
+                      st0 (assoc (vault/init-vaults-state {:network-uri "devnet.bitecho.org"
+                                                           :network-genesis-cid test-genesis-cid
+                                                           :genesis-custody-supply (+ initial-bal 1002000)
+                                                           :root-unallocated (+ initial-bal 1002000)
+                                                           :chartered-vaults #{"vault:devnet.bitecho.org/root"
+                                                                               "vault:devnet.bitecho.org/root/protocol"}})
+                                 :root-owner-multisig root-ms)
+                      c-root-p {:vault-id "vault:devnet.bitecho.org/root"
+                                :entity-uri "devnet.bitecho.org/root"
+                                :custody-bucket :bootstrap
+                                :puzzle-hash p-hash
+                                :balance initial-bal
+                                :created-epoch 10
+                                :funding-source :root-unallocated}
+                      c-root (vault/create-vault st0 (assoc c-root-p
+                                                            :root-signatures
+                                                            (sign-root (vault/vault-create-signing-tuple
+                                                                        (assoc c-root-p :network-uri "devnet.bitecho.org" :network-genesis-cid test-genesis-cid)))))
+                      c-child-p {:vault-id "vault:devnet.bitecho.org/root/protocol"
+                                 :entity-uri "devnet.bitecho.org/root/protocol"
+                                 :custody-bucket :bootstrap
+                                 :puzzle-hash p-hash
+                                 :balance 2000
+                                 :created-epoch 10
+                                 :funding-source :root-unallocated}
+                      c-child (vault/create-vault (:state c-root)
+                                                  (assoc c-child-p
+                                                         :root-signatures
+                                                         (sign-root (vault/vault-create-signing-tuple
+                                                                     (assoc c-child-p :network-uri "devnet.bitecho.org" :network-genesis-cid test-genesis-cid)))))
+                      st1 (:state c-child)
                       relock-amt (- initial-bal release-amt alloc-amt)
                       outputs [{:type :release :receiver (:spki-hex recv-kp) :amount release-amt}
                                {:type :allocate :target-vault-id "vault:devnet.bitecho.org/root/protocol" :amount alloc-amt}
@@ -303,30 +319,46 @@
           pubkeys [(:spki-hex k1) (:spki-hex k2)]
           p-src (vault/canonical-multisig-treasury-puzzle-source 2 pubkeys)
           p-hash (puzzle/puzzle-cid p-src)
-          st0 (vault/init-vaults-state {:network-uri "devnet.bitecho.org"
-                                        :network-genesis-cid test-genesis-cid
-                                        :max-vaults 2
-                                        :min-vault-balance-ech 1000
-                                        :genesis-custody-supply 100000
-                                        :chartered-vaults #{"vault:root"}})
+          root-ms {:threshold 2 :pubkeys pubkeys}
+          sign-root (fn [tuple]
+                      {(:spki-hex k1) (basalt/bytes->hex (crypto/sign-canonical (:private k1) tuple))
+                       (:spki-hex k2) (basalt/bytes->hex (crypto/sign-canonical (:private k2) tuple))})
+          st0 (assoc (vault/init-vaults-state {:network-uri "devnet.bitecho.org"
+                                               :network-genesis-cid test-genesis-cid
+                                               :max-vaults 2
+                                               :min-vault-balance-ech 1000
+                                               :genesis-custody-supply 100000
+                                               :root-unallocated 100000
+                                               :chartered-vaults #{"vault:root"}})
+                     :root-owner-multisig root-ms)
           ;; Dust floor rejected
           dust-res (vault/create-vault st0 {:vault-id "vault:dust"
                                             :entity-uri "devnet.bitecho.org/id/x"
                                             :puzzle-hash p-hash
                                             :balance 500
                                             :created-epoch 1})
-          c1 (vault/create-vault st0 {:vault-id "vault:root"
-                                      :entity-uri "devnet.bitecho.org/root"
-                                      :custody-bucket :bootstrap
-                                      :puzzle-hash p-hash
-                                      :balance 50000
-                                      :created-epoch 1})
-          c2 (vault/create-vault (:state c1) {:vault-id "vault:leaf"
-                                              :entity-uri "devnet.bitecho.org/id/leaf"
-                                              :custody-bucket nil
-                                              :puzzle-hash p-hash
-                                              :balance 50000
-                                              :created-epoch 1})
+          c1-p {:vault-id "vault:root"
+                :entity-uri "devnet.bitecho.org/root"
+                :custody-bucket :bootstrap
+                :puzzle-hash p-hash
+                :balance 50000
+                :created-epoch 1
+                :funding-source :root-unallocated}
+          c1 (vault/create-vault st0 (assoc c1-p
+                                            :root-signatures
+                                            (sign-root (vault/vault-create-signing-tuple
+                                                        (assoc c1-p :network-uri "devnet.bitecho.org" :network-genesis-cid test-genesis-cid)))))
+          c2-p {:vault-id "vault:leaf"
+                :entity-uri "devnet.bitecho.org/id/leaf"
+                :custody-bucket nil
+                :puzzle-hash p-hash
+                :balance 50000
+                :created-epoch 1
+                :funding-source :root-unallocated}
+          c2 (vault/create-vault (:state c1) (assoc c2-p
+                                                    :root-signatures
+                                                    (sign-root (vault/vault-create-signing-tuple
+                                                                (assoc c2-p :network-uri "devnet.bitecho.org" :network-genesis-cid test-genesis-cid)))))
           ;; Max vaults cap exceeded
           c3 (vault/create-vault (:state c2) {:vault-id "vault:overflow"
                                               :entity-uri "devnet.bitecho.org/id/over"
@@ -334,32 +366,54 @@
                                               :balance 5000
                                               :created-epoch 1})
           ;; Issue :vault-spend-dac capped at 500 bps (5% of 50000 = 2500)
+          dac-p {:dac-id "vdac-1"
+                 :vault-id "vault:root"
+                 :holder-pubkey (:spki-hex holder)
+                 :max-per-epoch-bps 500
+                 :issued-epoch 10
+                 :expires-epoch 100}
           dac-res (vault/issue-vault-spend-dac (:state c2)
-                                               {:dac-id "vdac-1"
-                                                :vault-id "vault:root"
-                                                :holder-pubkey (:spki-hex holder)
-                                                :max-per-epoch-bps 500
-                                                :issued-epoch 10
-                                                :expires-epoch 100})
+                                               (assoc dac-p
+                                                      :root-signatures
+                                                      (sign-root (vault/dac-issue-signing-tuple
+                                                                  (assoc dac-p :network-uri "devnet.bitecho.org" :network-genesis-cid test-genesis-cid)))))
+          sign-dac-spend (fn [amt ep]
+                           (basalt/bytes->hex
+                            (crypto/sign-canonical
+                             (:private holder)
+                             (vault/dac-spend-signing-tuple {:network-uri "devnet.bitecho.org"
+                                                             :network-genesis-cid test-genesis-cid
+                                                             :dac-id "vdac-1"
+                                                             :vault-id "vault:root"
+                                                             :receiver (:spki-hex recv)
+                                                             :amount amt
+                                                             :epoch ep}))))
           ;; Spend within 500 bps succeeds
           dac-spend-ok (vault/spend-via-vault-dac (:state dac-res)
                                                   {:dac-id "vdac-1"
                                                    :receiver (:spki-hex recv)
                                                    :amount 2000
-                                                   :epoch 10})
+                                                   :epoch 10
+                                                   :signature (sign-dac-spend 2000 10)})
           ;; Exceeding 500 bps in same epoch fails closed
           dac-spend-over (vault/spend-via-vault-dac (:state dac-spend-ok)
                                                     {:dac-id "vdac-1"
                                                      :receiver (:spki-hex recv)
                                                      :amount 1000
-                                                     :epoch 10})
+                                                     :epoch 10
+                                                     :signature (sign-dac-spend 1000 10)})
           ;; Atomic revocation on explicit revoke
-          rev-res (vault/revoke-vault-spend-dac (:state dac-spend-ok) "vdac-1")
+          rev-sig (sign-root (vault/dac-revoke-signing-tuple {:network-uri "devnet.bitecho.org"
+                                                              :network-genesis-cid test-genesis-cid
+                                                              :dac-id "vdac-1"
+                                                              :vault-id "vault:root"}))
+          rev-res (vault/revoke-vault-spend-dac (:state dac-spend-ok) "vdac-1" {:root-signatures rev-sig})
           dac-spend-after-rev (vault/spend-via-vault-dac (:state rev-res)
                                                          {:dac-id "vdac-1"
                                                           :receiver (:spki-hex recv)
                                                           :amount 100
-                                                          :epoch 11})
+                                                          :epoch 11
+                                                          :signature (sign-dac-spend 100 11)})
           ;; Epoch 26,280 sunset burns ONLY :custody-bucket :bootstrap unspent balance
           sunset-res (vault/apply-bootstrap-sunset (:state rev-res) 26280)]
       (is (false? (:ok? dust-res)))
@@ -679,25 +733,28 @@
           ;; Sociocratic consent round: zero :paramount-objection, double-linked, bars advisory twins
           twin-reg (circle/register-advisory-twin #{} (:spki-hex twin))
           consent-ok (circle/verify-consent-round
-                      {:lead-link-pubkey (:spki-hex r1)
+                      {:proposal-cid test-consent-cid
+                       :lead-link-pubkey (:spki-hex r1)
                        :delegate-link-pubkey (:spki-hex p1)
-                       :ballots {(:spki-hex r1) :consent
-                                 (:spki-hex p1) :consent
-                                 (:spki-hex r2) :consent}
+                       :ballots {(:spki-hex r1) (circle/sign-consent-ballot (:private r1) (:spki-hex r1) test-consent-cid :consent)
+                                 (:spki-hex p1) (circle/sign-consent-ballot (:private p1) (:spki-hex p1) test-consent-cid :consent)
+                                 (:spki-hex r2) (circle/sign-consent-ballot (:private r2) (:spki-hex r2) test-consent-cid :consent)}
                        :quorum-size 2}
                       {:advisory-twin-pubkeys twin-reg})
           consent-blocked (circle/verify-consent-round
-                           {:lead-link-pubkey (:spki-hex r1)
+                           {:proposal-cid test-consent-cid
+                            :lead-link-pubkey (:spki-hex r1)
                             :delegate-link-pubkey (:spki-hex p1)
-                            :ballots {(:spki-hex r1) :consent
-                                      (:spki-hex p1) :paramount-objection}
+                            :ballots {(:spki-hex r1) (circle/sign-consent-ballot (:private r1) (:spki-hex r1) test-consent-cid :consent)
+                                      (:spki-hex p1) (circle/sign-consent-ballot (:private p1) (:spki-hex p1) test-consent-cid :paramount-objection)}
                             :quorum-size 2}
                            {:advisory-twin-pubkeys twin-reg})
           consent-twin-spoof (circle/verify-consent-round
-                              {:lead-link-pubkey (:spki-hex twin)
+                              {:proposal-cid test-consent-cid
+                               :lead-link-pubkey (:spki-hex twin)
                                :delegate-link-pubkey (:spki-hex p1)
-                               :ballots {(:spki-hex twin) :consent
-                                         (:spki-hex p1) :consent}
+                               :ballots {(:spki-hex twin) (circle/sign-consent-ballot (:private twin) (:spki-hex twin) test-consent-cid :consent)
+                                         (:spki-hex p1) (circle/sign-consent-ballot (:private p1) (:spki-hex p1) test-consent-cid :consent)}
                                :quorum-size 2}
                               {:advisory-twin-pubkeys twin-reg})
           ;; Two-mode privacy: :shared-encrypted leaks zero plaintext roster/home-set

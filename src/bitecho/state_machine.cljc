@@ -158,6 +158,7 @@
       :echo-vote-counts {} :ready-vote-counts {} :delivery-vote-counts {}
       :sieve-delivered-set #{} :local-ready-set #{} :delivered-set #{}
       :total-minted 0 :minted-epochs #{} :mint-dust 0 :epoch-mint-dust {}
+      :total-burned 0 :sunset-custody-burned 0
       :unclaimed-mint 0 :epoch-unclaimed-mint {}
       :frozen-epoch-messages {} :frozen-epoch-message-roles {}
       :settled-transcript-pairs #{} :epoch-participation {}
@@ -509,9 +510,13 @@
 (defn apply-epoch-treasury-boundary
   "Executes treasury epoch boundary calculations, applying demand-gated mint
    and custody drawdowns or sunset burns to the state.
-   Rejects epochs already in :minted-epochs or <= :last-pruned-mint-epoch (B-CARB-5)."
+   Executes `vault/apply-bootstrap-sunset` deterministically BEFORE the `:minted-epochs`
+   early-return (BIP-026 §1.1 P1.2, B3).
+   Rejects minting for epochs already in :minted-epochs or <= :last-pruned-mint-epoch (B-CARB-5)."
   [state new-epoch]
-  (let [minted-epochs (or (:minted-epochs state) #{})
+  (let [sunset-res (vault/apply-bootstrap-sunset state new-epoch)
+        state (if (:ok? sunset-res) (:state sunset-res) state)
+        minted-epochs (or (:minted-epochs state) #{})
         last-pruned (long (or (:last-pruned-mint-epoch state) -1))]
     (if (or (contains? minted-epochs new-epoch)
             (<= (long new-epoch) last-pruned))
@@ -530,9 +535,8 @@
                                    (assoc :skipped-custody-allocations
                                           (or (:skipped-allocations res) []))
                                    (assoc :sunset-custody-burned
-                                          (long (or (:sunset-custody-burned res)
-                                                    (:sunset-custody-burned state)
-                                                    0))))
+                                          (max (long (or (:sunset-custody-burned res) 0))
+                                               (long (or (:sunset-custody-burned state) 0)))))
             t-priv (or (:treasury-privkey state) (get-in state [:config :treasury-privkey]))
             t-pub (or (:treasury-pubkey state) (get-in state [:config :treasury-pubkey]))]
         (cond
@@ -1948,6 +1952,51 @@
                   (catch #?(:clj Exception :cljs :default) _
                     false)))))))))
 
+(defn- escrow-conditions-valid?
+  "Returns true iff every condition for a one-shot escrow is permitted:
+   forbids `:allocate` / `:relock` and blank/nil `:receiver` (BIP-026 §1.3 P3.2, B5)."
+  [conditions]
+  (every? (fn [c]
+            (and (not (#{:allocate :relock} (:type c)))
+                 (string? (:receiver c))
+                 (not (string/blank? (:receiver c)))))
+          conditions))
+
+(defn- apply-escrow-puzzle-conditions
+  "Applies verified puzzle conditions on a one-shot escrow using Hamilton largest-remainder
+   apportionment for `:release` outputs and 0-take for `:refund`/`:refund-remainder` (BIP-026 P3.1, P3.2)."
+  [ledger conditions configured-bps]
+  (if-not (escrow-conditions-valid? conditions)
+    {:ok? false :error :escrow-vault-condition-forbidden}
+    (let [releases (filter #(= :release (:type %)) conditions)
+          non-releases (remove #(= :release (:type %)) conditions)
+          apportioned (escrow/apportion-settlement-take releases configured-bps)
+          after-releases (reduce (fn [acc c]
+                                   (let [rec (:receiver c)
+                                         net-amt (long (:net c))
+                                         take-amt (long (:take c))
+                                         rec-acct (get-in (:ledger acc) [rec]
+                                                          (account/map->AccountState {:balance 0 :seq 0 :deps []}))
+                                         new-rec (assoc rec-acct :balance (+ (or (:balance rec-acct) 0) net-amt))]
+                                     (-> acc
+                                         (assoc-in [:ledger rec] new-rec)
+                                         (update :total-take + take-amt)
+                                         (update :total-net + net-amt))))
+                                 {:ledger ledger :total-take 0 :total-net 0}
+                                 apportioned)
+          after-all (reduce (fn [acc c]
+                              (let [rec (:receiver c)
+                                    amt (long (:amount c))
+                                    rec-acct (get-in (:ledger acc) [rec]
+                                                     (account/map->AccountState {:balance 0 :seq 0 :deps []}))
+                                    new-rec (assoc rec-acct :balance (+ (or (:balance rec-acct) 0) amt))]
+                                (-> acc
+                                    (assoc-in [:ledger rec] new-rec)
+                                    (update :total-net + amt))))
+                            after-releases
+                            non-releases)]
+      (assoc after-all :ok? true))))
+
 (defn execute-finalized-blocks
   "Executes finalized Streamlet blocks along the canonical chain in ascending order.
    Applies receipts, advances epoch vouchers, and executes treasury boundaries."
@@ -1970,7 +2019,7 @@
                                   st
                                   (range (inc last-exec) b-epoch))
                           st)
-             payload (:payload b)
+             payload (or (:payload b) (:receipts b))
              receipts (filter #(and (map? %) (:receipt-id %)) (when (sequential? payload) payload))
              st-applied (reduce
                          (fn [s r]
@@ -1998,6 +2047,7 @@
                                          (if-let [res (when (and sender-hex amt) (burn/deduct-signaling-burn (:ledger s) sender-hex amt))]
                                            (-> s
                                                (assoc :ledger (:ledger res))
+                                               (update :total-burned (fnil + 0) (:burn-amount res))
                                                (update-in [:epoch-burns closing-ep] (fnil + 0) (:burn-amount res)))
                                            (update s :failed-receipts-count (fnil inc 0))))
 
@@ -2010,19 +2060,20 @@
 
                                        :bounty-create
                                        (let [bounty-id (:bounty-id r)
-                                             m-pub (:maintainer-pubkey r)
+                                             m-pub (or (:maintainer-pubkey r) (:payer r))
                                              m-pub-hex (when m-pub (if (string? m-pub) m-pub (basalt/bytes->hex m-pub)))
                                              gross (long (or (:gross-amount r) (:amount r) 0))
                                              m-acct (when m-pub-hex (get-in s [:ledger m-pub-hex]))
                                              m-bal (long (or (:balance m-acct) 0))
                                              take-bps (long (or (:take-bps r) 50))
                                              builder-bps (long (or (:builder-bps r) 8450))
+                                             bps-valid? (and (>= take-bps 0) (>= builder-bps 0) (<= (+ take-bps builder-bps) 10000))
                                              proto-take (quot (* gross take-bps) 10000)
                                              b-net (quot (* gross builder-bps) 10000)
                                              a-net (- gross (+ proto-take b-net))
                                              existing (get-in s [:bounty-escrows bounty-id])]
                                          (if (and (string? bounty-id) (not (string/blank? bounty-id))
-                                                  m-pub-hex (pos? gross) m-acct (>= m-bal gross)
+                                                  m-pub-hex (pos? gross) bps-valid? m-acct (>= m-bal gross)
                                                   (nil? existing))
                                            (let [new-m (assoc m-acct :balance (- m-bal gross))
                                                  escrow-entry {:bounty-id bounty-id
@@ -2040,7 +2091,9 @@
                                              (-> s
                                                  (assoc-in [:ledger m-pub-hex] new-m)
                                                  (assoc-in [:bounty-escrows bounty-id] escrow-entry)))
-                                           (update s :failed-receipts-count (fnil inc 0))))
+                                           (-> s
+                                               (update :failed-receipts-count (fnil inc 0))
+                                               (update-in [:diagnostics :invalid-bounty-create] (fnil inc 0)))))
 
                                        :bounty-settle
                                        (let [bounty-id (:bounty-id r)
@@ -2074,6 +2127,7 @@
                                                  (assoc-in [:ledger builder-hex] new-b)
                                                  (assoc-in [:ledger auditor-hex] new-a)
                                                  (assoc-in [:bounty-escrows bounty-id] updated-escrow)
+                                                 (update :total-burned (fnil + 0) proto-take)
                                                  (update-in [:epoch-settlement-takes created-ep] (fnil + 0) proto-take)))
                                            (update s :failed-receipts-count (fnil inc 0))))
 
@@ -2101,6 +2155,7 @@
                                                                    receiver-hex new-receiver)]
                                              (-> s
                                                  (assoc :ledger new-ledger)
+                                                 (update :total-burned (fnil + 0) take-amt)
                                                  (update-in [:epoch-settlement-takes closing-ep] (fnil + 0) take-amt)))
                                            (update s :failed-receipts-count (fnil inc 0))))
 
@@ -2196,44 +2251,32 @@
                                              (if (or payer-auth? preimage-auth? puzzle-auth?)
                                                (if puzzle-auth?
                                                  (let [conditions (:conditions puzzle-res)
-                                                       settled-res (reduce
-                                                                    (fn [acc c]
-                                                                      (let [rec (:receiver c)
-                                                                            amt (long (:amount c))
-                                                                            is-release? (= :release (:type c))
-                                                                            take-amt (if is-release?
-                                                                                       (escrow/calculate-escrow-settlement-take amt configured-bps)
-                                                                                       0)
-                                                                            net-amt (- amt take-amt)
-                                                                            rec-acct (get-in (:ledger acc) [rec]
-                                                                                             (account/map->AccountState {:balance 0 :seq 0 :deps []}))
-                                                                            new-rec (assoc rec-acct :balance (+ (or (:balance rec-acct) 0) net-amt))]
-                                                                        (-> acc
-                                                                            (assoc-in [:ledger rec] new-rec)
-                                                                            (update :total-take + take-amt)
-                                                                            (update :total-net + net-amt))))
-                                                                    {:ledger (:ledger s) :total-take 0 :total-net 0}
-                                                                    conditions)
-                                                       total-take (:total-take settled-res)
-                                                       total-net (:total-net settled-res)
-                                                       updated-escrow (assoc escrow
-                                                                             :status :released
-                                                                             :settled-epoch closing-ep
-                                                                             :take-amount total-take
-                                                                             :net-amount total-net
-                                                                             :conditions conditions
-                                                                             :settlement-mode :puzzle-verified)
-                                                       max-tracked (long (or (get-in state [:config :max-tracked-receipts]) 10000))
-                                                       [next-settled-ids next-settled-ord] (fifo-track (:settled-escrow-ids s)
-                                                                                                       (:settled-escrow-order s)
-                                                                                                       escrow-id
-                                                                                                       max-tracked)]
-                                                   (-> s
-                                                       (assoc :ledger (:ledger settled-res))
-                                                       (assoc-in [:escrows escrow-id] updated-escrow)
-                                                       (assoc :settled-escrow-ids next-settled-ids
-                                                              :settled-escrow-order next-settled-ord)
-                                                       (update-in [:epoch-settlement-takes closing-ep] (fnil + 0) total-take)))
+                                                       settled-res (apply-escrow-puzzle-conditions (:ledger s) conditions configured-bps)]
+                                                   (if-not (:ok? settled-res)
+                                                     (-> s
+                                                         (update :failed-receipts-count (fnil inc 0))
+                                                         (update-in [:diagnostics (or (:error settled-res) :escrow-vault-condition-forbidden)] (fnil inc 0)))
+                                                     (let [total-take (:total-take settled-res)
+                                                           total-net (:total-net settled-res)
+                                                           updated-escrow (assoc escrow
+                                                                                 :status :released
+                                                                                 :settled-epoch closing-ep
+                                                                                 :take-amount total-take
+                                                                                 :net-amount total-net
+                                                                                 :conditions conditions
+                                                                                 :settlement-mode :puzzle-verified)
+                                                           max-tracked (long (or (get-in state [:config :max-tracked-receipts]) 10000))
+                                                           [next-settled-ids next-settled-ord] (fifo-track (:settled-escrow-ids s)
+                                                                                                           (:settled-escrow-order s)
+                                                                                                           escrow-id
+                                                                                                           max-tracked)]
+                                                       (-> s
+                                                           (assoc :ledger (:ledger settled-res))
+                                                           (assoc-in [:escrows escrow-id] updated-escrow)
+                                                           (assoc :settled-escrow-ids next-settled-ids
+                                                                  :settled-escrow-order next-settled-ord)
+                                                           (update :total-burned (fnil + 0) total-take)
+                                                           (update-in [:epoch-settlement-takes closing-ep] (fnil + 0) total-take)))))
                                                  (let [take-amt (escrow/calculate-escrow-settlement-take amount configured-bps)
                                                        net-amt (- amount take-amt)
                                                        receiver-acct (get-in s [:ledger receiver]
@@ -2254,8 +2297,11 @@
                                                        (assoc-in [:escrows escrow-id] updated-escrow)
                                                        (assoc :settled-escrow-ids next-settled-ids
                                                               :settled-escrow-order next-settled-ord)
+                                                       (update :total-burned (fnil + 0) take-amt)
                                                        (update-in [:epoch-settlement-takes closing-ep] (fnil + 0) take-amt))))
-                                               (update s :failed-receipts-count (fnil inc 0))))
+                                               (cond-> (update s :failed-receipts-count (fnil inc 0))
+                                                 (and puzzle-res (not (:valid? puzzle-res)))
+                                                 (update-in [:diagnostics (or (:error puzzle-res) :invalid-puzzle-conditions)] (fnil inc 0)))))
                                            (update s :failed-receipts-count (fnil inc 0))))
 
                                        :refund-intent
@@ -2428,7 +2474,7 @@
                                                (update :failed-receipts-count (fnil inc 0)))))
 
                                        :vault-spend-dac-revoke
-                                       (let [res (vault/revoke-vault-spend-dac s (:dac-id r))]
+                                       (let [res (vault/revoke-vault-spend-dac s r)]
                                          (if (:ok? res)
                                            (:state res)
                                            (-> (:state res)
@@ -2436,19 +2482,36 @@
 
                                        :register-entity-descriptor
                                        (let [desc (:descriptor r)
-                                             path (:path desc)
-                                             prev-desc (when path (get-in s [:entity-descriptors path]))
-                                             v-res (circle/verify-entity-descriptor
-                                                    desc
-                                                    {:network-uri (or (:network-uri s) (get-in s [:config :network-uri]) (get-in state [:config :network-uri]))
-                                                     :network-genesis-cid (or (:network-genesis-cid s) (get-in s [:config :network-genesis-cid]) (get-in state [:config :network-genesis-cid]))
-                                                     :prev-descriptor prev-desc
-                                                     :advisory-twin-pubkeys (or (:advisory-twin-pubkeys s) (:advisory-twin-pubkeys state))})]
-                                         (if (:ok? v-res)
-                                           (assoc-in s [:entity-descriptors path] (assoc desc :cid (:cid v-res)))
-                                           (-> s
-                                               (update :failed-receipts-count (fnil inc 0))
-                                               (update-in [:diagnostics (or (:error v-res) :invalid-entity-descriptor)] (fnil inc 0)))))
+                                             net-u (or (:network-uri s) (get-in s [:config :network-uri]) (get-in state [:config :network-uri]))
+                                             gen-c (or (:network-genesis-cid s) (get-in s [:config :network-genesis-cid]) (get-in state [:config :network-genesis-cid]))
+                                             twins (or (:advisory-twin-pubkeys s) (:advisory-twin-pubkeys state))]
+                                         (if (= :directory/encrypted-entity-envelope (:bitecho/type desc))
+                                           (let [b-path (:blinded-path desc)
+                                                 prev-desc (when b-path (get-in s [:entity-descriptors b-path]))
+                                                 v-res (circle/verify-encrypted-entity-envelope
+                                                        desc
+                                                        {:network-uri net-u
+                                                         :network-genesis-cid gen-c
+                                                         :prev-descriptor prev-desc
+                                                         :advisory-twin-pubkeys twins})]
+                                             (if (:ok? v-res)
+                                               (assoc-in s [:entity-descriptors b-path] (assoc desc :cid (:cid v-res)))
+                                               (-> s
+                                                   (update :failed-receipts-count (fnil inc 0))
+                                                   (update-in [:diagnostics (or (:error v-res) :invalid-encrypted-entity-envelope)] (fnil inc 0)))))
+                                           (let [path (:path desc)
+                                                 prev-desc (when path (get-in s [:entity-descriptors path]))
+                                                 v-res (circle/verify-entity-descriptor
+                                                        desc
+                                                        {:network-uri net-u
+                                                         :network-genesis-cid gen-c
+                                                         :prev-descriptor prev-desc
+                                                         :advisory-twin-pubkeys twins})]
+                                             (if (:ok? v-res)
+                                               (assoc-in s [:entity-descriptors path] (assoc desc :cid (:cid v-res)))
+                                               (-> s
+                                                   (update :failed-receipts-count (fnil inc 0))
+                                                   (update-in [:diagnostics (or (:error v-res) :invalid-entity-descriptor)] (fnil inc 0)))))))
 
                                        :dissolve-circle
                                        (let [d-res (circle/dissolve-circle
@@ -2589,7 +2652,9 @@
                                                (update-in [:diagnostics :membership-reconfigured] (fnil inc 0))))
                                          (update s :failed-receipts-count (fnil inc 0)))
 
-                                       s)
+                                       (-> s
+                                           (update :failed-receipts-count (fnil inc 0))
+                                           (update-in [:diagnostics :unknown-receipt-type] (fnil inc 0))))
                                      [next-exec next-exec-ord] (fifo-track (:executed-receipt-ids s-effect)
                                                                            (:executed-receipt-order s-effect)
                                                                            rid
@@ -3480,45 +3545,38 @@
                                        burn/default-settlement-take-bps)]
                 (if puzzle-auth?
                   (let [conditions (:conditions puzzle-res)
-                        settled-res (reduce
-                                     (fn [acc c]
-                                       (let [rec (:receiver c)
-                                             amt (long (:amount c))
-                                             is-release? (= :release (:type c))
-                                             take-amt (if is-release?
-                                                        (escrow/calculate-escrow-settlement-take amt configured-bps)
-                                                        0)
-                                             net-amt (- amt take-amt)
-                                             rec-acct (get-in (:ledger acc) [rec]
-                                                              (account/map->AccountState {:balance 0 :seq 0 :deps []}))
-                                             new-rec (assoc rec-acct :balance (+ (or (:balance rec-acct) 0) net-amt))]
-                                         (-> acc
-                                             (assoc-in [:ledger rec] new-rec)
-                                             (update :total-take + take-amt)
-                                             (update :total-net + net-amt))))
-                                     {:ledger (:ledger state) :total-take 0 :total-net 0}
-                                     conditions)
-                        total-take (:total-take settled-res)
-                        total-net (:total-net settled-res)
-                        updated-escrow (assoc escrow
-                                              :status :released
-                                              :settled-epoch current-epoch
-                                              :take-amount total-take
-                                              :net-amount total-net
-                                              :conditions conditions
-                                              :settlement-mode :puzzle-verified)
-                        max-tracked (long (or (get-in state [:config :max-tracked-receipts]) 10000))
-                        [next-settled-ids next-settled-ord] (fifo-track (:settled-escrow-ids state)
-                                                                        (:settled-escrow-order state)
-                                                                        escrow-id
-                                                                        max-tracked)]
-                    {:state (-> state
-                                (assoc :ledger (:ledger settled-res))
-                                (assoc-in [:escrows escrow-id] updated-escrow)
-                                (assoc :settled-escrow-ids next-settled-ids
-                                       :settled-escrow-order next-settled-ord)
-                                (update-in [:epoch-settlement-takes current-epoch] (fnil + 0) total-take))
-                     :commands []})
+                        settled-res (apply-escrow-puzzle-conditions (:ledger state) conditions configured-bps)]
+                    (if-not (:ok? settled-res)
+                      (let [err-reason (or (:error settled-res) :escrow-vault-condition-forbidden)]
+                        {:state (-> state
+                                    (update :failed-receipts-count (fnil inc 0))
+                                    (update-in [:diagnostics err-reason] (fnil inc 0)))
+                         :commands [{:type :diagnose
+                                     :effect :diagnose
+                                     :reason err-reason
+                                     :escrow-id escrow-id}]})
+                      (let [total-take (:total-take settled-res)
+                            total-net (:total-net settled-res)
+                            updated-escrow (assoc escrow
+                                                  :status :released
+                                                  :settled-epoch current-epoch
+                                                  :take-amount total-take
+                                                  :net-amount total-net
+                                                  :conditions conditions
+                                                  :settlement-mode :puzzle-verified)
+                            max-tracked (long (or (get-in state [:config :max-tracked-receipts]) 10000))
+                            [next-settled-ids next-settled-ord] (fifo-track (:settled-escrow-ids state)
+                                                                            (:settled-escrow-order state)
+                                                                            escrow-id
+                                                                            max-tracked)]
+                        {:state (-> state
+                                    (assoc :ledger (:ledger settled-res))
+                                    (assoc-in [:escrows escrow-id] updated-escrow)
+                                    (assoc :settled-escrow-ids next-settled-ids
+                                           :settled-escrow-order next-settled-ord)
+                                    (update :total-burned (fnil + 0) total-take)
+                                    (update-in [:epoch-settlement-takes current-epoch] (fnil + 0) total-take))
+                         :commands []})))
                   (let [take-amt (escrow/calculate-escrow-settlement-take amount configured-bps)
                         net-amt (- amount take-amt)
                         receiver-acct (get-in state [:ledger receiver]
@@ -3540,6 +3598,7 @@
                                 (assoc-in [:escrows escrow-id] updated-escrow)
                                 (assoc :settled-escrow-ids next-settled-ids
                                        :settled-escrow-order next-settled-ord)
+                                (update :total-burned (fnil + 0) take-amt)
                                 (update-in [:epoch-settlement-takes current-epoch] (fnil + 0) take-amt))
                      :commands []}))))))))))
 
@@ -3779,7 +3838,9 @@
                               :escrow-id escrow-id}
                      puzzle-res (when (and p-hash puzzle-src (<= current-ep expires-ep))
                                   (puzzle/eval-puzzle puzzle-src solution env-ctx))
-                     puzzle-auth? (boolean (and puzzle-res (:valid? puzzle-res)))
+                     puzzle-auth? (boolean (and puzzle-res
+                                                (:valid? puzzle-res)
+                                                (escrow-conditions-valid? (:conditions puzzle-res))))
                      payer-sig-valid? (and (not custom-puzzle?)
                                            (or (= sender payer)
                                                (and (string? payer-sig)
@@ -3831,12 +3892,17 @@
 
            :bounty-create
            (let [bounty-id (:bounty-id receipt)
-                 m-pub (:maintainer-pubkey receipt)
-                 gross (long (or (:gross-amount receipt) (:amount receipt) 0))]
+                 m-pub (or (:maintainer-pubkey receipt) (:payer receipt))
+                 gross (long (or (:gross-amount receipt) (:amount receipt) 0))
+                 take-bps (long (or (:take-bps receipt) 50))
+                 builder-bps (long (or (:builder-bps receipt) 8450))]
              (and (string? bounty-id)
                   (not (string/blank? bounty-id))
                   (string? m-pub)
                   (pos? gross)
+                  (>= take-bps 0)
+                  (>= builder-bps 0)
+                  (<= (+ take-bps builder-bps) 10000)
                   (receipt-sig-valid-or-exempt? state receipt m-pub)
                   (some? (get-in state [:ledger m-pub]))
                   (>= (spendable-balance state m-pub) gross)))
@@ -3853,6 +3919,84 @@
                   (string? auditor)
                   (map? claim)
                   (receipt-sig-valid-or-exempt? state receipt m-pub)))
+
+           :vault-create
+           (boolean (:ok? (vault/create-vault state receipt)))
+
+           :vault-spend
+           (boolean (:ok? (vault/spend-vault state (assoc receipt :epoch (or (:epoch receipt) cur-ep)))))
+
+           :vault-spend-dac-issue
+           (boolean (:ok? (vault/issue-vault-spend-dac state (assoc receipt :issued-epoch (or (:issued-epoch receipt) cur-ep)))))
+
+           :vault-spend-dac-spend
+           (boolean (:ok? (vault/spend-via-vault-dac state (assoc receipt :epoch (or (:epoch receipt) cur-ep)))))
+
+           :vault-spend-dac-revoke
+           (boolean (:ok? (vault/revoke-vault-spend-dac state receipt)))
+
+           :register-entity-descriptor
+           (let [desc (:descriptor receipt)
+                 net-u (or (:network-uri state) (get-in state [:config :network-uri]))
+                 gen-c (or (:network-genesis-cid state) (get-in state [:config :network-genesis-cid]))
+                 twins (:advisory-twin-pubkeys state)]
+             (if (= :directory/encrypted-entity-envelope (:bitecho/type desc))
+               (boolean (:ok? (circle/verify-encrypted-entity-envelope
+                               desc
+                               {:network-uri net-u
+                                :network-genesis-cid gen-c
+                                :prev-descriptor (when-let [bp (:blinded-path desc)]
+                                                   (get-in state [:entity-descriptors bp]))
+                                :advisory-twin-pubkeys twins})))
+               (boolean (:ok? (circle/verify-entity-descriptor
+                               desc
+                               {:network-uri net-u
+                                :network-genesis-cid gen-c
+                                :prev-descriptor (when-let [p (:path desc)]
+                                                   (get-in state [:entity-descriptors p]))
+                                :advisory-twin-pubkeys twins})))))
+
+           :dissolve-circle
+           (boolean (:ok? (circle/dissolve-circle state receipt {:advisory-twin-pubkeys (:advisory-twin-pubkeys state)})))
+
+           :initiate-recovery
+           (let [desc (get-in state [:entity-descriptors (:path receipt)])]
+             (boolean (and desc (:ok? (circle/initiate-recovery desc (assoc receipt :current-epoch cur-ep))))))
+
+           :cancel-recovery
+           (let [desc (get-in state [:entity-descriptors (:path receipt)])
+                 pending (get-in state [:pending-recoveries (:path receipt)])]
+             (boolean (and desc pending
+                           (:ok? (circle/cancel-recovery desc pending {:owner-signatures (:owner-signatures receipt)
+                                                                       :advisory-twin-pubkeys (:advisory-twin-pubkeys state)})))))
+
+           :register-advisory-twin
+           (let [pk (circle/normalize-spki-pubkey (:pubkey receipt))]
+             (boolean (and pk (receipt-sig-valid-or-exempt? state receipt pk))))
+
+           :rotate-validator-set
+           (let [desc (:descriptor receipt)
+                 root-ms (or (:root-owner-multisig state) (get-in state [:config :root-owner-multisig]))
+                 lead (long (or (get-in state [:config :validator-activation-lead-epochs]) 6))
+                 net-u (or (:network-uri state) (get-in state [:config :network-uri]) "devnet.bitecho.org")]
+             (boolean (:ok? (circle/verify-validator-set-descriptor
+                             desc
+                             {:root-owner-multisig root-ms
+                              :network-uri net-u
+                              :network-genesis-cid (or (:network-genesis-cid state) (get-in state [:config :network-genesis-cid]))
+                              :advisory-twin-pubkeys (:advisory-twin-pubkeys state)
+                              :lead-epochs lead}))))
+
+           :cold-root-recovery
+           (let [bundle (:bundle receipt)
+                 root-ms (or (:root-owner-multisig state) (get-in state [:config :root-owner-multisig]))]
+             (boolean (:ok? (circle/apply-cold-root-recovery
+                             state
+                             bundle
+                             {:root-owner-multisig root-ms
+                              :network-uri (or (:network-uri state) (get-in state [:config :network-uri]))
+                              :network-genesis-cid (or (:network-genesis-cid state) (get-in state [:config :network-genesis-cid]))
+                              :advisory-twin-pubkeys (:advisory-twin-pubkeys state)}))))
 
            :reconfigure-membership
            (verify-reconfigure-membership? state receipt)
@@ -3941,6 +4085,8 @@
                          :sunset-custody-burned (long (or (:sunset-custody-burned snapshot) 0))
                          :validators canon-vals
                          :mesh-nodes canon-mesh}
+                  (pos? (long (or (:total-burned snapshot) 0)))
+                  (assoc :total-burned (long (:total-burned snapshot)))
                   (seq (:vaults snapshot))
                   (assoc :vaults (into (sorted-map)
                                        (map (fn [[k v]] [(str k) (into (sorted-map) v)]))
@@ -3997,12 +4143,16 @@
               :depth (long (or (get-in state [:block-depths b-hash]) fin-epoch 1))
               :ledger (into {} (map (fn [[k v]] [k (into {} v)]) (or (:ledger state) {})))
               :escrows (or (:escrows state) {})
+              :bounty-escrows (or (:bounty-escrows state) {})
+              :vaults (or (:vaults state) {})
+              :validator-set-history (or (:validator-set-history state) {})
               :home-sets (or (:home-sets state) {})
               :voucher-seqs (or (:voucher-seqs state) {})
               :settled-voucher-tuples (or (:settled-voucher-tuples state) #{})
               :total-minted (long (or (:total-minted state) 0))
               :mint-dust (long (or (:mint-dust state) 0))
               :unclaimed-mint (long (or (:unclaimed-mint state) 0))
+              :total-burned (long (or (:total-burned state) 0))
               :sunset-custody-burned (long (or (:sunset-custody-burned state) 0))
               :epoch-burns (or (:epoch-burns state) {})
               :epoch-settlement-takes (or (:epoch-settlement-takes state) {})
@@ -4194,12 +4344,16 @@
         {:state (-> state
                     (assoc :ledger restored-ledger
                            :escrows (or (:escrows snapshot) {})
+                           :bounty-escrows (or (:bounty-escrows snapshot) {})
+                           :vaults (or (:vaults snapshot) {})
+                           :validator-set-history (or (:validator-set-history snapshot) {})
                            :home-sets (or (:home-sets snapshot) {})
                            :voucher-seqs (or (:voucher-seqs snapshot) {})
                            :settled-voucher-tuples (set (or (:settled-voucher-tuples snapshot) #{}))
                            :total-minted (long (or (:total-minted snapshot) 0))
                            :mint-dust (long (or (:mint-dust snapshot) 0))
                            :unclaimed-mint (long (or (:unclaimed-mint snapshot) 0))
+                           :total-burned (long (or (:total-burned snapshot) 0))
                            :sunset-custody-burned (long (or (:sunset-custody-burned snapshot) 0))
                            :epoch-burns (or (:epoch-burns snapshot) {})
                            :epoch-settlement-takes (or (:epoch-settlement-takes snapshot) {})

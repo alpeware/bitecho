@@ -128,3 +128,41 @@
      (if (pos? amt)
        (max 1 calc-take)
        0))))
+
+(defn apportion-settlement-take
+  "Applies Hamilton largest-remainder apportionment across a sequence of `:release`
+   conditions using a single aggregate `calculate-escrow-settlement-take` on the total
+   gross release amount (BIP-026 §1.3 P3.1, B5).
+   Guarantees for every output i:
+   - 0 <= take_i <= amount_i
+   - net_i = amount_i - take_i >= 0
+   - sum(take_i) == total-take
+   - sum(net_i) + total-take == total-release-gross
+   Deterministic tie-breaking by condition index."
+  ([release-conditions]
+   (apportion-settlement-take release-conditions burn/default-settlement-take-bps))
+  ([release-conditions configured-bps]
+   (let [conds (vec (or release-conditions []))
+         total-gross (reduce + 0 (map (comp long #(or (:amount %) 0)) conds))]
+     (if (or (empty? conds) (<= total-gross 0))
+       (mapv (fn [c] (assoc c :take 0 :net (long (or (:amount c) 0)))) conds)
+       (let [total-take (calculate-escrow-settlement-take total-gross configured-bps)
+             indexed (mapv (fn [idx c]
+                             (let [amt (long (or (:amount c) 0))
+                                   prod (* amt total-take)
+                                   base (quot prod total-gross)
+                                   rem-num (rem prod total-gross)]
+                               {:idx idx :cond c :amount amt :base base :rem rem-num}))
+                           (range (count conds))
+                           conds)
+             base-sum (reduce + 0 (map :base indexed))
+             rem-units (- total-take base-sum)
+             eligible (->> indexed
+                           (filter #(< (:base %) (:amount %)))
+                           (sort-by (fn [item] [(- (:rem item)) (:idx item)])))
+             bump-idxs (set (map :idx (take rem-units eligible)))]
+         (mapv (fn [{:keys [idx cond amount base]}]
+                 (let [t (if (contains? bump-idxs idx) (inc base) base)
+                       n (- amount t)]
+                   (assoc cond :take t :net n)))
+               indexed))))))

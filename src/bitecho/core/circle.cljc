@@ -461,14 +461,32 @@
                          default-human-anchor-sunset-epoch))]
     (boolean (and (some? anchor) (< (long current-epoch) sunset)))))
 
+(defn consent-ballot-signing-tuple
+  "Domain-separated canonical signing tuple for a sociocratic consent ballot (BIP-026 §1.5 P5.1, B7)."
+  [proposal-cid voter-pubkey vote]
+  ["bitecho-consent-ballot-v1"
+   (str proposal-cid)
+   (or (normalize-spki-pubkey voter-pubkey) (str voter-pubkey))
+   (if (keyword? vote) (name vote) (str vote))])
+
+(defn sign-consent-ballot
+  "Signs a sociocratic consent ballot `{:vote vote :signature sig-hex}` for `proposal-cid`."
+  [privkey voter-pubkey proposal-cid vote]
+  (let [spki (normalize-spki-pubkey voter-pubkey)
+        tuple (consent-ballot-signing-tuple proposal-cid spki vote)
+        sig (str/lower-case (basalt/bytes->hex (crypto/sign-canonical privkey tuple)))]
+    {:vote vote :signature sig}))
+
 (defn verify-consent-round
-  "Verifies a constitutional sociocratic consent round (§2.6.1):
+  "Verifies a constitutional sociocratic consent round (§2.6.1, BIP-026 §1.5 P5.1):
    1. Zero unresolved `:paramount-objection` ballots.
    2. Double-linking: lead-link (and delegate-link when specified) both consented.
-   3. Quorum participation strictly across non-twin human/org seats.
-   4. Advisory twins barred from consenting or holding link seats."
+   3. Cryptographic Ed25519 signature verification on all voter ballots (`B7`).
+   4. Quorum participation strictly across non-twin human/org seats.
+   5. Advisory twins barred from consenting or holding link seats."
   [round ctx]
   (let [twin-set (or (:advisory-twin-pubkeys ctx) #{})
+        proposal-cid (:proposal-cid round)
         lead (normalize-spki-pubkey (:lead-link-pubkey round))
         delegate (when (:delegate-link-pubkey round) (normalize-spki-pubkey (:delegate-link-pubkey round)))
         ballots (into {}
@@ -476,13 +494,26 @@
                               (when-let [spki (normalize-spki-pubkey pk)]
                                 [spki v]))
                             (or (:ballots round) {})))
+        vote-of (fn [v] (if (map? v) (:vote v) v))
+        sig-of (fn [v] (when (map? v) (:signature v)))
         quorum (long (or (:quorum-size round) 1))
         has-twin-voter? (or (and lead (advisory-twin? twin-set lead))
                             (and delegate (advisory-twin? twin-set delegate))
                             (some #(advisory-twin? twin-set %) (keys ballots)))
-        has-paramount? (some #(= :paramount-objection %) (vals ballots))
+        has-paramount? (some #(= :paramount-objection (vote-of %)) (vals ballots))
+        invalid-ballot-sig? (or (empty? ballots)
+                                (not (string? proposal-cid))
+                                (str/blank? proposal-cid)
+                                (some (fn [[pk v]]
+                                        (let [vote (vote-of v)
+                                              sig (sig-of v)
+                                              tuple (consent-ballot-signing-tuple proposal-cid pk vote)]
+                                          (not (and (string? sig)
+                                                    (not (str/blank? sig))
+                                                    (crypto/verify-with-fallback pk tuple sig)))))
+                                      ballots))
         non-twin-consents (count (filter (fn [[pk v]]
-                                           (and (= :consent v) (not (advisory-twin? twin-set pk))))
+                                           (and (= :consent (vote-of v)) (not (advisory-twin? twin-set pk))))
                                          ballots))]
     (cond
       has-twin-voter?
@@ -491,10 +522,13 @@
       has-paramount?
       (diag-fail :paramount-objection-present)
 
-      (or (nil? lead) (not= :consent (get ballots lead)))
+      invalid-ballot-sig?
+      (diag-fail :invalid-ballot-signature)
+
+      (or (nil? lead) (not= :consent (vote-of (get ballots lead))))
       (diag-fail :missing-lead-link-consent)
 
-      (and delegate (not= :consent (get ballots delegate)))
+      (and delegate (not= :consent (vote-of (get ballots delegate))))
       (diag-fail :missing-delegate-link-consent)
 
       (< non-twin-consents quorum)
@@ -504,21 +538,27 @@
       {:ok? true :consent-count non-twin-consents})))
 
 (defn dissolve-circle
-  "Pure `:dissolve-circle` lifecycle reducer (§2.6.1):
+  "Pure `:dissolve-circle` lifecycle reducer (§2.6.1, BIP-026 §1.5 P5.1, B7):
    Tombstones the circle's org path, revokes child seat leases, and atomically returns
-   remaining vault principal to parent/Root vault preserving `:custody-bucket` with 0 take."
+   remaining vault principal to an active parent/Root vault with strict custody-bucket
+   equality (`(= (:custody-bucket p-vault) (:custody-bucket c-vault))`) and 0 take."
   [state {:keys [circle-path parent-vault-id consent-round]} ctx]
   (let [c-res (verify-consent-round consent-round ctx)
         circle-desc (get-in state [:entity-descriptors circle-path])
         c-vault-id (:vault-id circle-desc)
         c-vault (when c-vault-id (get-in state [:vaults c-vault-id]))
-        p-vault (when parent-vault-id (get-in state [:vaults parent-vault-id]))]
+        p-vault (when parent-vault-id (get-in state [:vaults parent-vault-id]))
+        has-principal? (and c-vault (pos? (long (or (:balance c-vault) 0))))]
     (cond
-      (not (:ok? c-res)) c-res
       (nil? circle-desc) (diag-fail :circle-not-found {:path circle-path})
       (= :sovereign-id (:entity-kind circle-desc)) (diag-fail :sovereign-root-cannot-be-dissolved)
-      (and c-vault (pos? (long (:balance c-vault 0))) (nil? p-vault))
-      (diag-fail :missing-parent-vault-for-dissolution)
+      (and has-principal? (nil? p-vault)) (diag-fail :missing-parent-vault-for-dissolution)
+      (and has-principal? (not= :active (:status p-vault)))
+      (diag-fail :parent-vault-not-active {:parent-vault-id parent-vault-id :status (:status p-vault)})
+      (and has-principal? (not= (:custody-bucket p-vault) (:custody-bucket c-vault)))
+      (diag-fail :custody-bucket-mismatch {:child-bucket (:custody-bucket c-vault)
+                                           :parent-bucket (:custody-bucket p-vault)})
+      (not (:ok? c-res)) c-res
       :else
       (let [principal (long (or (:balance c-vault) 0))
             revoked-leases (into []
@@ -531,13 +571,11 @@
                         state
                         revoked-leases)
             st2 (assoc-in st1 [:entity-descriptors circle-path :status] :dissolved)
-            st3 (if (and c-vault (pos? principal))
+            st3 (if has-principal?
                   (-> st2
                       (assoc-in [:vaults c-vault-id :balance] 0)
                       (assoc-in [:vaults c-vault-id :status] :dissolved)
-                      (update-in [:vaults parent-vault-id :balance] (fnil + 0) principal)
-                      (assoc-in [:vaults parent-vault-id :custody-bucket]
-                                (or (:custody-bucket p-vault) (:custody-bucket c-vault))))
+                      (update-in [:vaults parent-vault-id :balance] (fnil + 0) principal))
                   st2)]
         {:ok? true
          :state st3
@@ -630,11 +668,26 @@
         tag-hex (subs (str/lower-case (basalt/bytes->hex tag-bytes)) 0 32)]
     (str "dir/" parent-path "/enc/" tag-hex)))
 
+(def blinded-envelope-path-pattern
+  "Strict regex for blinded `:directory/encrypted-entity-envelope` paths (BIP-026 §1.5 P5.2, B7)."
+  #"^dir/.+/enc/[0-9a-f]{32}$")
+
+(defn encrypted-envelope-signing-tuple
+  "Domain-separated canonical signing tuple for outer `:owner-signatures` on `:directory/encrypted-entity-envelope`."
+  [envelope]
+  ["bitecho-encrypted-entity-v1"
+   (str (:network-uri envelope))
+   (str/lower-case (str (:network-genesis-cid envelope)))
+   (str (:blinded-path envelope))
+   (str/lower-case (str (:ciphertext-hex envelope)))
+   (str/lower-case (str (:nonce-hex envelope)))])
+
 (defn encrypt-shared-descriptor
   "Encrypts sensitive payload fields (`:members`, `:home-set`, `:allocation-ech`, `:purpose-cid`,
    `:policy`) of a `:shared-encrypted` descriptor with AEAD (`crypto/secretbox`) using a fresh
-   CSPRNG 24-byte nonce (`F14`, never deterministic nonce reuse), keeping only structural
-   verification headers visible to relays for BIP-016 and signature verification."
+   CSPRNG 24-byte nonce (`F14`, never deterministic nonce reuse), omits plaintext `:payer-pubkey`
+   from `:storage-accounting`, and optionally attaches verifiable outer `:owner-signatures`
+   via `(:owner-signers opts)` or `(:signers opts)` (BIP-026 §1.5 P5.2, B7)."
   ([descriptor group-key-bytes]
    (encrypt-shared-descriptor descriptor group-key-bytes nil))
   ([descriptor group-key-bytes opts]
@@ -642,20 +695,97 @@
          plaintext (fressian/encode-canonical sensitive)
          nonce-24 (or (:nonce-bytes opts) (crypto/random-bytes 24))
          ciphertext (crypto/secretbox group-key-bytes nonce-24 plaintext)
-         owner-commitment (str/lower-case (basalt/bytes->hex (crypto/sha256 (fressian/encode-canonical (:owner-multisig descriptor)))))]
-     {:bitecho/type :directory/encrypted-entity-envelope
-      :schema-version 2
-      :visibility :shared-encrypted
-      :network-uri (:network-uri descriptor)
-      :network-genesis-cid (:network-genesis-cid descriptor)
-      :blinded-path (blinded-subpath (or (:parent-path descriptor) "root") (:path descriptor) group-key-bytes)
-      :version (:version descriptor)
-      :prev-descriptor-cid (:prev-descriptor-cid descriptor)
-      :owner-multisig-commitment owner-commitment
-      :retention-policy (:retention-policy descriptor)
-      :storage-accounting (:storage-accounting descriptor)
-      :nonce-hex (str/lower-case (basalt/bytes->hex nonce-24))
-      :ciphertext-hex (str/lower-case (basalt/bytes->hex ciphertext))})))
+         norm-ms (normalize-owner-multisig (:owner-multisig descriptor))
+         owner-commitment (str/lower-case (basalt/bytes->hex (crypto/sha256 (fressian/encode-canonical (or norm-ms (:owner-multisig descriptor))))))
+         clean-storage (when-let [sa (:storage-accounting descriptor)]
+                         (dissoc sa :payer-pubkey))
+         b-path (or (:blinded-path opts)
+                    (blinded-subpath (or (:parent-path descriptor) "root") (:path descriptor) group-key-bytes))
+         base (cond-> {:bitecho/type :directory/encrypted-entity-envelope
+                       :schema-version 2
+                       :visibility :shared-encrypted
+                       :network-uri (:network-uri descriptor)
+                       :network-genesis-cid (:network-genesis-cid descriptor)
+                       :blinded-path b-path
+                       :version (:version descriptor)
+                       :prev-descriptor-cid (:prev-descriptor-cid descriptor)
+                       :owner-multisig-commitment owner-commitment
+                       :retention-policy (:retention-policy descriptor)
+                       :storage-accounting clean-storage
+                       :nonce-hex (str/lower-case (basalt/bytes->hex nonce-24))
+                       :ciphertext-hex (str/lower-case (basalt/bytes->hex ciphertext))}
+                norm-ms (assoc :owner-multisig norm-ms))
+         signers (or (:owner-signers opts) (:signers opts))
+         tuple (encrypted-envelope-signing-tuple base)
+         owner-sigs (cond
+                      (seq signers)
+                      (into (sorted-map)
+                            (keep (fn [{:keys [pubkey privkey]}]
+                                    (when-let [spki (normalize-spki-pubkey pubkey)]
+                                      [spki (str/lower-case (basalt/bytes->hex (crypto/sign-canonical privkey tuple)))])))
+                            signers)
+
+                      (map? (:owner-signatures opts))
+                      (:owner-signatures opts)
+
+                      :else nil)]
+     (cond-> base
+       (seq owner-sigs) (assoc :owner-signatures owner-sigs)))))
+
+(defn verify-encrypted-entity-envelope
+  "Verifies a `:directory/encrypted-entity-envelope` for validator admission (BIP-026 §1.5 P5.2, B7):
+   1. `:blinded-path` strictly matches `^dir/.+/enc/[0-9a-f]{32}$`.
+   2. `:network-uri`, `:network-genesis-cid`, `:ciphertext-hex`, and `:nonce-hex` are valid.
+   3. `:storage-accounting` does not leak plaintext `:payer-pubkey`.
+   4. Outer `:owner-signatures` satisfy the owning entity's `:owner-multisig` quorum
+      (excluding `:advisory-twin-pubkeys`)."
+  [envelope ctx]
+  (let [b-path (:blinded-path envelope)
+        exp-net (:network-uri ctx)
+        exp-gen (:network-genesis-cid ctx)
+        prev-desc (:prev-descriptor ctx)
+        twin-set (or (:advisory-twin-pubkeys ctx) #{})
+        ms (or (:owner-multisig prev-desc)
+               (:owner-multisig ctx)
+               (let [env-ms (normalize-owner-multisig (:owner-multisig envelope))
+                     env-comm (when env-ms
+                                (str/lower-case (basalt/bytes->hex (crypto/sha256 (fressian/encode-canonical env-ms)))))]
+                 (when (and env-ms (= env-comm (:owner-multisig-commitment envelope)))
+                   env-ms)))
+        owners (when (map? ms) (dedup-spki-pubkeys (:pubkeys ms)))
+        th (when (map? ms) (long (or (:threshold ms) 0)))
+        tuple (encrypted-envelope-signing-tuple envelope)
+        valid-sigs (if (and (seq owners) (pos? (long (or th 0))))
+                     (count-valid-multisig-signatures (:owner-signatures envelope) owners tuple twin-set)
+                     0)]
+    (cond
+      (not= :directory/encrypted-entity-envelope (:bitecho/type envelope))
+      (diag-fail :invalid-encrypted-envelope-type)
+
+      (not (and (string? b-path) (boolean (re-matches blinded-envelope-path-pattern b-path))))
+      (diag-fail :invalid-blinded-envelope-path {:blinded-path b-path})
+
+      (and exp-net (not= (str exp-net) (str (:network-uri envelope))))
+      (diag-fail :network-uri-mismatch)
+
+      (and exp-gen (not= (str/lower-case (str exp-gen)) (str/lower-case (str (:network-genesis-cid envelope)))))
+      (diag-fail :network-genesis-cid-mismatch)
+
+      (not (and (string? (:nonce-hex envelope)) (re-matches #"[0-9a-f]{48}" (str/lower-case (:nonce-hex envelope)))))
+      (diag-fail :invalid-envelope-nonce)
+
+      (not (and (string? (:ciphertext-hex envelope)) (pos? (count (:ciphertext-hex envelope)))
+                (re-matches #"[0-9a-f]+" (str/lower-case (:ciphertext-hex envelope)))))
+      (diag-fail :invalid-envelope-ciphertext)
+
+      (contains? (or (:storage-accounting envelope) {}) :payer-pubkey)
+      (diag-fail :encrypted-envelope-payer-pubkey-leak)
+
+      (or (empty? owners) (< (long (or th 0)) 1) (< valid-sigs (long th)))
+      (diag-fail :insufficient-encrypted-envelope-signatures {:valid valid-sigs :required (or th 1)})
+
+      :else
+      {:ok? true :cid (descriptor-cid envelope) :blinded-path b-path})))
 
 (defn decrypt-shared-descriptor
   "Decrypts a `:directory/encrypted-entity-envelope` using `group-key-bytes`."

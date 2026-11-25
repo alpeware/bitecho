@@ -4,7 +4,8 @@
    Eliminates all wall-clock and unseeded randomness by injecting `crypto/fork-random`
    and explicit epoch clocks, consistently scaling all epoch constants by
    `:time-compression-factor C` and verifying 7-bucket `INV-C1` conservation on every step."
-  (:require [bitecho.circles.vault :as vault]
+  (:require [bitecho.basalt.core :as basalt]
+            [bitecho.circles.vault :as vault]
             [bitecho.config :as config]
             [bitecho.core.circle :as circle]
             [bitecho.core.protocol.faucet :as faucet]
@@ -56,35 +57,48 @@
         scaled-theta (scale-lifecycle-config theta time-compression-factor)
         net-uri "devnet.bitecho.org"
         gen-cid "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        root-pk (deterministic-spki-hex (crypto/fork-random master-rng "root-pk"))
+        root-kp (crypto/generate-keypair (crypto/fork-random master-rng "root-pk"))
+        root-pk (circle/normalize-spki-pubkey (basalt/bytes->hex (:public root-kp)))
+        root-ms {:threshold 1 :pubkeys [root-pk]}
         p-src (vault/canonical-multisig-treasury-puzzle-source 1 [root-pk])
         p-hash (puzzle/puzzle-cid p-src)
         inc-bal (quot (long genesis-custody-supply) 2)
         boot-bal (- (long genesis-custody-supply) inc-bal)
-        vst0 (vault/init-vaults-state {:network-uri net-uri
-                                       :network-genesis-cid gen-cid
-                                       :genesis-custody-supply (long genesis-custody-supply)
-                                       :bootstrap-sunset-epoch (:bootstrap-sunset-epoch scaled-theta)
-                                       :settlement-take-bps (:settlement-take-bps scaled-theta)
-                                       :chartered-vaults #{"vault:root" "vault:root/inc"}})
-        v1 (:state (vault/create-vault vst0 {:vault-id "vault:root"
-                                             :entity-uri (str net-uri "/root")
-                                             :custody-bucket :bootstrap
-                                             :puzzle-hash p-hash
-                                             :balance boot-bal
-                                             :created-epoch 0}))
-        v2 (:state (vault/create-vault v1 {:vault-id "vault:root/inc"
-                                           :entity-uri (str net-uri "/root/inc")
-                                           :custody-bucket :ecosystem
-                                           :puzzle-hash p-hash
-                                           :balance inc-bal
-                                           :created-epoch 0}))
-        v3 (:state (vault/issue-vault-spend-dac v2 {:dac-id "faucet-dac"
-                                                    :vault-id "vault:root/inc"
-                                                    :holder-pubkey root-pk
-                                                    :max-per-epoch-bps 500
-                                                    :issued-epoch 0
-                                                    :expires-epoch (+ (long epochs) 100)}))
+        vst0 (assoc (vault/init-vaults-state {:network-uri net-uri
+                                              :network-genesis-cid gen-cid
+                                              :genesis-custody-supply (long genesis-custody-supply)
+                                              :root-unallocated (long genesis-custody-supply)
+                                              :bootstrap-sunset-epoch (:bootstrap-sunset-epoch scaled-theta)
+                                              :settlement-take-bps (:settlement-take-bps scaled-theta)
+                                              :chartered-vaults #{"vault:root" "vault:root/inc"}})
+                    :root-owner-multisig root-ms)
+        sign-root (fn [tuple] {root-pk (basalt/bytes->hex (crypto/sign-canonical (:private root-kp) tuple))})
+        v1-params {:vault-id "vault:root"
+                   :entity-uri (str net-uri "/root")
+                   :custody-bucket :bootstrap
+                   :puzzle-hash p-hash
+                   :balance boot-bal
+                   :created-epoch 0
+                   :funding-source :root-unallocated}
+        v1-sig (sign-root (vault/vault-create-signing-tuple (assoc v1-params :network-uri net-uri :network-genesis-cid gen-cid)))
+        v1 (:state (vault/create-vault vst0 (assoc v1-params :root-signatures v1-sig)))
+        v2-params {:vault-id "vault:root/inc"
+                   :entity-uri (str net-uri "/root/inc")
+                   :custody-bucket :ecosystem
+                   :puzzle-hash p-hash
+                   :balance inc-bal
+                   :created-epoch 0
+                   :funding-source :root-unallocated}
+        v2-sig (sign-root (vault/vault-create-signing-tuple (assoc v2-params :network-uri net-uri :network-genesis-cid gen-cid)))
+        v2 (:state (vault/create-vault v1 (assoc v2-params :root-signatures v2-sig)))
+        dac-params {:dac-id "faucet-dac"
+                    :vault-id "vault:root/inc"
+                    :holder-pubkey root-pk
+                    :max-per-epoch-bps 500
+                    :issued-epoch 0
+                    :expires-epoch (+ (long epochs) 100)}
+        dac-sig (sign-root (vault/dac-issue-signing-tuple (assoc dac-params :network-uri net-uri :network-genesis-cid gen-cid)))
+        v3 (:state (vault/issue-vault-spend-dac v2 (assoc dac-params :root-signatures dac-sig)))
         fst0 (faucet/init-faucet-state {:network-uri net-uri
                                         :network-genesis-cid gen-cid
                                         :drip-amount-ech (long faucet-drip-ech)
@@ -110,10 +124,19 @@
               ch-res (faucet/issue-faucet-challenge fst {:network-uri net-uri :rng ep-rng} (* ep 10000))
               nonce (get-in ch-res [:challenge :nonce])
               claimant-pk (deterministic-spki-hex ep-rng)
+              dac-spend-tuple (vault/dac-spend-signing-tuple {:network-uri net-uri
+                                                              :network-genesis-cid gen-cid
+                                                              :dac-id "faucet-dac"
+                                                              :vault-id "vault:root/inc"
+                                                              :receiver claimant-pk
+                                                              :amount (long faucet-drip-ech)
+                                                              :epoch ep})
+              dac-spend-sig (basalt/bytes->hex (crypto/sign-canonical (:private root-kp) dac-spend-tuple))
               dac-res (vault/spend-via-vault-dac vst {:dac-id "faucet-dac"
                                                       :receiver claimant-pk
                                                       :amount (long faucet-drip-ech)
-                                                      :epoch ep})
+                                                      :epoch ep
+                                                      :signature dac-spend-sig})
               vst-after-drip (if (:ok? dac-res) (:state dac-res) vst)
               sunset-res (vault/apply-bootstrap-sunset vst-after-drip ep)
               vst-next (:state sunset-res)

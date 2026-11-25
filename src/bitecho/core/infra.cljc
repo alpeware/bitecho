@@ -235,7 +235,7 @@
                                         {:pattern "web/app/*"        :principal {:type :allowlist :signers releases-signers}}
                                         {:pattern "web/*"            :principal {:type :allowlist}}
                                         {:pattern "bootstrap"        :principal {:type :allowlist}}
-                                        {:pattern "dir/*"            :principal {:type :allowlist}}
+                                        {:pattern "dir/*"            :principal {:type :allowlist :threshold 1}}
                                         {:pattern "acme/challenge/*" :principal {:type :leader}}
                                         {:pattern "tls/*"            :principal {:type :leader}}
                                         {:pattern "bounty/*"         :principal {:type :allowlist}}

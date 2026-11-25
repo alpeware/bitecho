@@ -685,9 +685,15 @@
                   {:ok? true :principal-type :leader}))
 
               :allowlist
-              (let [allowed (set (map normalize-hex (or (:signers principal) (:trust-anchors ctx) (:admitted-members ctx) #{})))]
-                (if (contains? allowed auth)
-                  {:ok? true :principal-type :allowlist}
+              (let [allowed (set (map normalize-hex (or (:signers principal) (:trust-anchors ctx) (:admitted-members ctx) #{})))
+                    allowed-spki (set (keep normalize-spki-hex allowed))
+                    norm-auth-spki (normalize-spki-hex auth)]
+                (if (or (contains? allowed auth)
+                        (and norm-auth-spki (contains? allowed-spki norm-auth-spki)))
+                  {:ok? true
+                   :principal-type :allowlist
+                   :signers allowed-spki
+                   :threshold (max 1 (long (or (:threshold principal) 1)))}
                   {:ok? false :error :unauthorized-pointer-authority}))
 
               :quorum

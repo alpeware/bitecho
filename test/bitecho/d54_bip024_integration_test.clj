@@ -277,7 +277,7 @@
                                  :root-owner-multisig root-ms
                                  :peers-map peers-map
                                  :genesis-custody-supply 100000
-                                 :root-unallocated 0
+                                 :root-unallocated 100000
                                  :total-burned 0
                                  :sunset-custody-burned 0
                                  :validator-set-history {0 {:committee init-vals :quorum-threshold 4 :descriptor-cid gen-cid}})))
@@ -318,14 +318,21 @@
           ;; Partition: 4-node majority (init-vals[0..3]) active; 2-node minority (init-vals[4..5]) isolated
           majority-pks (subvec init-vals 0 4)
           minority-pk (nth init-vals 4)
-          ;; Epoch 1: Create persistent vault with 100,000 ECHO
-          r-create {:type :vault-create
-                    :receipt-id "v-create-1"
-                    :vault-id "vault:devnet.bitecho.org/root"
-                    :entity-uri "devnet.bitecho.org/root"
-                    :custody-bucket :bootstrap
-                    :puzzle-hash p-hash
-                    :balance 100000}
+          ;; Epoch 1: Create persistent vault with 100,000 ECHO (Root-signed & funded from :root-unallocated)
+          r-create-base {:type :vault-create
+                         :receipt-id "v-create-1"
+                         :vault-id "vault:devnet.bitecho.org/root"
+                         :entity-uri "devnet.bitecho.org/root"
+                         :custody-bucket :bootstrap
+                         :puzzle-hash p-hash
+                         :balance 100000
+                         :created-epoch 0
+                         :funding-source :root-unallocated}
+          r-create-tuple (vault/vault-create-signing-tuple
+                          (assoc r-create-base :network-uri net-uri :network-genesis-cid gen-cid))
+          r-create (assoc r-create-base
+                          :root-signatures {(:spki-hex r1) (basalt/bytes->hex (crypto/sign-canonical (:private r1) r-create-tuple))
+                                            (:spki-hex r2) (basalt/bytes->hex (crypto/sign-canonical (:private r2) r-create-tuple))})
           ;; Epoch 2: Concurrent :vault-seq 1 spend race (2 conflicting spends in same block!)
           out-a [{:type :release :receiver (:spki-hex recv1) :amount 10000}
                  {:type :relock :amount 90000 :next-puzzle-hash p-hash}]
@@ -449,8 +456,10 @@
                            {:type :cancel-recovery :receipt-id "gov-4" :path "root"
                             :owner-signatures {(:spki-hex r1) r1-csig (:spki-hex r2) r2-csig}}])
           [s2 h2] (run-ep s1 2 h1 [{:type :dissolve-circle :receipt-id "gov-5" :circle-path "root"
-                                    :consent-round {:lead-link-pubkey (:spki-hex r1)
-                                                    :ballots {(:spki-hex r1) :consent (:spki-hex r2) :consent}
+                                    :consent-round {:proposal-cid c-cid
+                                                    :lead-link-pubkey (:spki-hex r1)
+                                                    :ballots {(:spki-hex r1) (circle/sign-consent-ballot (:private r1) (:spki-hex r1) c-cid :consent)
+                                                              (:spki-hex r2) (circle/sign-consent-ballot (:private r2) (:spki-hex r2) c-cid :consent)}
                                                     :quorum-size 2}}])
           [s3 h3] (run-ep s2 3 h2 [])
           [s4 _] (run-ep s3 4 h3 [])]
