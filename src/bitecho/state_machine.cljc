@@ -2289,6 +2289,12 @@
                                                  amount (long (:amount escrow))
                                                  htlc-cid (puzzle/standard-htlc-cid)
                                                  custom-puzzle? (and (some? p-hash) (not= p-hash htlc-cid))
+                                                 eff-puzzle-src (or puzzle-src
+                                                                    (when (= p-hash htlc-cid)
+                                                                      puzzle/standard-htlc-puzzle-source))
+                                                 norm-solution (if (and (map? solution) (string? (:mode solution)))
+                                                                 (assoc solution :mode (keyword (:mode solution)))
+                                                                 solution)
                                                  env-ctx {:amount amount
                                                           :receiver receiver
                                                           :payer payer
@@ -2296,8 +2302,8 @@
                                                           :puzzle-hash p-hash
                                                           :epoch closing-ep
                                                           :escrow-id escrow-id}
-                                                 puzzle-res (when (and p-hash puzzle-src (<= closing-ep expires-epoch))
-                                                              (puzzle/eval-puzzle puzzle-src solution env-ctx))
+                                                 puzzle-res (when (and p-hash eff-puzzle-src (some? norm-solution) (<= closing-ep expires-epoch))
+                                                              (puzzle/eval-puzzle eff-puzzle-src norm-solution env-ctx))
                                                  puzzle-auth? (boolean (and puzzle-res (:valid? puzzle-res)))
                                                  payer-sig-valid? (and (not custom-puzzle?)
                                                                        (or (= sender-hex payer)
@@ -2737,8 +2743,9 @@
                                      (update-in [:executed-receipts-by-epoch closing-ep] (fnil conj #{}) rid))))))
                          st-skipped
                          (let [reconfig-rcpts (filter #(= :reconfigure-membership (:type %)) receipts)
-                               other-rcpts (remove #(= :reconfigure-membership (:type %)) receipts)]
-                           (concat reconfig-rcpts other-rcpts)))
+                               lock-rcpts (filter #(= :lock-intent (:type %)) receipts)
+                               other-rcpts (remove #(contains? #{:reconfigure-membership :lock-intent} (:type %)) receipts)]
+                           (concat reconfig-rcpts lock-rcpts other-rcpts)))
              st-pruned-epochs (update st-applied :executed-receipts-by-epoch
                                       (fn [m]
                                         (into {} (filter (fn [[ep _]] (>= (long ep) (- closing-ep 65))) m))))
@@ -3537,18 +3544,35 @@
   (if-not (or (nil? (:epoch event)) (integer? (:epoch event)))
     {:state state :commands []}
     (let [escrow-id (:escrow-id event)
-          escrow (get-in state [:escrows escrow-id])
+          pending-lock (some (fn [r]
+                               (when (and (= (:type r) :lock-intent)
+                                          (= (:escrow-id r) escrow-id))
+                                 {:escrow-id escrow-id
+                                  :payer (:payer r)
+                                  :receiver (:receiver r)
+                                  :amount (:amount r)
+                                  :deliverable-hash (or (:deliverable-hash r) (:puzzle-hash r))
+                                  :puzzle-hash (:puzzle-hash r)
+                                  :created-epoch (:created-epoch r)
+                                  :expires-epoch (:expires-epoch r)
+                                  :status :locked}))
+                             (or (:pending-receipts state) []))
+          escrow (or (get-in state [:escrows escrow-id]) pending-lock)
           preimage (:preimage event)
           payer-sig (:payer-signature event)
           puzzle-src (:puzzle-source event)
-          solution (:solution event)
+          raw-solution (:solution event)
+          solution (if (and (map? raw-solution) (string? (:mode raw-solution)))
+                     (assoc raw-solution :mode (keyword (:mode raw-solution)))
+                     raw-solution)
           event-sender (:sender event)
           sender-hex (when event-sender (if (string? event-sender) event-sender (basalt/bytes->hex event-sender)))
           current-epoch (long (if (and (consensus-mode? state) (pos? (long (or (:epoch state) 0))))
                                 (:epoch state)
                                 (or (:epoch event) (:epoch state) 0)))]
       (if-not (and escrow (= :locked (:status escrow)))
-        {:state state :commands []}
+        {:state (update-in state [:diagnostics :release-intent-escrow-not-found] (fnil inc 0))
+         :commands [{:effect :diagnose :reason :release-intent-escrow-not-found :escrow-id escrow-id}]}
         (let [payer (:payer escrow)
               receiver (:receiver escrow)
               d-hash (:deliverable-hash escrow)
@@ -3557,6 +3581,9 @@
               amount (long (:amount escrow))
               htlc-cid (puzzle/standard-htlc-cid)
               custom-puzzle? (and (some? p-hash) (not= p-hash htlc-cid))
+              eff-puzzle-src (or puzzle-src
+                                 (when (= p-hash htlc-cid)
+                                   puzzle/standard-htlc-puzzle-source))
               env-ctx {:amount amount
                        :receiver receiver
                        :payer payer
@@ -3564,8 +3591,8 @@
                        :puzzle-hash p-hash
                        :epoch current-epoch
                        :escrow-id escrow-id}
-              puzzle-res (when (and p-hash puzzle-src (<= current-epoch expires-epoch))
-                           (puzzle/eval-puzzle puzzle-src solution env-ctx))
+              puzzle-res (when (and p-hash eff-puzzle-src (some? solution) (<= current-epoch expires-epoch))
+                           (puzzle/eval-puzzle eff-puzzle-src solution env-ctx))
               puzzle-auth? (boolean (and puzzle-res (:valid? puzzle-res)))
               payer-sig-valid? (and (not custom-puzzle?)
                                     (or (= sender-hex payer)
@@ -3892,10 +3919,16 @@
                      preimage (:preimage receipt)
                      payer-sig (:payer-signature receipt)
                      puzzle-src (:puzzle-source receipt)
-                     solution (:solution receipt)
+                     raw-solution (:solution receipt)
+                     solution (if (and (map? raw-solution) (string? (:mode raw-solution)))
+                                (assoc raw-solution :mode (keyword (:mode raw-solution)))
+                                raw-solution)
                      sender (:sender receipt)
                      htlc-cid (puzzle/standard-htlc-cid)
                      custom-puzzle? (and (some? p-hash) (not= p-hash htlc-cid))
+                     eff-puzzle-src (or puzzle-src
+                                        (when (= p-hash htlc-cid)
+                                          puzzle/standard-htlc-puzzle-source))
                      env-ctx {:amount amount
                               :receiver receiver
                               :payer payer
@@ -3903,8 +3936,8 @@
                               :puzzle-hash p-hash
                               :epoch current-ep
                               :escrow-id escrow-id}
-                     puzzle-res (when (and p-hash puzzle-src (<= current-ep expires-ep))
-                                  (puzzle/eval-puzzle puzzle-src solution env-ctx))
+                     puzzle-res (when (and p-hash eff-puzzle-src (some? solution) (<= current-ep expires-ep))
+                                  (puzzle/eval-puzzle eff-puzzle-src solution env-ctx))
                      puzzle-auth? (boolean (and puzzle-res
                                                 (:valid? puzzle-res)
                                                 (escrow-conditions-valid? (:conditions puzzle-res))))

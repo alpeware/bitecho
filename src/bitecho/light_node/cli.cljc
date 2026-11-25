@@ -251,7 +251,10 @@
    "--release-cid" "--genesis-anchor-cid" "--lkg-release-cid" "--headers-config-cid"
    "--max-cache-bytes" "--min-free-disk-bytes" "--min-free-disk-pct"
    "--max-events-log-bytes" "--state-save-warn-ms" "--ctl-warn-ms"
-   "--event-loop-lag-warn-ms" "--snapshot-encode-warn-ms"])
+   "--event-loop-lag-warn-ms" "--snapshot-encode-warn-ms"
+   "--dac" "--dac-file" "--revocation" "--revocation-file" "--dac-id"
+   "--agent-pubkey" "--revoked-epoch" "--anchor-pubkey"
+   "--pointer-file" "--blob-file" "--anchor-file"])
 
 ;; =============================================================================
 ;; 2. Pure CLI Tokenizer & JSONL Command Splitter (Rule 2)
@@ -785,8 +788,31 @@
             pk (extract-flag-value clean-tokens "--pubkey" nil)]
         {"cmd" "petname-resolve" "petname" pn "pubkey" pk})
 
-      "dac-attach" {"cmd" "dac-attach"}
-      "dac-revoke" {"cmd" "dac-revoke"}
+      "dac-attach"
+      (let [dac (extract-flag-value clean-tokens "--dac" nil)
+            dac-file (extract-flag-value clean-tokens "--dac-file" nil)
+            m {"cmd" "dac-attach"}]
+        (cond-> m
+          dac (assoc "dac" dac)
+          dac-file (assoc "dac_file" dac-file)))
+
+      "dac-revoke"
+      (let [rev (extract-flag-value clean-tokens "--revocation" nil)
+            rev-file (extract-flag-value clean-tokens "--revocation-file" nil)
+            dac-id (extract-flag-value clean-tokens "--dac-id" nil)
+            agent-pk (extract-flag-value clean-tokens "--agent-pubkey" nil)
+            rev-ep (extract-long-flag clean-tokens "--revoked-epoch" nil)
+            sig (extract-flag-value clean-tokens "--signature" nil)
+            anchor-pk (extract-flag-value clean-tokens "--anchor-pubkey" nil)
+            m {"cmd" "dac-revoke"}]
+        (cond-> m
+          rev (assoc "revocation" rev)
+          rev-file (assoc "revocation_file" rev-file)
+          dac-id (assoc "dac_id" dac-id)
+          agent-pk (assoc "agent_pubkey" agent-pk)
+          (some? rev-ep) (assoc "revoked_epoch" rev-ep)
+          sig (assoc "signature" sig)
+          anchor-pk (assoc "anchor_pubkey" anchor-pk)))
 
       "directory-verify"
       (let [raw-nick (or (extract-flag-value clean-tokens "--nickname" nil)
@@ -807,7 +833,9 @@
       "directory-register"
       (let [raw-nick (or (extract-flag-value clean-tokens "--nickname" nil)
                          (extract-flag-value clean-tokens "--name" nil))
-            raw-dom (extract-flag-value clean-tokens "--domain" nil)
+            raw-dom (or (extract-flag-value clean-tokens "--domain" nil)
+                        (extract-flag-value clean-tokens "--subnet-id" nil)
+                        (extract-flag-value clean-tokens "--subnet" nil))
             trimmed (when (string? raw-nick) (str/replace (str/trim raw-nick) #"^/+|/+$" ""))
             first-slash (when trimmed (.indexOf trimmed "/"))
             has-domain-prefix? (and first-slash (pos? first-slash) (str/includes? (subs trimmed 0 first-slash) "."))
@@ -819,7 +847,7 @@
             m {"cmd" "directory-register"}]
         (cond-> m
           nick (assoc "nickname" nick)
-          dom (assoc "domain" dom)
+          dom (assoc "domain" dom "subnet_id" dom)
           mb (assoc "mailbox" mb)
           prev-pk (assoc "prev_pubkey" prev-pk)
           prev-sk (assoc "prev_privkey" prev-sk)))
@@ -827,7 +855,9 @@
       "directory-lookup"
       (let [raw-nick (or (extract-flag-value clean-tokens "--nickname" nil)
                          (extract-flag-value clean-tokens "--name" nil))
-            raw-dom (extract-flag-value clean-tokens "--domain" nil)
+            raw-dom (or (extract-flag-value clean-tokens "--domain" nil)
+                        (extract-flag-value clean-tokens "--subnet-id" nil)
+                        (extract-flag-value clean-tokens "--subnet" nil))
             trimmed (when (string? raw-nick) (str/replace (str/trim raw-nick) #"^/+|/+$" ""))
             first-slash (when trimmed (.indexOf trimmed "/"))
             has-domain-prefix? (and first-slash (pos? first-slash) (str/includes? (subs trimmed 0 first-slash) "."))
@@ -837,7 +867,7 @@
             m {"cmd" "directory-lookup"}]
         (cond-> m
           nick (assoc "nickname" nick)
-          dom (assoc "domain" dom)
+          dom (assoc "domain" dom "subnet_id" dom)
           dir-pk (assoc "directory_pubkey" dir-pk)))
 
       "anchor-subnet"
@@ -868,10 +898,16 @@
                     (extract-flag-value clean-tokens "--child-subnet" nil))
             psub (or (extract-flag-value clean-tokens "--parent-subnet" nil)
                      (extract-flag-value clean-tokens "--parent" nil))
+            ptr-file (extract-flag-value clean-tokens "--pointer-file" nil)
+            blob-file (extract-flag-value clean-tokens "--blob-file" nil)
+            anch-file (extract-flag-value clean-tokens "--anchor-file" nil)
             m {"cmd" "verify-subnet-anchor"}]
         (cond-> m
           sub (assoc "subnet_id" sub)
-          psub (assoc "parent_subnet" psub)))
+          psub (assoc "parent_subnet" psub)
+          ptr-file (assoc "pointer_file" ptr-file)
+          blob-file (assoc "blob_file" blob-file)
+          anch-file (assoc "anchor_file" anch-file)))
 
       "wait"
       (let [t (or (extract-long-flag clean-tokens "--timeout-ms" nil)
@@ -1045,8 +1081,7 @@
 
       "storage-put"
       (let [sub (or (extract-flag-value clean-tokens "--subnet-id" nil)
-                    (extract-flag-value clean-tokens "--subnet" nil)
-                    "global")
+                    (extract-flag-value clean-tokens "--subnet" nil))
             slot (or (extract-flag-value clean-tokens "--slot-id" nil)
                      (extract-flag-value clean-tokens "--slot" nil)
                      "default")
@@ -1058,8 +1093,9 @@
                          (extract-flag-value clean-tokens "--out-file" nil))
             local-only? (has-flag? clean-tokens "--local-only")
             b (extract-long-flag clean-tokens "--burn" nil)
-            m {"cmd" "storage-put" "subnet_id" sub "slot" slot "slot_id" slot}]
+            m {"cmd" "storage-put" "slot" slot "slot_id" slot}]
         (cond-> m
+          sub (assoc "subnet_id" sub)
           data (assoc "data" data)
           data-hex (assoc "data_hex" data-hex)
           seq-num (assoc "seq" seq-num)
@@ -1070,16 +1106,16 @@
 
       "storage-get"
       (let [sub (or (extract-flag-value clean-tokens "--subnet-id" nil)
-                    (extract-flag-value clean-tokens "--subnet" nil)
-                    "global")
+                    (extract-flag-value clean-tokens "--subnet" nil))
             slot (or (extract-flag-value clean-tokens "--slot-id" nil)
                      (extract-flag-value clean-tokens "--slot" nil)
                      "default")
             min-seq (or (extract-long-flag clean-tokens "--min-seq" nil)
                         (extract-long-flag clean-tokens "--min-expected-seq" nil))
             out-file (extract-flag-value clean-tokens "--out-file" nil)
-            m {"cmd" "storage-get" "subnet_id" sub "slot" slot "slot_id" slot}]
+            m {"cmd" "storage-get" "slot" slot "slot_id" slot}]
         (cond-> m
+          sub (assoc "subnet_id" sub)
           min-seq (assoc "min_seq" min-seq "min_expected_seq" min-seq)
           out-file (assoc "out_file" out-file)))
 
@@ -1092,8 +1128,7 @@
 
       "capability-publish"
       (let [sub (or (extract-flag-value clean-tokens "--subnet-id" nil)
-                    (extract-flag-value clean-tokens "--subnet" nil)
-                    "global")
+                    (extract-flag-value clean-tokens "--subnet" nil))
             cap-id (or (extract-flag-value clean-tokens "--capability-id" nil)
                        (extract-flag-value clean-tokens "--cap-id" nil))
             cap-type (or (extract-flag-value clean-tokens "--capability-type" nil)
@@ -1109,8 +1144,9 @@
             target-cid (extract-flag-value clean-tokens "--target-cid" nil)
             seq-num (extract-long-flag clean-tokens "--seq" nil)
             meta (extract-flag-value clean-tokens "--metadata" nil)
-            m {"cmd" "capability-publish" "subnet_id" sub}]
+            m {"cmd" "capability-publish"}]
         (cond-> m
+          sub (assoc "subnet_id" sub)
           cap-id (assoc "capability_id" cap-id)
           cap-type (assoc "capability_type" cap-type)
           cap-path (assoc "capability_path" cap-path)
@@ -1124,8 +1160,7 @@
 
       "capability-resolve"
       (let [sub (or (extract-flag-value clean-tokens "--subnet-id" nil)
-                    (extract-flag-value clean-tokens "--subnet" nil)
-                    "global")
+                    (extract-flag-value clean-tokens "--subnet" nil))
             cap-id (or (extract-flag-value clean-tokens "--capability-id" nil)
                        (extract-flag-value clean-tokens "--cap-id" nil))
             auth (or (extract-flag-value clean-tokens "--authority" nil)
@@ -1133,8 +1168,9 @@
             path (extract-flag-value clean-tokens "--path" nil)
             min-seq (or (extract-long-flag clean-tokens "--min-seq" nil)
                         (extract-long-flag clean-tokens "--min-expected-seq" nil))
-            m {"cmd" "capability-resolve" "subnet_id" sub}]
+            m {"cmd" "capability-resolve"}]
         (cond-> m
+          sub (assoc "subnet_id" sub)
           cap-id (assoc "capability_id" cap-id)
           auth (assoc "authority" auth)
           path (assoc "path" path)

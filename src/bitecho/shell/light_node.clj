@@ -607,19 +607,63 @@
      effs)))
 
 (defn build-light-runtime-ctx
-  "BIP-025 F3: Projects live `jvm-light-telemetry-atom` storage and latency telemetry into
-   `runtime-ctx` for `status-core/render-status` (`bitecho.status/v1`)."
+  "BIP-025 F3 / BIP-026 S6.1: Projects live `jvm-light-telemetry-atom` storage and latency telemetry into
+   `runtime-ctx` for `status-core/render-status` (`bitecho.status/v1`), including live host usable disk bytes."
   []
   (let [tm @jvm-light-telemetry-atom
-        cs (cache/cache-storage-summary (:cache-index tm))]
-    {:storage (merge cs
-                     {:state-bytes (long (:state-bytes tm 0))
-                      :cache-budget-bytes (long (:cache-budget-bytes tm cache/default-max-cache-bytes))
-                      :events-log-bytes (long (:events-log-bytes tm 0))
-                      :events-log-max-bytes (long (:events-log-max-bytes tm cli/default-max-events-log-bytes))})
+        cs (cache/cache-storage-summary (:cache-index tm))
+        host-free (try
+                    (.getUsableSpace (io/file (or (:state-dir tm) ".")))
+                    (catch Exception _ nil))]
+    {:storage (cond-> (merge cs
+                             {:state-bytes (long (:state-bytes tm 0))
+                              :cache-budget-bytes (long (:cache-budget-bytes tm cache/default-max-cache-bytes))
+                              :events-log-bytes (long (:events-log-bytes tm 0))
+                              :events-log-max-bytes (long (:events-log-max-bytes tm cli/default-max-events-log-bytes))})
+                (integer? host-free) (assoc :host-free-disk-bytes (long host-free)))
      :latency {:state-save-ms (:state-save-ms tm)
                :ctl-ms (:ctl-ms tm)
                :event-loop-lag-ms (:event-loop-lag-ms tm)}}))
+
+(declare write-cache-blob!)
+
+(defn fetch-and-hydrate-artifact-blob!
+  "BIP-026 S3.1: Fail-closed HTTP read-through fetch for `artifact-get --cid` / `storage-get`
+   on local cache miss. Verifies `data/compute-cid` against `cid` before hydrating cache & state."
+  [state-dir state-atom relay-url cid]
+  (let [base (when (and (string? relay-url) (not (str/blank? relay-url)))
+               (str/replace (str/trim relay-url) #"/+$" ""))]
+    (if-not (and base (string? cid) (not (str/blank? cid)))
+      {:ok? false :error "missing-artifact" :attempted (if base [base] [])}
+      (try
+        (let [url (str base "/artifact/v1/blob/" cid)
+              req (-> (HttpRequest/newBuilder (URI/create url))
+                      (.timeout (Duration/ofMillis 15000))
+                      (.GET)
+                      (.build))
+              resp (.send ^HttpClient @shared-http11-client req (HttpResponse$BodyHandlers/ofByteArray))
+              status (.statusCode resp)]
+          (if (not= 200 status)
+            {:ok? false :error "missing-artifact" :status status :attempted [url]}
+            (let [^bytes bs (.body resp)
+                  actual-cid (data/compute-cid bs)]
+              (if (not= actual-cid cid)
+                (do
+                  (when state-atom
+                    (swap! state-atom update-in [:diagnostics :remote-blob-cid-mismatch] (fnil inc 0)))
+                  {:ok? false
+                   :error "blob-cid-mismatch"
+                   :expected-cid cid
+                   :actual-cid actual-cid
+                   :attempted [url]})
+                (let [blob (data/make-blob bs)]
+                  (when state-dir
+                    (try (write-cache-blob! state-dir cid bs) (catch Exception _ nil)))
+                  (when state-atom
+                    (swap! state-atom assoc-in [:artifact-blobs cid] blob))
+                  {:ok? true :cid cid :bytes bs :blob blob :source url})))))
+        (catch Exception e
+          {:ok? false :error "missing-artifact" :detail (.getMessage e) :attempted [base]})))))
 
 (defn save-light-state!
   "Persists sanitized light-node state via cross-platform Fressian (`state.fressian`)
@@ -836,18 +880,28 @@
             {:ok? false :error :cache-miss :cid norm-cid}))))))
 
 (defn maybe-hydrate-state-for-read!
-  "BIP-025 F7: Production read-through hydration for JVM `storage-get` / `artifact-get`.
+  "BIP-025 F7 + BIP-026 S3: Production read-through hydration for JVM `storage-get` / `artifact-get`.
    If the target CID is absent from hot `:blobs`/`:storage-blobs`/`:artifact-blobs`, hydrates
    it from `<state-dir>/cache/blobs/<2>/<cid>`, updates GDSF hit count (`cache/record-hit`),
-   and ephemerally injects it into the returned transient state map (leaving `state-atom` pruned)."
-  [state-dir state-atom eff-verb cmd-map]
-  (let [st @state-atom]
-    (if-let [target-cid (and state-dir (cache/resolve-read-target-cid st eff-verb cmd-map))]
-      (let [hyd (hydrate-cache-blob! state-dir target-cid state-atom)]
-        (if (:ok? hyd)
-          (cache/inject-hydrated-blob @state-atom target-cid (:blob hyd))
-          @state-atom))
-      st)))
+   and on local cache miss for `artifact-get` with `relay-urls`, performs fail-closed HTTP
+   read-through (`fetch-and-hydrate-artifact-blob!`) verifying `data/compute-cid`."
+  ([state-dir state-atom eff-verb cmd-map]
+   (maybe-hydrate-state-for-read! state-dir state-atom eff-verb cmd-map nil))
+  ([state-dir state-atom eff-verb cmd-map relay-urls]
+   (let [st @state-atom]
+     (if-let [target-cid (and state-dir (cache/resolve-read-target-cid st eff-verb cmd-map))]
+       (let [hyd (hydrate-cache-blob! state-dir target-cid state-atom)]
+         (if (:ok? hyd)
+           (cache/inject-hydrated-blob @state-atom target-cid (:blob hyd))
+           (let [urls (or (seq relay-urls)
+                          (seq (remove str/blank? [(get cmd-map "relay_url") (get cmd-map "relay")])))]
+             (if (and (= eff-verb "artifact-get") (seq urls))
+               (let [rem (fetch-and-hydrate-artifact-blob! state-dir urls target-cid state-atom)]
+                 (if (:ok? rem)
+                   (cache/inject-hydrated-blob @state-atom target-cid (:blob rem))
+                   @state-atom))
+               @state-atom))))
+       st))))
 
 (defn load-or-rebuild-cache-index!
   "BIP-025 §2.2 (Axiom A2): Loads `<state-dir>/cache/index.fressian` or, if missing/corrupt,
@@ -3621,6 +3675,25 @@
                             (assoc (dissoc committed :ok?)
                                    :net-envelopes (if (:ok? committed) (:net-envelopes prep) [])))))
 
+                      (and (= eff-domain-verb "artifact-put")
+                           (not (boolean (or (get effective-map-with-now "local_only")
+                                             (get effective-map-with-now "local-only")
+                                             (:local-only effective-map-with-now)))))
+                      (let [sub-str (str (or (get effective-map-with-now "subnet_id") (:subnet-id @state-atom) "global"))
+                            prep (light-core/prepare-artifact-put @state-atom effective-map-with-now (:privkey-bytes identity) sub-str)]
+                        (if-not (:ok? prep)
+                          (dissoc prep :ok?)
+                          (let [art-relay (or (get effective-map-with-now "relay_url")
+                                              (get effective-map-with-now "relay-url")
+                                              (:relay-url effective-map-with-now)
+                                              relay-url)
+                                net-receipt (if art-relay
+                                              (post-artifact-to-relay! art-relay "artifact-put" (:publish-intent prep))
+                                              {:ok? false :error "no-relay-configured" :confirmed-replicas []})
+                                committed (light-core/commit-artifact-put-outcome @state-atom (:publish-intent prep) net-receipt)]
+                            (assoc (dissoc committed :ok?)
+                                   :net-envelopes (if (:ok? committed) (:net-envelopes prep) [])))))
+
                       :else
                       (let [read-blob-cmd? (contains? #{"storage-get" "artifact-get"} eff-domain-verb)
                             hydrated-from-cache? (and read-blob-cmd?
@@ -3648,7 +3721,7 @@
                 res (if (:applied? out-write-res)
                       (assoc res :response (:response out-write-res) :state @state-atom)
                       res)
-                _ (when (contains? #{"artifact-put" "artifact-revoke"} eff-domain-verb)
+                _ (when (= "artifact-revoke" eff-domain-verb)
                     (when-let [art-relay (or (get effective-map "relay_url")
                                              (get effective-map "relay-url")
                                              (:relay-url effective-map)
@@ -5245,6 +5318,25 @@
                               (assoc (dissoc committed :ok?)
                                      :net-envelopes (if (:ok? committed) (:net-envelopes prep) [])))))
 
+                        (and (= eff-domain-verb "artifact-put")
+                             (not (boolean (or (get cmd-map "local_only")
+                                               (get cmd-map "local-only")
+                                               (:local-only cmd-map)))))
+                        (let [sub-str (str (or (get cmd-map "subnet_id") (:subnet-id @state-atom) "global"))
+                              prep (light-core/prepare-artifact-put @state-atom cmd-map (:privkey-bytes identity) sub-str)]
+                          (if-not (:ok? prep)
+                            (dissoc prep :ok?)
+                            (let [art-relay (or (get cmd-map "relay_url")
+                                                (get cmd-map "relay-url")
+                                                (:relay-url cmd-map)
+                                                effective-relay-url)
+                                  net-receipt (if art-relay
+                                                (post-artifact-to-relay! art-relay "artifact-put" (:publish-intent prep))
+                                                {:ok? false :error "no-relay-configured" :confirmed-replicas []})
+                                  committed (light-core/commit-artifact-put-outcome @state-atom (:publish-intent prep) net-receipt)]
+                              (assoc (dissoc committed :ok?)
+                                     :net-envelopes (if (:ok? committed) (:net-envelopes prep) [])))))
+
                         :else
                         (let [read-blob-cmd? (contains? #{"storage-get" "artifact-get"} eff-domain-verb)
                               hydrated-from-cache? (and read-blob-cmd?
@@ -5265,7 +5357,7 @@
                   res (if (:applied? out-write-res)
                         (assoc res :response (:response out-write-res) :state @state-atom)
                         res)
-                  _ (when (contains? #{"artifact-put" "artifact-revoke"} eff-domain-verb)
+                  _ (when (= "artifact-revoke" eff-domain-verb)
                       (when-let [art-relay (or (get cmd-map "relay_url")
                                                (get cmd-map "relay-url")
                                                (:relay-url cmd-map)

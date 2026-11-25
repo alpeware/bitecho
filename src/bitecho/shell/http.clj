@@ -18,6 +18,7 @@
             [bitecho.core.protocol.faucet :as faucet]
             [bitecho.core.protocol.relay :as relay]
             [bitecho.core.subnet :as subnet]
+            [bitecho.crypto :as crypto]
             [bitecho.fressian :as fressian]
             [bitecho.light-node.core :as light-core]
             [bitecho.shell.infra :as infra]
@@ -1068,6 +1069,18 @@
                        :response/headers {"Content-Type" "text/plain; charset=utf-8"}
                        :response/body "Not Found\n"})))
 
+                ;; BIP-026 S6.4: Permanent HTTP 301 redirect GET /app -> /app/ (preserving ?query)
+                (= raw-path "/app")
+                (let [q (get-in req [:request/uri :query])
+                      loc (if (and (string? q) (not (str/blank? q)))
+                            (str "/app/?" q)
+                            "/app/")]
+                  {:response/status 301
+                   :response/headers {"Location" loc
+                                      "Cache-Control" "public, max-age=86400"
+                                      "Content-Type" "text/plain; charset=utf-8"}
+                   :response/body (when (not= method :HEAD) (str "Moved Permanently: " loc "\n"))})
+
                 (or (= subpath "app") (str/starts-with? subpath "app/"))
                 (let [rel-res (infra/resolve-app-release-asset! rt raw-path now-ms)]
                   (cond
@@ -2100,25 +2113,110 @@
 
 (defn handle-directory-endpoint
   "Dispatches HTTP /directory/v1/* endpoints:
-   - GET/HEAD /directory/v1/<network-uri>/<nickname>
-   - GET/HEAD /directory/v1/<nickname>"
+   - GET/HEAD /directory/v1/<network-uri>/<path...>
+   - GET/HEAD /directory/v1/<nickname>
+   - POST /directory/v1/<network-uri>/<path...> (BIP-026 S5.1 / B9)"
   [^HttpExchange exchange req config target-rt]
   (let [path (get-in req [:request/uri :path])
         method (:request/method req)
         clean-path (str/replace path #"/+$" "")
-        now-ms (System/currentTimeMillis)]
-    (if-not (or (= method :GET) (= method :HEAD))
-      (send-response exchange
-                     {:response/status 405
-                      :response/headers {"Allow" "GET, HEAD" "Content-Type" "application/json; charset=utf-8"}
-                      :response/body (json/write-str {"ok" false "error" "method-not-allowed"})})
-      (let [subpath (subs clean-path (count "/directory/v1/"))
-            segs (remove str/blank? (str/split subpath #"/"))
-            ;; BIP-024 §2.2 (Blocker 2): Multi-segment /directory/v1/<network-uri>/<path...> routing
-            [net-uri dir-path] (if (>= (count segs) 2)
-                                 [(first segs) (str/join "/" (rest segs))]
-                                 [(or (:network-uri config) "bitecho.org") (first segs)])
-            resolved (when (and target-rt dir-path)
+        now-ms (System/currentTimeMillis)
+        subpath (subs clean-path (count "/directory/v1/"))
+        segs (remove str/blank? (str/split subpath #"/"))
+        ;; BIP-024 §2.2 (Blocker 2): Multi-segment /directory/v1/<network-uri>/<path...> routing
+        [net-uri dir-path] (if (>= (count segs) 2)
+                             [(first segs) (str/join "/" (rest segs))]
+                             [(or (:network-uri config) "bitecho.org") (first segs)])]
+    (cond
+      (= method :POST)
+      (if-not (and target-rt dir-path (light-core/valid-directory-path? dir-path))
+        (send-response exchange
+                       {:response/status 400
+                        :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                        :response/body (json/write-str {"ok" false "error" "invalid-directory-path" "path" dir-path})})
+        (let [[body-bytes exceeded?] (with-open [is (.getRequestBody exchange)]
+                                       (read-body-bounded is 65536))]
+          (if exceeded?
+            (send-response exchange
+                           {:response/status 413
+                            :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                            :response/body (json/write-str {"ok" false "error" "payload-too-large"})})
+            (let [ct (str/lower-case (str (first (get (:request/headers req) :header/content-type ""))))
+                  parsed (try
+                           (if (str/includes? ct "fressian")
+                             (fressian/decode-wire body-bytes)
+                             (json/read-str (String. ^bytes body-bytes StandardCharsets/UTF_8)))
+                           (catch Exception _ nil))
+                  pop-map (if (and (map? parsed) (map? (or (get parsed "pop") (:pop parsed))))
+                            (or (get parsed "pop") (:pop parsed))
+                            parsed)]
+              (if-not (and (map? pop-map) (light-core/verify-directory-pop pop-map))
+                (send-response exchange
+                               {:response/status 400
+                                :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                                :response/body (json/write-str {"ok" false "error" "invalid-directory-pop"})})
+                (let [out-bytes (if (str/includes? ct "fressian")
+                                  body-bytes
+                                  (.getBytes ^String (json/write-str pop-map) StandardCharsets/UTF_8))
+                      media-type (if (str/includes? ct "fressian")
+                                   "application/fressian"
+                                   "application/json")
+                      blob (data/make-blob out-bytes media-type)
+                      ptr-path (str "dir/" net-uri "/" dir-path)
+                      inst @(:subnet-atom target-rt)
+                      sid (or (get-in inst [:policy :subnet/id]) net-uri)
+                      prev-seq (long (or (get-in inst [:data :pointers [sid ptr-path] :pointer/seq]) 0))
+                      peer-id (:peer-identity target-rt)
+                      kp (when-not (and (:privkey-bytes peer-id) (:pubkey-hex peer-id))
+                           (crypto/generate-keypair (str "dir-authority-" sid)))
+                      auth-priv (or (:privkey-bytes peer-id) (:private kp))
+                      auth-pub (or (:pubkey-hex peer-id) (basalt/bytes->hex (:public kp)))
+                      pop-tuple ["bitecho-pointer-pop-v1"
+                                 (str/lower-case auth-pub)
+                                 (str sid)
+                                 ptr-path
+                                 (:blob/cid blob)
+                                 (str/lower-case auth-pub)
+                                 ""]
+                      pop-sig-raw (crypto/sign-canonical auth-priv pop-tuple)
+                      pop-sig (if (string? pop-sig-raw) pop-sig-raw (basalt/bytes->hex pop-sig-raw))
+                      ptr (data/sign-pointer auth-priv
+                                             {:pointer/subnet sid
+                                              :pointer/path ptr-path
+                                              :pointer/authority auth-pub
+                                              :pointer/seq (inc prev-seq)
+                                              :pointer/leader-term 1
+                                              :pointer/target (:blob/cid blob)
+                                              :pointer/proof {:proof/type :pop
+                                                              :agent-pubkey auth-pub
+                                                              :pop-sig pop-sig}
+                                              :pointer/timestamp now-ms})
+                      blob-res (infra/submit-event! target-rt {:type :put-blob :blob blob :sender auth-pub :now-ms now-ms})
+                      ptr-res (when (:applied? blob-res)
+                                (infra/submit-event! target-rt {:type :publish-pointer :pointer ptr :sender auth-pub :now-ms now-ms}))
+                      pk (or (get pop-map "pubkey") (:pubkey pop-map))]
+                  (if (and (:applied? blob-res) (:applied? ptr-res))
+                    (send-response exchange
+                                   {:response/status 200
+                                    :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                                    :response/body (json/write-str {"ok" true
+                                                                    "network_uri" net-uri
+                                                                    "path" dir-path
+                                                                    "uri" (str net-uri "/" dir-path)
+                                                                    "pubkey" pk
+                                                                    "cid" (:blob/cid blob)})})
+                    (let [err-kw (or (:error ptr-res) (:error blob-res) :directory-publish-rejected)]
+                      (when-let [da (:diagnostics-atom target-rt)]
+                        (swap! da update :http-directory-rejected (fnil inc 0)))
+                      (send-response exchange
+                                     {:response/status 403
+                                      :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                                      :response/body (json/write-str {"ok" false
+                                                                      "error" (name err-kw)
+                                                                      "path" dir-path})})))))))))
+
+      (or (= method :GET) (= method :HEAD))
+      (let [resolved (when (and target-rt dir-path)
                        (let [r1 (infra/resolve-path-blob! target-rt (str "dir/" net-uri "/" dir-path) now-ms)]
                          (if (:ok? r1)
                            r1
@@ -2140,7 +2238,13 @@
           (send-response exchange
                          {:response/status 404
                           :response/headers {"Content-Type" "application/json; charset=utf-8"}
-                          :response/body (json/write-str {"ok" false "error" "nickname-not-found" "nickname" dir-path "path" dir-path "network_uri" net-uri})}))))))
+                          :response/body (json/write-str {"ok" false "error" "nickname-not-found" "nickname" dir-path "path" dir-path "network_uri" net-uri})})))
+
+      :else
+      (send-response exchange
+                     {:response/status 405
+                      :response/headers {"Allow" "GET, HEAD, POST" "Content-Type" "application/json; charset=utf-8"}
+                      :response/body (json/write-str {"ok" false "error" "method-not-allowed"})}))))
 
 (defn handle-artifact-endpoint
   "Dispatches HTTP /artifact/v1/* endpoints (BIP-004 D30):
@@ -2916,7 +3020,8 @@
                                                             (when (map? env) (get-in env [:event :subnet-id]))
                                                             "global")
                                                  _ (when-let [colocated-val (:validator-node subnet-runtime)]
-                                                     (when gossip-msg
+                                                     (cond
+                                                       gossip-msg
                                                        (let [sender-pk (or edge-pk
                                                                            (when (map? env) (:agent-pubkey env))
                                                                            (get-in colocated-val [:identity :pubkey-hex]))
@@ -2933,7 +3038,23 @@
                                                             (fressian/encode-wire {:type :receive-gossip
                                                                                    :subnet-id sub-id
                                                                                    :message gossip-msg})
-                                                            nil)))))
+                                                            nil)))
+
+                                                       ;; BIP-026 S1.1 (B8): Forward valid wrap-agent-event receipts into consensus!
+                                                       (and (map? env) (map? (:event env)) (keyword? (get-in env [:event :type])))
+                                                       (let [unwrapped (try (mesh/unwrap-authenticated-agent-event env) (catch Exception _ nil))
+                                                             inner-ev (if (:signature env) unwrapped (:event env))
+                                                             sender-pk (when (map? inner-ev)
+                                                                         (or (:sender inner-ev)
+                                                                             (:agent-pubkey env)
+                                                                             edge-pk
+                                                                             (get-in colocated-val [:identity :pubkey-hex])))]
+                                                         (when (map? inner-ev)
+                                                           (when-let [net-in (get-in colocated-val [:shell-node :network-in])]
+                                                             (async/put! net-in (assoc inner-ev :sender sender-pk)))))
+
+                                                       :else
+                                                       (swap! relay-atom update-in [:diagnostics :relay-forward-unrecognized-envelope] (fnil inc 0))))
                                                  payload-to-send (if (and edge-pk edge-priv gossip-msg)
                                                                    (let [rewrapped (mesh/wrap-agent-event
                                                                                     {:type :receive-gossip

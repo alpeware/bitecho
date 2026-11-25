@@ -846,6 +846,13 @@
                                                  (done! {:status nil :body nil :error "timeout"})))
                             (.on req "error" (fn [e]
                                                (done! {:status nil :body nil :error (or (.-message e) (str e))})))
+                            ;; BIP-026 S6.3 (B11): Defensive .once socket ECONNRESET guard (no keep-alive listener leak)
+                            (.once req "socket"
+                                   (fn [sock]
+                                     (when sock
+                                       (.once sock "error"
+                                              (fn [e]
+                                                (done! {:status nil :body nil :error (or (.-message e) (str e))}))))))
                             (.write req body-buf)
                             (.end req))
                           (catch :default e
@@ -1499,21 +1506,33 @@
      effs)))
 
 (defn build-light-runtime-ctx
-  "BIP-025 §5.3 (F3): Builds the live `:storage` and `:latency` runtime-ctx map for
-   `bitecho.status.core/render-status` (`bitecho.status/v1`)."
+  "BIP-025 §5.3 (F3) / BIP-026 S6.1 (B11): Builds the live `:storage` and `:latency` runtime-ctx map for
+   `bitecho.status.core/render-status` (`bitecho.status/v1`), aligned with canonical status/core.cljc keys
+   and CLJS :advanced-safe `fs.statfsSync` host free disk bytes."
   []
   (let [t @light-runtime-telemetry-atom
-        idx (or (:cache-index t) (cache/init-cache-index))]
-    {:storage {:state-fressian-bytes (long (or (:state-bytes t) 0))
-               :cache-bytes (long (or (:total-bytes idx) 0))
-               :cache-budget-bytes (long (or (:cache-budget-bytes t) cache/default-max-cache-bytes))
-               :cache-entry-count (count (or (:entries idx) {}))
-               :cache-evictions (long (or (get-in t [:diagnostics :cache-blob-evicted]) 0))
-               :events-log-bytes (long (or (:events-log-bytes t) 0))
-               :events-log-max-bytes (long (or (:events-log-max-bytes t) cli/default-max-events-log-bytes))}
-     :latency {:save-ms (vec (or (:state-save-ms t) []))
+        idx (or (:cache-index t) (cache/init-cache-index))
+        cs (cache/cache-storage-summary idx)
+        host-free (try
+                    (when (fn? (.-statfsSync node-fs))
+                      (let [st (.statfsSync node-fs (or (:state-dir t) "."))]
+                        (when st
+                          (* (long (or (.-bavail st) (.-bfree st) 0))
+                             (long (or (.-bsize st) 0))))))
+                    (catch :default _ nil))]
+    {:storage (cond-> (merge cs
+                             {:state-bytes (long (or (:state-bytes t) 0))
+                              :cache-bytes (long (or (:total-bytes idx) (:cache-bytes cs) 0))
+                              :cache-index-bytes (long (or (:cache-index-bytes t) (:cache-index-bytes cs) 0))
+                              :cache-entries (long (or (:cache-entries cs) (count (or (:entries idx) {}))))
+                              :cache-budget-bytes (long (or (:cache-budget-bytes t) cache/default-max-cache-bytes))
+                              :cache-evictions (long (or (get-in t [:diagnostics :cache-blob-evicted]) 0))
+                              :events-log-bytes (long (or (:events-log-bytes t) 0))
+                              :events-log-max-bytes (long (or (:events-log-max-bytes t) cli/default-max-events-log-bytes))})
+                (number? host-free) (assoc :host-free-disk-bytes (long host-free)))
+     :latency {:state-save-ms (vec (or (:state-save-ms t) []))
                :ctl-ms (vec (or (:ctl-ms t) []))
-               :loop-lag-ms (vec (or (:event-loop-lag-ms t) []))}}))
+               :event-loop-lag-ms (vec (or (:event-loop-lag-ms t) []))}}))
 
 (declare dispatch-light-writer-effects!)
 
@@ -2367,6 +2386,12 @@
                            (finish! {:ok? false :status 0 :error "timeout"})))
       (.on req "error" (fn [e]
                          (finish! {:ok? false :status 0 :error (or (.-message e) (str e))})))
+      (.once req "socket"
+             (fn [sock]
+               (when sock
+                 (.once sock "error"
+                        (fn [e]
+                          (finish! {:ok? false :status 0 :error (or (.-message e) (str e))}))))))
       (when body-buf
         (.write req body-buf))
       (.end req))
@@ -4587,7 +4612,6 @@
   [raw-relay-url verb resp cb]
   (let [base-url (artifact-endpoint-base-url raw-relay-url)
         resp-ok? (and (map? resp) (true? (or (get resp "ok") (:ok resp))))
-        is-storage-put? (= (str verb) "storage-put")
         is-put? (contains? #{"artifact-put" "put" "storage-put"} (str verb))]
     (cond
       (not resp-ok?)
@@ -4627,10 +4651,6 @@
 
                                (and (:retryable? eval-res) (< attempt 2))
                                (js/setTimeout #(ptr-attempt! (inc attempt)) (* 250 (inc attempt)))
-
-                               (and is-put? (not is-storage-put?) (integer? (:status eval-res)) (<= 400 (:status eval-res) 499))
-                               ;; Blob was already durably stored; cross-subnet relays may return 400/403 on pointer index
-                               (when cb (cb {:ok? true :endpoints [base-url] :pointer-status (:status eval-res)}))
 
                                :else
                                (when cb
@@ -4779,7 +4799,7 @@
                                  status-cmd?
                                  (let [tel-diags (:diagnostics @light-runtime-telemetry-atom)]
                                    (-> st-before
-                                       (assoc :runtime-ctx (build-light-runtime-ctx))
+                                       (update :runtime-ctx merge (build-light-runtime-ctx))
                                        (update :diagnostics #(merge-with + (or % {}) (or tel-diags {})))))
 
                                  hydrated-from-cache?
@@ -6636,7 +6656,7 @@
                                                                             (some? (cache/resolve-read-target-cid @state-atom eff-domain-verb cmd-map)))
                                                   st-for-cmd (cond
                                                                (= verb "status")
-                                                               (assoc @state-atom :runtime-ctx (build-light-runtime-ctx))
+                                                               (update @state-atom :runtime-ctx merge (build-light-runtime-ctx))
 
                                                                hydrated-from-cache?
                                                                (maybe-hydrate-state-for-read! state-file @state-atom eff-domain-verb cmd-map {:sync? true :state-atom state-atom})

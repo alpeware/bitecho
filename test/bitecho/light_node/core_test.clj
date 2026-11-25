@@ -4325,7 +4325,7 @@
                              "subnet_id" "bitecho-dev"
                              "builder" pub-g
                              "auditor" pub-g
-                             "patch_cid" "cid-patch-001"
+                             "patch_cid" "1111111111111111111111111111111111111111111111111111111111111111"
                              "sha256" "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}
                             priv-e)
               ;; Valid 3-party settlement (maintainer Euler != builder Gauss != auditor Noether)
@@ -4336,7 +4336,7 @@
                            "subnet_id" "bitecho-dev"
                            "builder" pub-g
                            "auditor" pub-n
-                           "patch_cid" "cid-patch-001"
+                           "patch_cid" "1111111111111111111111111111111111111111111111111111111111111111"
                            "sha256" "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                            "burn" 100}
                           priv-e)

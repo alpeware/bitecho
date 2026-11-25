@@ -2069,7 +2069,8 @@
             sub-id (or (when (map? env) (:subnet-id env))
                        (when (map? env) (get-in env [:event :subnet-id]))
                        "global")]
-        (when gossip-msg
+        (cond
+          gossip-msg
           (let [sender-pk (or (when (map? env) (:agent-pubkey env))
                               (:default-sender rt)
                               (get-in vnode [:identity :pubkey-hex]))
@@ -2085,7 +2086,24 @@
                (fressian/encode-wire {:type :receive-gossip
                                       :subnet-id sub-id
                                       :message gossip-msg})
-               nil)))))
+               nil)))
+
+          ;; BIP-026 S1.1 (B8): Forward all valid wrap-agent-event receipts (:lock-intent, :release-intent,
+          ;; :refund-intent, :settle-intent, :bounty-*, :transfer, :burn, BIP-024 receipts) into consensus!
+          (and (map? env) (map? (:event env)) (keyword? (get-in env [:event :type])))
+          (let [unwrapped (try (core-mesh/unwrap-authenticated-agent-event env) (catch :default _ nil))
+                inner-ev (if (:signature env) unwrapped (:event env))
+                sender-pk (when (map? inner-ev)
+                            (or (:sender inner-ev)
+                                (:agent-pubkey env)
+                                (:default-sender rt)
+                                (get-in vnode [:identity :pubkey-hex])))]
+            (when (map? inner-ev)
+              (step-validator-event! vnode (assoc inner-ev :sender sender-pk) false)))
+
+          :else
+          (when-let [ra (:relay-atom rt)]
+            (swap! ra update-in [:diagnostics :relay-forward-unrecognized-envelope] (fnil inc 0)))))
       (catch :default _ nil))))
 
 (defn- handle-relay-endpoint!
@@ -2388,30 +2406,102 @@
             (str/trim (.readFileSync node-fs acme-file "utf8"))))))))
 
 (defn- handle-directory-endpoint!
-  [res rt clean-path method]
-  (if-not (contains? #{"GET" "HEAD"} method)
-    (send-json! res 405 {:ok false :error "method-not-allowed"})
-    (let [subpath (subs clean-path (count "/directory/v1/"))
-          segs (remove str/blank? (str/split subpath #"/"))
-          ;; BIP-024 §2.2 (Blocker 2): Multi-segment /directory/v1/<network-uri>/<path...> routing
-          [net-uri dir-path] (if (>= (count segs) 2)
-                               [(first segs) (str/join "/" (rest segs))]
-                               [(or (:domain (:config rt)) "bitecho.org") (first segs)])
-          now-ms (.now js/Date)
-          r (when dir-path
-              (let [r1 (resolve-path-blob! rt (str "dir/" net-uri "/" dir-path) now-ms)]
-                (if (:ok? r1) r1 (resolve-path-blob! rt (str "dir/" dir-path) now-ms))))]
-      (if (and r (:ok? r))
-        (let [blob (:blob r)
-              buf (u8->buf (:blob/bytes blob))
-              ct (if (= "application/fressian" (:blob/media-type blob))
-                   "application/fressian"
-                   "application/json; charset=utf-8")]
-          (.writeHead res 200 #js {"Content-Type" ct
-                                   "Cache-Control" "public, max-age=60"
-                                   "Content-Length" (.-length buf)})
-          (if (= method "HEAD") (.end res) (.end res buf)))
-        (send-json! res 404 {:ok false :error "nickname-not-found" :nickname dir-path :path dir-path :network_uri net-uri})))))
+  [req res rt clean-path method]
+  (let [subpath (subs clean-path (count "/directory/v1/"))
+        segs (remove str/blank? (str/split subpath #"/"))
+        ;; BIP-024 §2.2 (Blocker 2): Multi-segment /directory/v1/<network-uri>/<path...> routing
+        [net-uri dir-path] (if (>= (count segs) 2)
+                             [(first segs) (str/join "/" (rest segs))]
+                             [(or (:domain (:config rt)) "bitecho.org") (first segs)])
+        now-ms (.now js/Date)]
+    (cond
+      (= method "POST")
+      (if-not (and dir-path (light-core/valid-directory-path? dir-path))
+        (send-json! res 400 {:ok false :error "invalid-directory-path" :path dir-path})
+        (read-req-body-bounded!
+         req 65536
+         (fn [body-buf exceeded?]
+           (if exceeded?
+             (send-json! res 413 {:ok false :error "payload-too-large"})
+             (let [ct (str/lower-case (str (or (get-header req "content-type") "")))
+                   parsed (try
+                            (if (str/includes? ct "fressian")
+                              (fressian/decode-wire (buf->u8 body-buf))
+                              (js->clj (js/JSON.parse (.toString body-buf "utf8"))))
+                            (catch :default _ nil))
+                   pop-map (if (and (map? parsed) (map? (or (get parsed "pop") (:pop parsed))))
+                             (or (get parsed "pop") (:pop parsed))
+                             parsed)]
+               (if-not (and (map? pop-map) (light-core/verify-directory-pop pop-map))
+                 (send-json! res 400 {:ok false :error "invalid-directory-pop"})
+                 (let [out-u8 (if (str/includes? ct "fressian")
+                                (buf->u8 body-buf)
+                                (fressian/utf8->bytes (js/JSON.stringify (clj->js pop-map))))
+                       media-type (if (str/includes? ct "fressian") "application/fressian" "application/json")
+                       blob (data/make-blob out-u8 media-type)
+                       ptr-path (str "dir/" net-uri "/" dir-path)
+                       inst @(:subnet-atom rt)
+                       sid (or (get-in inst [:policy :subnet/id]) net-uri)
+                       prev-seq (long (or (get-in inst [:data :pointers [sid ptr-path] :pointer/seq]) 0))
+                       peer-id (:peer-identity rt)
+                       kp (when-not (and (:privkey-bytes peer-id) (:pubkey-hex peer-id))
+                            (crypto/generate-keypair (str "dir-authority-" sid)))
+                       auth-priv (or (:privkey-bytes peer-id) (:private kp))
+                       auth-pub (or (:pubkey-hex peer-id) (basalt/bytes->hex (:public kp)))
+                       pop-tuple ["bitecho-pointer-pop-v1"
+                                  (str/lower-case auth-pub)
+                                  (str sid)
+                                  ptr-path
+                                  (:blob/cid blob)
+                                  (str/lower-case auth-pub)
+                                  ""]
+                       pop-sig-raw (crypto/sign-canonical auth-priv pop-tuple)
+                       pop-sig (if (string? pop-sig-raw) pop-sig-raw (basalt/bytes->hex pop-sig-raw))
+                       ptr (data/sign-pointer auth-priv
+                                              {:pointer/subnet sid
+                                               :pointer/path ptr-path
+                                               :pointer/authority auth-pub
+                                               :pointer/seq (inc prev-seq)
+                                               :pointer/leader-term 1
+                                               :pointer/target (:blob/cid blob)
+                                               :pointer/proof {:proof/type :pop
+                                                               :agent-pubkey auth-pub
+                                                               :pop-sig pop-sig}
+                                               :pointer/timestamp now-ms})
+                       blob-res (submit-subnet-event! rt {:type :put-blob :blob blob :sender auth-pub :now-ms now-ms})
+                       ptr-res (when (:applied? blob-res)
+                                 (submit-subnet-event! rt {:type :publish-pointer :pointer ptr :sender auth-pub :now-ms now-ms}))
+                       pk (or (get pop-map "pubkey") (:pubkey pop-map))]
+                   (if (and (:applied? blob-res) (:applied? ptr-res))
+                     (send-json! res 200 {:ok true
+                                          :network_uri net-uri
+                                          :path dir-path
+                                          :uri (str net-uri "/" dir-path)
+                                          :pubkey pk
+                                          :cid (:blob/cid blob)})
+                     (let [err-kw (or (:error ptr-res) (:error blob-res) :directory-publish-rejected)]
+                       (send-json! res 403 {:ok false
+                                            :error (name err-kw)
+                                            :path dir-path}))))))))))
+
+      (contains? #{"GET" "HEAD"} method)
+      (let [r (when dir-path
+                (let [r1 (resolve-path-blob! rt (str "dir/" net-uri "/" dir-path) now-ms)]
+                  (if (:ok? r1) r1 (resolve-path-blob! rt (str "dir/" dir-path) now-ms))))]
+        (if (and r (:ok? r))
+          (let [blob (:blob r)
+                buf (u8->buf (:blob/bytes blob))
+                ct (if (= "application/fressian" (:blob/media-type blob))
+                     "application/fressian"
+                     "application/json; charset=utf-8")]
+            (.writeHead res 200 #js {"Content-Type" ct
+                                     "Cache-Control" "public, max-age=60"
+                                     "Content-Length" (.-length buf)})
+            (if (= method "HEAD") (.end res) (.end res buf)))
+          (send-json! res 404 {:ok false :error "nickname-not-found" :nickname dir-path :path dir-path :network_uri net-uri})))
+
+      :else
+      (send-json! res 405 {:ok false :error "method-not-allowed"}))))
 
 (defn- handle-faucet-endpoint!
   [req res rt faucet-atom clean-path query-str method]
@@ -2538,7 +2628,7 @@
       (handle-artifact-endpoint! req res rt clean-path query-str method)
 
       (str/starts-with? raw-path "/directory/v1/")
-      (handle-directory-endpoint! res rt clean-path method)
+      (handle-directory-endpoint! req res rt clean-path method)
 
       (and faucet-atom (str/starts-with? raw-path "/faucet/v1/"))
       (handle-faucet-endpoint! req res rt faucet-atom clean-path query-str method)
@@ -2687,6 +2777,19 @@
           (cond
             (str/starts-with? subpath "dist/")
             (handle-dist-request! req res config rt raw-path query-str method extra-hdrs limiter-atom)
+
+            ;; BIP-026 S6.4: Permanent HTTP 301 redirect GET /app -> /app/ (preserving ?query)
+            (= raw-path "/app")
+            (let [loc (if (and (string? query-str) (not (str/blank? query-str)))
+                        (str "/app/?" query-str)
+                        "/app/")
+                  body (str "Moved Permanently: " loc "\n")]
+              (.writeHead res 301 (clj->js (merge extra-hdrs
+                                                  {"Location" loc
+                                                   "Cache-Control" "public, max-age=86400"
+                                                   "Content-Type" "text/plain; charset=utf-8"
+                                                   "Content-Length" (.-length (.from js/Buffer body "utf8"))})))
+              (if (= method "HEAD") (.end res) (.end res body)))
 
             (or (= subpath "app") (str/starts-with? subpath "app/"))
             (let [rel-res (resolve-app-release-asset! rt raw-path now-ms)]

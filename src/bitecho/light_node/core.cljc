@@ -853,14 +853,23 @@
 
 (defn valid-directory-path?
   "Validates either a flat nickname (e.g. `alice`) or a BIP-024 hierarchical directory path
-   (e.g. `root/protocol/dev/nexus`) where every slash-separated segment satisfies `valid-petname?`."
+   (e.g. `root/protocol/dev/nexus`) where every slash-separated segment satisfies `valid-petname?`,
+   rejecting leading/trailing slashes, empty segments, and `.` / `..` traversal segments."
   [s]
-  (and (string? s)
-       (not (str/blank? s))
-       (let [trimmed (str/replace (str/trim s) #"^/+|/+$" "")
-             segs (str/split trimmed #"/")]
-         (and (seq segs)
-              (every? valid-petname? segs)))))
+  (boolean
+   (and (string? s)
+        (not (str/blank? s))
+        (let [t (str/trim s)]
+          (and (not (str/starts-with? t "/"))
+               (not (str/ends-with? t "/"))
+               (not (str/includes? t "//"))
+               (let [segs (str/split t #"/" -1)]
+                 (and (seq segs)
+                      (every? (fn [seg]
+                                (and (not (str/blank? seg))
+                                     (not (contains? #{"." ".."} seg))
+                                     (valid-petname? seg)))
+                              segs))))))))
 
 (defn normalize-directory-path
   "Normalizes a flat nickname or BIP-024 hierarchical directory path segment-by-segment."
@@ -945,7 +954,7 @@
       (boolean
        (when (and (map? pop-m)
                   (string? (:nickname pop-m))
-                  (valid-petname? (:nickname pop-m))
+                  (valid-directory-path? (:nickname pop-m))
                   (string? (:pubkey pop-m))
                   (valid-pubkey-hex? (:pubkey pop-m))
                   (string? (:domain pop-m))
@@ -957,7 +966,7 @@
                       (and (coll? (:home-set pop-m))
                            (every? (fn [x] (or (string? x) (keyword? x) (symbol? x))) (:home-set pop-m)))))
          (let [norm-domain (str/lower-case (str/trim (:domain pop-m)))
-               norm-nick (normalize-petname (:nickname pop-m))
+               norm-nick (normalize-directory-path (:nickname pop-m))
                norm-pub (normalize-pubkey-hex (:pubkey pop-m))
                hs (or (:home-set pop-m) [])
                sorted-hs (vec (sort (distinct (keep (fn [hn]
@@ -1010,7 +1019,7 @@
              (>= (long expires-epoch) (long issued-epoch)))
     (let [pop-m (normalize-wire-map pop-map)
           domain (str/lower-case (str/trim (or (:domain pop-m) "bitecho.org")))
-          norm-nick (normalize-petname (:nickname pop-m))
+          norm-nick (normalize-directory-path (:nickname pop-m))
           norm-pub (normalize-pubkey-hex (:pubkey pop-m))
           sorted-hs (vec (sort (distinct (keep (fn [hn]
                                                  (let [n (rendezvous/normalize-home-node hn)]
@@ -1095,7 +1104,7 @@
 
         :else
         (let [domain (str/lower-case (str/trim (:domain desc)))
-              norm-nick (normalize-petname (:nickname desc))
+              norm-nick (normalize-directory-path (:nickname desc))
               norm-pub (normalize-pubkey-hex (:pubkey desc))
               hs (or (:home-set desc) [])
               sorted-hs (vec (sort (distinct (keep (fn [hn]
@@ -1551,7 +1560,9 @@
                                                         (if (keyword? s) s (keyword s)))
                                                set-ep (when-let [se (or (:settled-epoch esc) (get esc "settled-epoch") (:settled_epoch esc) (get esc "settled_epoch"))] (long se))
                                                net-a (when-let [na (or (:net-amount esc) (get esc "net-amount") (:net_amount esc) (get esc "net_amount"))] (long na))
-                                               ref-r (or (:refund-reason esc) (get esc "refund-reason") (:refund_reason esc) (get esc "refund_reason"))]
+                                               ref-r (or (:refund-reason esc) (get esc "refund-reason") (:refund_reason esc) (get esc "refund_reason"))
+                                               p-hash (or (:puzzle-hash esc) (get esc "puzzle-hash") (:puzzle_hash esc) (get esc "puzzle_hash"))
+                                               p-src (or (:puzzle-source esc) (get esc "puzzle-source") (:puzzle_source esc) (get esc "puzzle_source"))]
                                            (cond-> {:escrow-id eid
                                                     :payer payer
                                                     :receiver receiver
@@ -1562,7 +1573,9 @@
                                                     :status st-val}
                                              set-ep (assoc :settled-epoch set-ep)
                                              net-a (assoc :net-amount net-a)
-                                             ref-r (assoc :refund-reason ref-r))))
+                                             ref-r (assoc :refund-reason ref-r)
+                                             p-hash (assoc :puzzle-hash p-hash)
+                                             p-src (assoc :puzzle-source p-src))))
                                        escrows-vec)]
           {:ok? true
            :snapshot (cond-> {:bitecho/type :chain-state-snapshot
@@ -4794,34 +4807,69 @@
             raw-psrc (or (get cmd-map "puzzle_source") (get cmd-map "puzzle-source")
                          (:puzzle_source cmd-map) (:puzzle-source cmd-map))
             raw-sol (or (get cmd-map "solution") (:solution cmd-map))
-            solution (when (some? raw-sol) (parse-structured-arg raw-sol))
+            parsed-sol (when (some? raw-sol) (parse-structured-arg raw-sol))
+            solution (if (and (map? parsed-sol)
+                              (or (string? (:mode parsed-sol))
+                                  (string? (get parsed-sol "mode"))))
+                       (let [m-str (or (:mode parsed-sol) (get parsed-sol "mode"))]
+                         (-> parsed-sol
+                             (dissoc "mode")
+                             (assoc :mode (keyword m-str))))
+                       parsed-sol)
             local-escrow (get-in state [:escrows escrow-id])
             d-hash (or (when local-escrow (:deliverable-hash local-escrow))
                        (get cmd-map "deliverable_hash") (get cmd-map "deliverable-hash")
                        (:deliverable_hash cmd-map) (:deliverable-hash cmd-map))
+            p-hash (when local-escrow (:puzzle-hash local-escrow))
+            eff-psrc (or (when (and (string? raw-psrc) (not (str/blank? raw-psrc))) raw-psrc)
+                         (when local-escrow (:puzzle-source local-escrow))
+                         (when (= p-hash (puzzle/standard-htlc-cid))
+                           puzzle/standard-htlc-puzzle-source))
             is-puzzle? (or (and (string? raw-psrc) (not (str/blank? raw-psrc)))
-                           (and local-escrow (:puzzle-hash local-escrow)))
-            final-sig (or raw-sig
-                          (when (and (not is-puzzle?)
-                                     (= (:pubkey state) (when local-escrow (:payer local-escrow)))
-                                     (string? d-hash))
-                            (escrow/sign-escrow-release privkey-bytes escrow-id d-hash)))
-            release-payload (cond-> {:type :release-intent
-                                     :escrow-id escrow-id
-                                     :epoch (effective-chain-epoch state)
-                                     :receipt-id (str "release:" escrow-id)}
-                              preimage (assoc :preimage preimage)
-                              final-sig (assoc :payer-signature final-sig)
-                              raw-psrc (assoc :puzzle-source raw-psrc)
-                              (some? solution) (assoc :solution solution))
-            envelope (wrap-agent-event release-payload (:pubkey state) privkey-bytes)
-            new-state (if local-escrow
-                        (assoc-in state [:escrows escrow-id :status] :release-submitted)
-                        state)]
-        {:state new-state
-         :response {"ok" true "escrow_id" escrow-id "intent_id" escrow-id "status" "release-submitted"}
-         :net-envelopes [envelope]
-         :stdout-events []}))))
+                           (some? p-hash))
+            ;; BIP-026 S1.3 (B8): Receiver-safe local fail-closed eval-puzzle pre-validation
+            ;; Runs ONLY when complete escrow + puzzle context AND a solution/puzzle-source are present.
+            local-eval (when (and local-escrow
+                                  eff-psrc
+                                  (or (some? solution)
+                                      (and (string? raw-psrc) (not (str/blank? raw-psrc)))))
+                         (puzzle/eval-puzzle eff-psrc
+                                             solution
+                                             {:amount (long (or (:amount local-escrow) 0))
+                                              :receiver (:receiver local-escrow)
+                                              :payer (:payer local-escrow)
+                                              :deliverable-hash d-hash
+                                              :puzzle-hash p-hash
+                                              :epoch (effective-chain-epoch state)
+                                              :escrow-id escrow-id}))]
+        (if (and local-eval (not (:valid? local-eval)))
+          {:state state
+           :response (cond-> {"ok" false
+                              "error" (name (or (:error local-eval) :puzzle-eval-failed))}
+                       (:message local-eval) (assoc "detail" (:message local-eval)))
+           :net-envelopes []
+           :stdout-events []}
+          (let [final-sig (or raw-sig
+                              (when (and (not is-puzzle?)
+                                         (= (:pubkey state) (when local-escrow (:payer local-escrow)))
+                                         (string? d-hash))
+                                (escrow/sign-escrow-release privkey-bytes escrow-id d-hash)))
+                release-payload (cond-> {:type :release-intent
+                                         :escrow-id escrow-id
+                                         :epoch (effective-chain-epoch state)
+                                         :receipt-id (str "release:" escrow-id)}
+                                  preimage (assoc :preimage preimage)
+                                  final-sig (assoc :payer-signature final-sig)
+                                  raw-psrc (assoc :puzzle-source raw-psrc)
+                                  (some? solution) (assoc :solution solution))
+                envelope (wrap-agent-event release-payload (:pubkey state) privkey-bytes)
+                new-state (if local-escrow
+                            (assoc-in state [:escrows escrow-id :status] :release-submitted)
+                            state)]
+            {:state new-state
+             :response {"ok" true "escrow_id" escrow-id "intent_id" escrow-id "status" "release-submitted"}
+             :net-envelopes [envelope]
+             :stdout-events []}))))))
 
 (defn- exec-refund-intent [state cmd-map privkey-bytes]
   (let [escrow-id (or (get cmd-map "intent_id") (get cmd-map "intent-id")
@@ -5917,35 +5965,60 @@
 
 (declare dispatch-multiplexed-command)
 
+(defn- derive-parent-subnet-id
+  "BIP-026 S4.1: Derives parent subnet ID from:
+   1. explicit parent-sid,
+   2. parent prefix of hierarchical sub-id (stripping final /segment),
+   3. (:subnet-id state) when distinct from sub-id,
+   4. fallback \"global\"."
+  [state sub-id explicit-parent]
+  (cond
+    (and (string? explicit-parent) (not (str/blank? explicit-parent)))
+    explicit-parent
+
+    (and (string? sub-id) (str/includes? sub-id "/"))
+    (let [idx (.lastIndexOf ^String sub-id "/")]
+      (if (pos? idx) (subs sub-id 0 idx) (or (:subnet-id state) "global")))
+
+    (and (string? (:subnet-id state))
+         (not (str/blank? (:subnet-id state)))
+         (not= (:subnet-id state) sub-id))
+    (:subnet-id state)
+
+    :else
+    "global"))
+
 (defn- ensure-light-node-subnet-mux
-  [state sub-id privkey-bytes]
-  (if (or (contains? (:subnets state) sub-id)
-          (:bitecho.subnet/unified? state)
-          (nil? privkey-bytes)
-          (nil? (:pubkey state))
-          (= sub-id "global"))
-    state
-    (let [parent-sid "global"
-          parent-policy {:subnet/id parent-sid
-                         :subnet/gate {:gate/mode :permissionless :gate/admission :open}
-                         :subnet/economy {:economy/mode :burn-only :economy/burn-floor 0}
-                         :subnet/path-acl [{:pattern "anchor/*" :principal {:type :allowlist}}]
-                         :subnet/replication {:replication/pointers :gossip-crdt :replication/blobs :eager-push}}
-          child-policy {:subnet/id sub-id
-                        :subnet/parent-id parent-sid
-                        :subnet/gate {:gate/mode :permissioned :gate/admission :allowlist :gate/trust-anchors #{(:pubkey state)}}
-                        :subnet/economy {:economy/mode :none :economy/burn-floor 0 :economy/settlement-take-bps 0}
-                        :subnet/path-acl [{:pattern "head/*" :principal {:type :allowlist}}]
-                        :subnet/replication {:replication/pointers :gossip-crdt :replication/blobs :eager-push}
-                        :subnet/anchoring {:trigger :epoch
-                                           :authority-privkey privkey-bytes
-                                           :authority-pubkey (:pubkey state)}}
-          parent-inst (:instance (core-subnet/init-subnet-instance parent-policy))
-          child-inst (:instance (core-subnet/init-subnet-instance child-policy))]
-      (update state :subnets (fn [m]
-                               (assoc (or m {})
-                                      parent-sid (or (get m parent-sid) parent-inst)
-                                      sub-id child-inst))))))
+  ([state sub-id privkey-bytes]
+   (ensure-light-node-subnet-mux state sub-id privkey-bytes nil))
+  ([state sub-id privkey-bytes explicit-parent]
+   (if (or (contains? (:subnets state) sub-id)
+           (:bitecho.subnet/unified? state)
+           (nil? privkey-bytes)
+           (nil? (:pubkey state))
+           (= sub-id "global"))
+     state
+     (let [parent-sid (derive-parent-subnet-id state sub-id explicit-parent)
+           parent-policy {:subnet/id parent-sid
+                          :subnet/gate {:gate/mode :permissionless :gate/admission :open :gate/trust-anchors #{(:pubkey state)}}
+                          :subnet/economy {:economy/mode :burn-only :economy/burn-floor 0}
+                          :subnet/path-acl [{:pattern "anchor/*" :principal {:type :allowlist :pubkeys #{(:pubkey state)}}}]
+                          :subnet/replication {:replication/pointers :gossip-crdt :replication/blobs :eager-push}}
+           child-policy {:subnet/id sub-id
+                         :subnet/parent-id parent-sid
+                         :subnet/gate {:gate/mode :permissioned :gate/admission :allowlist :gate/trust-anchors #{(:pubkey state)}}
+                         :subnet/economy {:economy/mode :none :economy/burn-floor 0 :economy/settlement-take-bps 0}
+                         :subnet/path-acl [{:pattern "head/*" :principal {:type :allowlist}}]
+                         :subnet/replication {:replication/pointers :gossip-crdt :replication/blobs :eager-push}
+                         :subnet/anchoring {:trigger :epoch
+                                            :authority-privkey privkey-bytes
+                                            :authority-pubkey (:pubkey state)}}
+           parent-inst (:instance (core-subnet/init-subnet-instance parent-policy))
+           child-inst (:instance (core-subnet/init-subnet-instance child-policy))]
+       (update state :subnets (fn [m]
+                                (assoc (or m {})
+                                       parent-sid (or (get m parent-sid) parent-inst)
+                                       sub-id child-inst)))))))
 
 (defn- anchor-effects->net-envelopes
   [state privkey-bytes effects]
@@ -5960,14 +6033,44 @@
                  (build-gossip-envelope (:pubkey state) privkey-bytes payload burn-amt parent-sid))))
            effects))))
 
+(defn- store-anchor-in-parent-subnet
+  "BIP-026 S2.1 (B10): Persists a newly created anchor pointer & blob into the local parent
+   subnet `:data` so `verify-subnet-anchor` auto-resolves 2-tuple `[parent-sid \"anchor/<child>\"]`."
+  [mux-st effects anchor-map]
+  (let [eff-anchors (filter #(= :anchor-to-parent (:type %)) (or effects []))
+        items (if (seq eff-anchors)
+                eff-anchors
+                (when (and (map? anchor-map) (:pointer anchor-map) (:blob anchor-map))
+                  [{:parent-subnet (get-in anchor-map [:pointer :pointer/subnet])
+                    :pointer (:pointer anchor-map)
+                    :blob (:blob anchor-map)}]))]
+    (reduce
+     (fn [st item]
+       (let [ptr (:pointer item)
+             blob (:blob item)
+             parent-sid (or (:parent-subnet item) (:pointer/subnet ptr))
+             ptr-path (:pointer/path ptr)
+             cid (:blob/cid blob)]
+         (if (and parent-sid ptr-path cid (contains? (:subnets st) parent-sid))
+           (-> st
+               (assoc-in [:subnets parent-sid :data :pointers [parent-sid ptr-path]] ptr)
+               (assoc-in [:subnets parent-sid :data :blobs :entries cid] blob))
+           st)))
+     mux-st
+     items)))
+
 (defn- exec-anchor-subnet
   [state effective-map privkey-bytes sub-id]
-  (let [state (ensure-light-node-subnet-mux state sub-id privkey-bytes)]
+  (let [explicit-parent (or (get effective-map "parent_subnet")
+                            (get effective-map "parent-subnet")
+                            (:parent-subnet effective-map))
+        state (ensure-light-node-subnet-mux state sub-id privkey-bytes explicit-parent)]
     (cond
       (contains? (:subnets state) sub-id)
       (let [res (dispatch-multiplexed-command state sub-id (assoc effective-map :type :anchor-subnet) privkey-bytes)
-            anchor-envs (anchor-effects->net-envelopes state privkey-bytes (:effects res))]
-        {:state (:mux res)
+            anchor-envs (anchor-effects->net-envelopes state privkey-bytes (:effects res))
+            next-mux (store-anchor-in-parent-subnet (:mux res) (:effects res) (get-in res [:response "anchor"]))]
+        {:state next-mux
          :response (:response res)
          :effects (or (:effects res) [])
          :net-envelopes (into (vec (or (:net-envelopes res) [])) anchor-envs)
@@ -6029,11 +6132,34 @@
 
 (defn- exec-verify-subnet-anchor
   [state effective-map sub-id]
-  (let [ptr (or (:pointer effective-map) (get effective-map "pointer"))
-        blob (or (:blob effective-map) (get effective-map "blob"))
-        prev-anchor (or (:prev-anchor effective-map) (:prev-anchor-entry effective-map) (get effective-map "prev_anchor"))
-        parent-sid (or (get effective-map "parent_subnet") (get effective-map "parent-subnet") (:parent-subnet effective-map) sub-id "global")
+  (let [child-sid (or (get effective-map "subnet_id")
+                      (get effective-map "subnet-id")
+                      (:subnet-id effective-map)
+                      sub-id)
+        explicit-parent (or (get effective-map "parent_subnet")
+                            (get effective-map "parent-subnet")
+                            (:parent-subnet effective-map))
+        parent-sid (derive-parent-subnet-id state child-sid explicit-parent)
         parent-inst (when (:subnets state) (get-in state [:subnets parent-sid]))
+        anchor-path (when child-sid (str "anchor/" child-sid))
+        ptr-key (when anchor-path [parent-sid anchor-path])
+        explicit-ptr (or (:pointer effective-map) (get effective-map "pointer"))
+        explicit-blob (or (:blob effective-map) (get effective-map "blob"))
+        ;; BIP-026 S2.1 (B10): Auto-resolve stored 2-tuple [parent-sid "anchor/<child>"] pointer & blob
+        ptr (or explicit-ptr
+                (when (and parent-inst ptr-key)
+                  (or (get-in parent-inst [:data :pointers ptr-key])
+                      (get-in parent-inst [:pointers ptr-key])))
+                (when ptr-key
+                  (get-in state [:artifact-pointers ptr-key])))
+        target-cid (when (map? ptr) (:pointer/target ptr))
+        blob (or explicit-blob
+                 (when (and parent-inst target-cid)
+                   (or (get-in parent-inst [:data :blobs :entries target-cid])
+                       (get-in parent-inst [:blobs target-cid])))
+                 (when target-cid
+                   (get-in state [:artifact-blobs target-cid])))
+        prev-anchor (or (:prev-anchor effective-map) (:prev-anchor-entry effective-map) (get effective-map "prev_anchor"))
         now-ms (long (or (:now-ms effective-map) 0))
         parent-ctx (cond
                      (and parent-inst (:bitecho.subnet/unified? parent-inst))
@@ -6043,14 +6169,22 @@
                      (core-subnet/pointer-verify-ctx state nil now-ms)
 
                      :else
-                     (or (:parent-ctx effective-map) (get effective-map "parent_ctx") {}))
-        res (core-subnet/verify-subnet-anchor ptr blob parent-ctx prev-anchor)]
-    {:state state
-     :response (if (:ok? res)
-                 {"ok" true "verified" true "child_subnet" (:child-subnet res) "merkle_root" (:merkle-root res) "child_epoch" (:child-epoch res) "anchor_seq" (:anchor-seq res)}
-                 {"ok" false "error" (str (:error res))})
-     :net-envelopes []
-     :stdout-events []}))
+                     (or (:parent-ctx effective-map) (get effective-map "parent_ctx") {}))]
+    (if (and (nil? explicit-ptr) (nil? ptr))
+      {:state state
+       :response {"ok" false
+                  "error" "anchor-not-found"
+                  "child_subnet" child-sid
+                  "parent_subnet" parent-sid}
+       :net-envelopes []
+       :stdout-events []}
+      (let [res (core-subnet/verify-subnet-anchor ptr blob parent-ctx prev-anchor)]
+        {:state state
+         :response (if (:ok? res)
+                     {"ok" true "verified" true "child_subnet" (:child-subnet res) "merkle_root" (:merkle-root res) "child_epoch" (:child-epoch res) "anchor_seq" (:anchor-seq res)}
+                     {"ok" false "error" (str (:error res))})
+         :net-envelopes []
+         :stdout-events []}))))
 
 (defn- exec-puzzle-hash
   [state cmd-map]
@@ -6448,6 +6582,165 @@
 
       :else
       nil)))
+
+(defn prepare-artifact-put
+  "BIP-026 S4.2 (B10): Phase 1 of 2-phase fail-closed `artifact-put`.
+   Validates path, payload, sequence monotonicity, and burn sufficiency WITHOUT mutating
+   committed local pointer state or deducting burn until replica confirmation succeeds."
+  [state effective-map privkey-bytes sub-id]
+  (let [raw-burn (if (contains? effective-map "burn")
+                   (get effective-map "burn")
+                   (:burn effective-map))
+        default-burn (if (get state :economy-enabled? true)
+                       (max 100 (effective-signaling-burn-floor state))
+                       0)
+        burn-amt (max 0 (long (if (some? raw-burn)
+                                (or (parse-long-safe raw-burn default-burn) default-burn)
+                                default-burn)))
+        burn-chk (check-and-deduct-burn state burn-amt)]
+    (if-not (:ok? burn-chk)
+      {:ok? false :state state :response {"ok" false "error" (:error burn-chk)} :net-envelopes [] :stdout-events []}
+      (let [subnet (str (or (get effective-map "subnet_id")
+                            (get effective-map "subnet-id")
+                            (:subnet-id effective-map)
+                            sub-id
+                            (:subnet-id state)
+                            "global"))
+            raw-path (str (or (get effective-map "path") (:path effective-map) ""))
+            path (str/replace (str/trim raw-path) #"^/+" "")
+            bs (extract-artifact-bytes effective-map)]
+        (cond
+          (or (str/blank? path) (str/includes? path ".."))
+          {:ok? false
+           :state (update-in state [:diagnostics :artifact-put-rejected] (fnil inc 0))
+           :response {"ok" false "error" "invalid-artifact-path" "path" path}
+           :net-envelopes []
+           :stdout-events []}
+
+          (nil? bs)
+          {:ok? false
+           :state (update-in state [:diagnostics :artifact-put-rejected] (fnil inc 0))
+           :response {"ok" false "error" "missing-artifact-payload" "path" path}
+           :net-envelopes []
+           :stdout-events []}
+
+          :else
+          (let [blob (data/make-blob bs)
+                cid (:blob/cid blob)
+                local-prev-seq (long (or (get-in state [:artifact-min-seqs [subnet path]])
+                                         (when-let [p (get-in state [:artifact-pointers [subnet path]])]
+                                           (:pointer/seq p))
+                                         (when-let [t (get-in state [:artifact-tombstones [subnet path]])]
+                                           (:pointer/seq t))
+                                         0))
+                remote-seq (long (or (parse-long-safe (or (get effective-map "min_remote_seq") (:min-remote-seq effective-map)) 0) 0))
+                prev-seq (max local-prev-seq remote-seq)
+                explicit-seq (parse-long-safe (or (get effective-map "seq") (:seq effective-map)) nil)
+                seq-num (long (if (some? explicit-seq) explicit-seq (inc prev-seq)))]
+            (if (<= seq-num prev-seq)
+              {:ok? false
+               :state (update-in state [:diagnostics :stale-pointer-seq] (fnil inc 0))
+               :response {"ok" false "error" "stale-pointer-seq" "seq" seq-num "current_seq" prev-seq "path" path}
+               :net-envelopes []
+               :stdout-events []}
+              (let [my-pub (normalize-pubkey-hex (:pubkey state))
+                    fallback-kp (when-not privkey-bytes
+                                  (crypto/generate-keypair (str "artifact-authority-" my-pub)))
+                    eff-priv (or privkey-bytes (:private fallback-kp))
+                    eff-pub (if privkey-bytes my-pub (basalt/bytes->hex (:public fallback-kp)))
+                    ts (now-utc-ms)
+                    raw-replicas (or (get effective-map "replicas") (:replicas effective-map) (:artifact-replicas state))
+                    replicas (when (sequential? raw-replicas) (vec (map str raw-replicas)))
+                    unsigned-ptr (cond-> {:pointer/subnet subnet
+                                          :pointer/path path
+                                          :pointer/authority eff-pub
+                                          :pointer/seq seq-num
+                                          :pointer/leader-term 1
+                                          :pointer/target cid
+                                          :pointer/proof {:proof/type :self}
+                                          :pointer/timestamp ts}
+                                   (seq replicas) (assoc :pointer/replicas replicas))
+                    ptr (cond-> (assoc (data/sign-pointer eff-priv unsigned-ptr) :pointer/timestamp ts)
+                          (seq replicas) (assoc :pointer/replicas replicas))
+                    rep-payload {:protocol-version current-wire-version
+                                 :type :artifact-replicate
+                                 :subnet-id subnet
+                                 :blob blob
+                                 :pointer ptr}
+                    gossip-env (when (not (boolean (or (get effective-map "local_only")
+                                                       (get effective-map "local-only")
+                                                       (:local-only effective-map))))
+                                 (build-gossip-envelope eff-pub eff-priv (freeze-payload rep-payload) burn-amt subnet))]
+                {:ok? true
+                 :state state
+                 :publish-intent {:subnet subnet
+                                  :path path
+                                  :cid cid
+                                  :seq seq-num
+                                  :burn burn-amt
+                                  :blob blob
+                                  :pointer ptr
+                                  "cid" cid
+                                  "blob" blob
+                                  "pointer" ptr}
+                 :net-envelopes (if gossip-env [gossip-env] [])
+                 :stdout-events []}))))))))
+
+(defn commit-artifact-put-outcome
+  "BIP-026 S4.2 (B10): Phase 2 of 2-phase fail-closed `artifact-put`.
+   Commits pointer, blob, and burn ONLY when `net-receipt` confirms `>= 1` replica
+   (or `:ok? true` with confirmed endpoints). On 0 confirmed replicas / upload failure,
+   returns `artifact-replica-quorum-unmet` with ZERO local pointer advance and ZERO burn."
+  [state publish-intent net-receipt]
+  (let [{:keys [subnet path cid seq burn blob pointer]} publish-intent
+        confirmed (vec (or (:confirmed-replicas net-receipt)
+                           (:endpoints net-receipt)
+                           (when (:ok? net-receipt) ["relay"])
+                           []))
+        ok? (and (true? (:ok? net-receipt)) (pos? (count confirmed)))]
+    (if-not ok?
+      (let [diag {"reason" "artifact-replica-quorum-unmet"
+                  "confirmed_replicas" confirmed
+                  "upload_error" (or (:error net-receipt) "upload-failed")
+                  "status" (:status net-receipt)}]
+        {:ok? false
+         :state (update-in state [:diagnostics :artifact-replica-quorum-unmet] (fnil inc 0))
+         :response {"ok" false
+                    "error" "artifact-replica-quorum-unmet"
+                    "subnet_id" subnet
+                    "path" path
+                    "cid" cid
+                    "confirmed_replicas" confirmed
+                    "diagnose" diag}
+         :net-envelopes []
+         :stdout-events []})
+      (let [burn-chk (check-and-deduct-burn state (long (or burn 0)))]
+        (if-not (:ok? burn-chk)
+          {:ok? false
+           :state state
+           :response {"ok" false "error" (:error burn-chk)}
+           :net-envelopes []
+           :stdout-events []}
+          (let [st-after-burn (:state burn-chk)
+                next-state (-> st-after-burn
+                               (assoc-in [:artifact-blobs cid] blob)
+                               (assoc-in [:artifact-pointers [subnet path]] pointer)
+                               (assoc-in [:artifact-min-seqs [subnet path]] seq))]
+            {:ok? true
+             :state next-state
+             :response {"ok" true
+                        "subnet_id" subnet
+                        "path" path
+                        "cid" cid
+                        "seq" seq
+                        "size_bytes" (fressian/count-bytes (:blob/bytes blob))
+                        "confirmed_replicas" confirmed
+                        "burn" (long (or burn 0))
+                        "blob" blob
+                        "pointer" pointer}
+             :cache-effects [{:effect :put-cache-blob :cid cid :bytes (:blob/bytes blob)}]
+             :net-envelopes []
+             :stdout-events []}))))))
 
 (defn- exec-artifact-put
   [state effective-map privkey-bytes sub-id]
@@ -7299,191 +7592,214 @@
 (defn- exec-bounty-create
   [state effective-map privkey-bytes sub-id]
   (let [subnet (str (or (get effective-map "subnet_id") (get effective-map "subnet-id") (:subnet-id effective-map) sub-id gov/dev-subnet-id))
-        bounty-id (str (or (get effective-map "bounty_id") (get effective-map "bounty-id") (:bounty-id effective-map) ""))
+        bounty-id (str/trim (str (or (get effective-map "bounty_id") (get effective-map "bounty-id") (:bounty-id effective-map) "")))
         target-cid (str (or (get effective-map "target_bip_cid") (get effective-map "target-bip-cid") (:target-bip-cid effective-map)
                             (get effective-map "bip_id") (get effective-map "bip-id") (:bip-id effective-map) ""))
-        gross (max 0 (long (or (parse-long-safe (or (get effective-map "gross_amount") (get effective-map "gross-amount") (:gross-amount effective-map)
-                                                    (get effective-map "amount") (:amount effective-map)) 0) 0)))
-        burn-amt (max 0 (long (or (parse-long-safe (or (get effective-map "burn") (:burn effective-map)) 0) 0)))
-        total-deduct (+ gross burn-amt)
-        deduct-chk (check-and-deduct-burn state total-deduct)]
-    (if-not (:ok? deduct-chk)
-      {:state state :response {"ok" false "error" (:error deduct-chk)} :net-envelopes [] :stdout-events []}
-      (let [st-after-deduct (:state deduct-chk)
-            m-pub (or (get effective-map "maintainer_pubkey") (get effective-map "maintainer-pubkey") (:maintainer-pubkey effective-map) (:pubkey state))
-            take-bps (parse-long-safe (or (get effective-map "take_bps") (get effective-map "take-bps") (:take-bps effective-map)) 50)
-            builder-bps (parse-long-safe (or (get effective-map "builder_bps") (get effective-map "builder-bps") (:builder-bps effective-map)) 8500)
-            gov-st (or (:governance st-after-deduct) (gov/init-governance-state))
-            res (gov/create-bounty-escrow
-                 gov-st
-                 {:subnet-id subnet
-                  :bounty-id bounty-id
-                  :target-bip-cid target-cid
-                  :gross-amount gross
-                  :maintainer-pubkey m-pub
-                  :take-bps take-bps
-                  :builder-bps builder-bps}
-                 privkey-bytes)
-            bounty (:bounty res)
-            cap-cid (:capability-cid res)
-            cap-blob (:capability-blob res)
-            cap-ptr (:capability-pointer res)
-            cap-path (str "bounty/" bounty-id)
-            b-escrow {:bounty-id bounty-id
-                      :maintainer-pubkey m-pub
-                      :subnet-id subnet
-                      :target-bip-cid target-cid
-                      :gross-amount gross
-                      :take-bps take-bps
-                      :builder-bps builder-bps
-                      :protocol-take (:protocol-take bounty)
-                      :builder-net (:builder-net bounty)
-                      :auditor-net (:auditor-net bounty)
-                      :created-epoch (:epoch state 0)
-                      :status :locked}
-            b-rcpt {:type :bounty-create
-                    :receipt-id (str "bounty-rcpt-" bounty-id)
-                    :bounty-id bounty-id
-                    :subnet-id subnet
-                    :maintainer-pubkey m-pub
-                    :gross-amount gross
-                    :take-bps take-bps
-                    :builder-bps builder-bps
-                    :target-bip-cid target-cid
-                    :epoch (:epoch state 0)}
-            b-rcpt-signed (if privkey-bytes
-                            (let [c-bytes (fressian/encode-canonical (dissoc b-rcpt :signature "signature"))
-                                  sig (basalt/bytes->hex (crypto/sign privkey-bytes c-bytes))]
-                              (assoc b-rcpt :signature sig))
-                            b-rcpt)
-            rcpt-env {:type :receive-receipt :receipt b-rcpt-signed}
-            rep-env (build-governance-replicate-envelope
-                     st-after-deduct
-                     privkey-bytes
-                     subnet
-                     :bounty-create
+        gross (long (or (parse-long-safe (or (get effective-map "gross_amount") (get effective-map "gross-amount") (:gross-amount effective-map)
+                                             (get effective-map "amount") (:amount effective-map)) 0) 0))
+        burn-amt (max 0 (long (or (parse-long-safe (or (get effective-map "burn") (:burn effective-map)) 0) 0)))]
+    (cond
+      (str/blank? bounty-id)
+      {:state state :response {"ok" false "error" "missing-bounty-id"} :net-envelopes [] :stdout-events []}
+
+      (<= gross 0)
+      {:state state :response {"ok" false "error" "invalid-bounty-amount"} :net-envelopes [] :stdout-events []}
+
+      :else
+      (let [total-deduct (+ gross burn-amt)
+            deduct-chk (check-and-deduct-burn state total-deduct)]
+        (if-not (:ok? deduct-chk)
+          {:state state :response {"ok" false "error" (:error deduct-chk)} :net-envelopes [] :stdout-events []}
+          (let [st-after-deduct (:state deduct-chk)
+                m-pub (or (get effective-map "maintainer_pubkey") (get effective-map "maintainer-pubkey") (:maintainer-pubkey effective-map) (:pubkey state))
+                take-bps (parse-long-safe (or (get effective-map "take_bps") (get effective-map "take-bps") (:take-bps effective-map)) 50)
+                builder-bps (parse-long-safe (or (get effective-map "builder_bps") (get effective-map "builder-bps") (:builder-bps effective-map)) 8500)
+                gov-st (or (:governance st-after-deduct) (gov/init-governance-state))
+                res (gov/create-bounty-escrow
+                     gov-st
                      {:subnet-id subnet
                       :bounty-id bounty-id
-                      :bounty bounty
-                      :capability-cid cap-cid
-                      :capability-blob cap-blob
-                      :capability-pointer cap-ptr}
-                     burn-amt)]
-        {:state (-> st-after-deduct
-                    (assoc :governance (:state res))
-                    (assoc-in [:bounty-escrows bounty-id] b-escrow)
-                    (assoc-in [:capabilities [subnet cap-path]] cap-ptr)
-                    (assoc-in [:capability-blobs cap-cid] cap-blob))
-         :response {"ok" true
-                    "subnet_id" subnet
-                    "bounty_id" bounty-id
-                    "target_bip_cid" target-cid
-                    "gross_amount" (:gross-amount bounty)
-                    "protocol_take" (:protocol-take bounty)
-                    "builder_net" (:builder-net bounty)
-                    "auditor_net" (:auditor-net bounty)
-                    "capability_cid" cap-cid
-                    "capability_path" cap-path
-                    "path" cap-path
-                    "status" "locked"
-                    "burn" burn-amt}
-         :net-envelopes (cond-> []
-                          rep-env (conj rep-env)
-                          rcpt-env (conj rcpt-env))
-         :stdout-events []}))))
-
-(defn- exec-bounty-settle
-  [state effective-map privkey-bytes sub-id]
-  (let [burn-amt (max 0 (long (or (parse-long-safe (or (get effective-map "burn") (:burn effective-map)) 0) 0)))
-        burn-chk (check-and-deduct-burn state burn-amt)]
-    (if-not (:ok? burn-chk)
-      {:state state :response {"ok" false "error" (:error burn-chk)} :net-envelopes [] :stdout-events []}
-      (let [st-after-burn (:state burn-chk)
-            subnet (str (or (get effective-map "subnet_id") (get effective-map "subnet-id") (:subnet-id effective-map) sub-id gov/dev-subnet-id))
-            bounty-id (str (or (get effective-map "bounty_id") (get effective-map "bounty-id") (:bounty-id effective-map) ""))
-            explicit-claim (parse-edn-safe (or (get effective-map "claim_edn") (get effective-map "claim-edn") (:claim-edn effective-map)))
-            raw-builder (or (get effective-map "builder") (:builder effective-map))
-            raw-auditor (or (get effective-map "auditor") (:auditor effective-map))
-            patch-cid (str (or (get effective-map "patch_cid") (get effective-map "patch-cid") (:patch-cid effective-map) "cid-patch"))
-            sha256 (str (or (get effective-map "sha256") (:sha256 effective-map) "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"))
-            builder-pub (when raw-builder
-                          (normalize-pubkey-hex (or (:pubkey (resolve-counterparty state raw-builder)) (str raw-builder))))
-            auditor-pub (when raw-auditor
-                          (normalize-pubkey-hex (or (:pubkey (resolve-counterparty state raw-auditor)) (str raw-auditor))))
-            my-pub (normalize-pubkey-hex (:pubkey state))
-            fallback-kp (when-not privkey-bytes
-                          (crypto/generate-keypair (str "bounty-maintainer-" my-pub)))
-            eff-priv (or privkey-bytes (:private fallback-kp))
-            claim (if (seq explicit-claim)
-                    explicit-claim
-                    (let [payload (gov/canonical-bounty-claim-payload bounty-id patch-cid sha256)
-                          m-sig (basalt/bytes->hex (crypto/sign-canonical eff-priv payload))]
-                      {:bounty-id bounty-id
-                       :patch-bundle-cid patch-cid
-                       :reproducible-sha256 sha256
-                       :maintainer-direct-settle? true
-                       :builder {:pubkey builder-pub}
-                       :auditor {:pubkey auditor-pub
-                                 :model "claude-opus-5-5"
-                                 :tests-passed? true
-                                 :lint-clean? true
-                                 :reproducible-sha256 sha256}
-                       :maintainer {:pubkey my-pub
-                                    :signature m-sig}}))
-            gov-st (or (:governance st-after-burn) (gov/init-governance-state))
-            res (gov/settle-bounty-escrow gov-st subnet bounty-id claim)]
-        (if-not (:ok? res)
-          {:state (assoc st-after-burn :governance (:state res))
-           :response {"ok" false
-                      "error" (name (or (:error res) :bounty-quorum-invalid))
-                      "subnet_id" subnet
-                      "bounty_id" bounty-id}
-           :net-envelopes []
-           :stdout-events []}
-          (let [settled-bounty (:bounty res)
-                b-net (long (or (:builder-net settled-bounty) 0))
-                a-net (long (or (:auditor-net settled-bounty) 0))
-                settle-rcpt {:type :bounty-settle
-                             :receipt-id (str "bounty-settle-rcpt-" bounty-id)
-                             :bounty-id bounty-id
-                             :subnet-id subnet
-                             :maintainer-pubkey my-pub
-                             :builder-pubkey builder-pub
-                             :auditor-pubkey auditor-pub
-                             :claim claim
-                             :epoch (:epoch state 0)}
-                settle-rcpt-signed (if eff-priv
-                                     (let [c-bytes (fressian/encode-canonical (dissoc settle-rcpt :signature "signature"))
-                                           sig (basalt/bytes->hex (crypto/sign eff-priv c-bytes))]
-                                       (assoc settle-rcpt :signature sig))
-                                     settle-rcpt)
-                rcpt-env {:type :receive-receipt :receipt settle-rcpt-signed}
+                      :target-bip-cid target-cid
+                      :gross-amount gross
+                      :maintainer-pubkey m-pub
+                      :take-bps take-bps
+                      :builder-bps builder-bps}
+                     privkey-bytes)
+                bounty (:bounty res)
+                cap-cid (:capability-cid res)
+                cap-blob (:capability-blob res)
+                cap-ptr (:capability-pointer res)
+                cap-path (str "bounty/" bounty-id)
+                b-escrow {:bounty-id bounty-id
+                          :maintainer-pubkey m-pub
+                          :subnet-id subnet
+                          :target-bip-cid target-cid
+                          :gross-amount gross
+                          :take-bps take-bps
+                          :builder-bps builder-bps
+                          :protocol-take (:protocol-take bounty)
+                          :builder-net (:builder-net bounty)
+                          :auditor-net (:auditor-net bounty)
+                          :created-epoch (:epoch state 0)
+                          :status :locked}
+                b-rcpt {:type :bounty-create
+                        :receipt-id (str "bounty-rcpt-" bounty-id)
+                        :bounty-id bounty-id
+                        :subnet-id subnet
+                        :maintainer-pubkey m-pub
+                        :gross-amount gross
+                        :take-bps take-bps
+                        :builder-bps builder-bps
+                        :target-bip-cid target-cid
+                        :epoch (:epoch state 0)}
+                b-rcpt-signed (if privkey-bytes
+                                (let [c-bytes (fressian/encode-canonical (dissoc b-rcpt :signature "signature"))
+                                      sig (basalt/bytes->hex (crypto/sign privkey-bytes c-bytes))]
+                                  (assoc b-rcpt :signature sig))
+                                b-rcpt)
+                rcpt-env {:type :receive-receipt :receipt b-rcpt-signed}
                 rep-env (build-governance-replicate-envelope
-                         st-after-burn
+                         st-after-deduct
                          privkey-bytes
                          subnet
-                         :bounty-settle
+                         :bounty-create
                          {:subnet-id subnet
                           :bounty-id bounty-id
-                          :claim claim
-                          :bounty settled-bounty}
+                          :bounty bounty
+                          :capability-cid cap-cid
+                          :capability-blob cap-blob
+                          :capability-pointer cap-ptr}
                          burn-amt)]
-            {:state (-> st-after-burn
+            {:state (-> st-after-deduct
                         (assoc :governance (:state res))
-                        (assoc-in [:bounty-escrows bounty-id :status] :settled))
+                        (assoc-in [:bounty-escrows bounty-id] b-escrow)
+                        (assoc-in [:capabilities [subnet cap-path]] cap-ptr)
+                        (assoc-in [:capability-blobs cap-cid] cap-blob))
              :response {"ok" true
                         "subnet_id" subnet
                         "bounty_id" bounty-id
-                        "status" "settled"
-                        "payouts" (:payouts res)
-                        "builder_net" b-net
-                        "auditor_net" a-net
-                        "protocol_take" (:protocol-take res)
+                        "target_bip_cid" target-cid
+                        "gross_amount" (:gross-amount bounty)
+                        "protocol_take" (:protocol-take bounty)
+                        "builder_net" (:builder-net bounty)
+                        "auditor_net" (:auditor-net bounty)
+                        "capability_cid" cap-cid
+                        "capability_path" cap-path
+                        "path" cap-path
+                        "status" "locked"
                         "burn" burn-amt}
              :net-envelopes (cond-> []
                               rep-env (conj rep-env)
                               rcpt-env (conj rcpt-env))
              :stdout-events []}))))))
+
+(defn- valid-patch-cid?
+  "BIP-026 S5.2 (B10): Patch CID must be a non-blank 64-char lowercase hex string and not all-zero 0{64}."
+  [s]
+  (boolean
+   (and (string? s)
+        (re-matches #"^[0-9a-f]{64}$" s)
+        (not= s "0000000000000000000000000000000000000000000000000000000000000000"))))
+
+(defn- exec-bounty-settle
+  [state effective-map privkey-bytes sub-id]
+  (let [subnet (str (or (get effective-map "subnet_id") (get effective-map "subnet-id") (:subnet-id effective-map) sub-id gov/dev-subnet-id))
+        bounty-id (str (or (get effective-map "bounty_id") (get effective-map "bounty-id") (:bounty-id effective-map) ""))
+        explicit-claim (parse-edn-safe (or (get effective-map "claim_edn") (get effective-map "claim-edn") (:claim-edn effective-map)))
+        raw-patch-cid (or (get effective-map "patch_cid") (get effective-map "patch-cid") (:patch-cid effective-map)
+                          (when (map? explicit-claim) (:patch-bundle-cid explicit-claim)))]
+    (if-not (valid-patch-cid? raw-patch-cid)
+      {:state state
+       :response {"ok" false "error" "invalid-patch-cid" "bounty_id" bounty-id}
+       :net-envelopes []
+       :stdout-events []}
+      (let [burn-amt (max 0 (long (or (parse-long-safe (or (get effective-map "burn") (:burn effective-map)) 0) 0)))
+            burn-chk (check-and-deduct-burn state burn-amt)]
+        (if-not (:ok? burn-chk)
+          {:state state :response {"ok" false "error" (:error burn-chk)} :net-envelopes [] :stdout-events []}
+          (let [st-after-burn (:state burn-chk)
+                raw-builder (or (get effective-map "builder") (:builder effective-map))
+                raw-auditor (or (get effective-map "auditor") (:auditor effective-map))
+                patch-cid (str raw-patch-cid)
+                sha256 (str (or (get effective-map "sha256") (:sha256 effective-map) "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"))
+                builder-pub (when raw-builder
+                              (normalize-pubkey-hex (or (:pubkey (resolve-counterparty state raw-builder)) (str raw-builder))))
+                auditor-pub (when raw-auditor
+                              (normalize-pubkey-hex (or (:pubkey (resolve-counterparty state raw-auditor)) (str raw-auditor))))
+                my-pub (normalize-pubkey-hex (:pubkey state))
+                fallback-kp (when-not privkey-bytes
+                              (crypto/generate-keypair (str "bounty-maintainer-" my-pub)))
+                eff-priv (or privkey-bytes (:private fallback-kp))
+                claim (if (seq explicit-claim)
+                        explicit-claim
+                        (let [payload (gov/canonical-bounty-claim-payload bounty-id patch-cid sha256)
+                              m-sig (basalt/bytes->hex (crypto/sign-canonical eff-priv payload))]
+                          {:bounty-id bounty-id
+                           :patch-bundle-cid patch-cid
+                           :reproducible-sha256 sha256
+                           :maintainer-direct-settle? true
+                           :builder {:pubkey builder-pub}
+                           :auditor {:pubkey auditor-pub
+                                     :model "claude-opus-5-5"
+                                     :tests-passed? true
+                                     :lint-clean? true
+                                     :reproducible-sha256 sha256}
+                           :maintainer {:pubkey my-pub
+                                        :signature m-sig}}))
+                gov-st (or (:governance st-after-burn) (gov/init-governance-state))
+                res (gov/settle-bounty-escrow gov-st subnet bounty-id claim)]
+            (if-not (:ok? res)
+              {:state (assoc st-after-burn :governance (:state res))
+               :response {"ok" false
+                          "error" (name (or (:error res) :bounty-quorum-invalid))
+                          "subnet_id" subnet
+                          "bounty_id" bounty-id}
+               :net-envelopes []
+               :stdout-events []}
+              (let [settled-bounty (:bounty res)
+                    b-net (long (or (:builder-net settled-bounty) 0))
+                    a-net (long (or (:auditor-net settled-bounty) 0))
+                    settle-rcpt {:type :bounty-settle
+                                 :receipt-id (str "bounty-settle-rcpt-" bounty-id)
+                                 :bounty-id bounty-id
+                                 :subnet-id subnet
+                                 :maintainer-pubkey my-pub
+                                 :builder-pubkey builder-pub
+                                 :auditor-pubkey auditor-pub
+                                 :claim claim
+                                 :epoch (:epoch state 0)}
+                    settle-rcpt-signed (if eff-priv
+                                         (let [c-bytes (fressian/encode-canonical (dissoc settle-rcpt :signature "signature"))
+                                               sig (basalt/bytes->hex (crypto/sign eff-priv c-bytes))]
+                                           (assoc settle-rcpt :signature sig))
+                                         settle-rcpt)
+                    rcpt-env {:type :receive-receipt :receipt settle-rcpt-signed}
+                    rep-env (build-governance-replicate-envelope
+                             st-after-burn
+                             privkey-bytes
+                             subnet
+                             :bounty-settle
+                             {:subnet-id subnet
+                              :bounty-id bounty-id
+                              :claim claim
+                              :bounty settled-bounty}
+                             burn-amt)]
+                {:state (-> st-after-burn
+                            (assoc :governance (:state res))
+                            (assoc-in [:bounty-escrows bounty-id :status] :settled))
+                 :response {"ok" true
+                            "subnet_id" subnet
+                            "bounty_id" bounty-id
+                            "status" "settled"
+                            "payouts" (:payouts res)
+                            "builder_net" b-net
+                            "auditor_net" a-net
+                            "protocol_take" (:protocol-take res)
+                            "burn" burn-amt}
+                 :net-envelopes (cond-> []
+                                  rep-env (conj rep-env)
+                                  rcpt-env (conj rcpt-env))
+                 :stdout-events []}))))))))
 
 (defn exec-bounties
   "Returns list of on-chain / replicated bounty escrows optionally filtered by subnet_id."
@@ -7491,7 +7807,10 @@
    (exec-bounties state {}))
   ([state cmd-map]
    (let [sub-filter (or (get cmd-map "subnet_id") (get cmd-map "subnet-id") (:subnet-id cmd-map))
-         escrows (vals (or (:bounty-escrows state) {}))
+         gov-bounties (vals (or (get-in state [:governance :bounties]) {}))
+         escrow-map (merge (into {} (map (fn [b] [(:bounty-id b) b]) gov-bounties))
+                           (or (:bounty-escrows state) {}))
+         escrows (vals escrow-map)
          filtered (if (and sub-filter (not= sub-filter "all"))
                     (filter (fn [b] (= (str (:subnet-id b)) (str sub-filter))) escrows)
                     escrows)
@@ -11045,7 +11364,7 @@
                            :revoked-epoch (or (:epoch state) 0)}))
             new-state (cond-> (assoc-in state [:supervised-agents agent-id :status] :revoked)
                         revocation (assoc-in [:supervised-agents agent-id :revocation] revocation)
-                        revocation (update :revoked-dacs (fnil conj []) revocation))
+                        revocation (update :revoked-dacs (fnil conj #{}) (or (:dac-id revocation) revocation)))
             effects (cond-> [{:effect :diagnose
                               :reason :supervised-agent-dac-revoked
                               :agent-id agent-id

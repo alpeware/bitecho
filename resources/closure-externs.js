@@ -159,6 +159,9 @@ var NodeExterns = {
   family: "",
   internal: false,
   size: 0,
+  bavail: 0,
+  bsize: 0,
+  bfree: 0,
   pid: 0,
   env: {},
   argv: [],
@@ -189,6 +192,7 @@ NodeExterns.readFileSync = function() {};
 NodeExterns.readSync = function() {};
 NodeExterns.renameSync = function() {};
 NodeExterns.statSync = function() {};
+NodeExterns.statfsSync = function() {};
 NodeExterns.unlinkSync = function() {};
 NodeExterns.writeFileSync = function() {};
 NodeExterns.writeSync = function() {};
