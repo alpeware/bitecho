@@ -4,7 +4,9 @@
    with atomic rename (0600 permissions), and WebRTC DataChannel agent connections."
   (:require [bitecho.backup.core :as backup]
             [bitecho.basalt.core :as basalt]
+            [bitecho.cache.core :as cache]
             [bitecho.config.flags :as flags]
+            [bitecho.core.data :as data]
             [bitecho.core.mesh :as core-mesh]
             [bitecho.core.protocol.relay :as relay]
             [bitecho.crypto :as crypto]
@@ -21,6 +23,7 @@
             [bitecho.shell.identity :as identity]
             [bitecho.shell.updater :as updater]
             [bitecho.snapshot.core :as snap]
+            [bitecho.status.core :as status-core]
             [bitecho.sync.core :as sync-core]
             [clojure.data.json :as json]
             [clojure.edn :as edn]
@@ -293,7 +296,10 @@
                                 "--wait-open-ms" "--until-event"
                                 "--path" "--cid" "--file" "--out" "--out-file" "--hex" "--seq" "--authority" "--prefix"
                                 "--pin-version" "--auto-update-pointer" "--auto-update-interval-ms"
-                                "--cold-root-recovery-cid"}
+                                "--cold-root-recovery-cid"
+                                "--max-cache-bytes" "--min-free-disk-bytes" "--min-free-disk-pct"
+                                "--max-events-log-bytes" "--state-save-warn-ms" "--ctl-warn-ms"
+                                "--event-loop-lag-warn-ms" "--snapshot-encode-warn-ms"}
         runner-valued-flags #{"--state-dir" "--control-port" "--bootstrap"}]
     (loop [rem (vec tokens)]
       (if (empty? rem)
@@ -394,6 +400,14 @@
          auto-update-interval-ms (extract-long-flag clean-args "--auto-update-interval-ms" nil)
          auto-update-force-http? (boolean (some #{"--auto-update-force-http"} clean-args))
          cold-root-recovery-cid (extract-flag-value clean-args "--cold-root-recovery-cid" nil)
+         max-cache-bytes (extract-long-flag clean-args "--max-cache-bytes" nil)
+         min-free-disk-bytes (extract-long-flag clean-args "--min-free-disk-bytes" nil)
+         min-free-disk-pct (extract-long-flag clean-args "--min-free-disk-pct" nil)
+         max-events-log-bytes (extract-long-flag clean-args "--max-events-log-bytes" nil)
+         state-save-warn-ms (extract-long-flag clean-args "--state-save-warn-ms" nil)
+         ctl-warn-ms (extract-long-flag clean-args "--ctl-warn-ms" nil)
+         event-loop-lag-warn-ms (extract-long-flag clean-args "--event-loop-lag-warn-ms" nil)
+         snapshot-encode-warn-ms (extract-long-flag clean-args "--snapshot-encode-warn-ms" nil)
          trusted-deploy-auths-present? (boolean (some #(or (= % "--trusted-deploy-authorities")
                                                            (str/starts-with? (str %) "--trusted-deploy-authorities="))
                                                       clean-args))
@@ -458,6 +472,14 @@
                    :ctl-args (or (:subargs ctl-sub) []))
        sync-interval-ms (assoc :sync-interval-ms sync-interval-ms)
        home-set-price (assoc :home-set-price home-set-price)
+       max-cache-bytes (assoc :max-cache-bytes max-cache-bytes)
+       min-free-disk-bytes (assoc :min-free-disk-bytes min-free-disk-bytes)
+       min-free-disk-pct (assoc :min-free-disk-pct min-free-disk-pct)
+       max-events-log-bytes (assoc :max-events-log-bytes max-events-log-bytes)
+       state-save-warn-ms (assoc :state-save-warn-ms state-save-warn-ms)
+       ctl-warn-ms (assoc :ctl-warn-ms ctl-warn-ms)
+       event-loop-lag-warn-ms (assoc :event-loop-lag-warn-ms event-loop-lag-warn-ms)
+       snapshot-encode-warn-ms (assoc :snapshot-encode-warn-ms snapshot-encode-warn-ms)
        cmd-file (assoc :cmd-file cmd-file)
        events-out (assoc :events-out events-out)
        wait-session-id (assoc :session-id wait-session-id)
@@ -527,18 +549,98 @@
 
 (defonce ^:private light-state-writers-atom (atom {}))
 
+(defonce ^{:doc "BIP-025 F1 & F3: JVM light-node storage & latency telemetry state."}
+  jvm-light-telemetry-atom
+  (atom {:state-save-ms []
+         :ctl-ms []
+         :event-loop-lag-ms []
+         :state-bytes 0
+         :cache-index (cache/init-cache-index)
+         :cache-budget-bytes cache/default-max-cache-bytes
+         :events-log-bytes 0
+         :events-log-max-bytes cli/default-max-events-log-bytes
+         :warn-thresholds status-core/default-latency-thresholds
+         :diagnostics {}}))
+
+(defn record-state-save-latency!
+  "BIP-025 §5.3 / F3: Records `save-ms` and `state-bytes` into `jvm-light-telemetry-atom`,
+   emitting counted `:state-save-slow` diagnostic when exceeding threshold."
+  ([save-ms state-bytes] (record-state-save-latency! save-ms state-bytes nil))
+  ([save-ms state-bytes state-atom]
+   (let [warn-ms (long (or (get-in @jvm-light-telemetry-atom [:warn-thresholds :state-save-ms])
+                           (:state-save-ms status-core/default-latency-thresholds)))
+         [next-ring effs] (status-core/record-latency-sample
+                           (:state-save-ms @jvm-light-telemetry-atom)
+                           save-ms
+                           {:max-samples status-core/default-latency-ring-max
+                            :warn-ms warn-ms
+                            :diag-reason :state-save-slow})]
+     (swap! jvm-light-telemetry-atom
+            (fn [m]
+              (cond-> (assoc m :state-save-ms next-ring :state-bytes (long (or state-bytes 0)))
+                (seq effs) (update-in [:diagnostics :state-save-slow] (fnil inc 0)))))
+     (when (and state-atom (seq effs))
+       (swap! state-atom update-in [:diagnostics :state-save-slow] (fnil inc 0)))
+     effs)))
+
+(defn record-ctl-latency!
+  "BIP-025 §5.3 / F3: Records `ctl-ms` into `jvm-light-telemetry-atom`, emitting counted
+   `:ctl-latency-high` diagnostic when exceeding threshold."
+  ([ctl-ms] (record-ctl-latency! ctl-ms nil nil))
+  ([ctl-ms state-atom] (record-ctl-latency! ctl-ms state-atom nil))
+  ([ctl-ms state-atom warn-ms-override]
+   (let [warn-ms (long (or warn-ms-override
+                           (get-in @jvm-light-telemetry-atom [:warn-thresholds :ctl-ms])
+                           (:ctl-ms status-core/default-latency-thresholds)))
+         [next-ring effs] (status-core/record-latency-sample
+                           (:ctl-ms @jvm-light-telemetry-atom)
+                           ctl-ms
+                           {:max-samples status-core/default-latency-ring-max
+                            :warn-ms warn-ms
+                            :diag-reason :ctl-latency-high})]
+     (swap! jvm-light-telemetry-atom
+            (fn [m]
+              (cond-> (assoc m :ctl-ms next-ring)
+                (seq effs) (update-in [:diagnostics :ctl-latency-high] (fnil inc 0)))))
+     (when (and state-atom (seq effs))
+       (swap! state-atom update-in [:diagnostics :ctl-latency-high] (fnil inc 0)))
+     effs)))
+
+(defn build-light-runtime-ctx
+  "BIP-025 F3: Projects live `jvm-light-telemetry-atom` storage and latency telemetry into
+   `runtime-ctx` for `status-core/render-status` (`bitecho.status/v1`)."
+  []
+  (let [tm @jvm-light-telemetry-atom
+        cs (cache/cache-storage-summary (:cache-index tm))]
+    {:storage (merge cs
+                     {:state-bytes (long (:state-bytes tm 0))
+                      :cache-budget-bytes (long (:cache-budget-bytes tm cache/default-max-cache-bytes))
+                      :events-log-bytes (long (:events-log-bytes tm 0))
+                      :events-log-max-bytes (long (:events-log-max-bytes tm cli/default-max-events-log-bytes))})
+     :latency {:state-save-ms (:state-save-ms tm)
+               :ctl-ms (:ctl-ms tm)
+               :event-loop-lag-ms (:event-loop-lag-ms tm)}}))
+
 (defn save-light-state!
   "Persists sanitized light-node state via cross-platform Fressian (`state.fressian`)
    with atomic move and 0600 permissions (`M2a-2`: writes strictly to `state-file` without
    dual-writing Fressian bytes into legacy `state.nippy`).
+   BIP-025 F2: Refuses to overwrite legacy `state.fressian` when `:migration-deferred?` is true,
+   preserving unmigrated blobs and the restart retry path with zero silent data loss.
    Synchronous entry point reserved for one-shot CLI commands and graceful shutdown flushes."
   [state-file state]
   (when (and (some? state-file) (not (str/blank? (str state-file))))
-    (locking light-state-save-lock
-      (let [f (io/file state-file)
-            encoded (light-core/encode-light-state state)]
-        (write-state-bytes-atomic! f encoded)
-        true))))
+    (if (true? (:migration-deferred? state))
+      (do
+        (swap! jvm-light-telemetry-atom update-in [:diagnostics :state-save-deferred-pending-migration] (fnil inc 0))
+        false)
+      (locking light-state-save-lock
+        (let [t0 (System/currentTimeMillis)
+              f (io/file state-file)
+              encoded (light-core/encode-light-state state)]
+          (write-state-bytes-atomic! f encoded)
+          (record-state-save-latency! (max 0 (- (System/currentTimeMillis) t0)) (alength ^bytes encoded))
+          true)))))
 
 (defn- dispatch-light-writer-effects!
   [state-file writer-atom effects]
@@ -597,6 +699,264 @@
   []
   @light-state-load-diagnostics-atom)
 
+(defn- cache-blobs-root
+  [state-dir]
+  (io/file (str state-dir) "cache" "blobs"))
+
+(defn- cache-index-file
+  [state-dir]
+  (io/file (str state-dir) "cache" "index.fressian"))
+
+(defn write-cache-blob!
+  "BIP-025 §2.1: Atomically writes raw blob bytes to `<state-dir>/cache/blobs/<2>/<cid>` (`0600`).
+   Skips rewrite if an identical verified blob already exists on disk (crash-restart idempotency)."
+  [state-dir cid ^bytes bs]
+  (when-let [[shard norm-cid] (cache/cid-shard-relpath cid)]
+    (let [dest (io/file (cache-blobs-root state-dir) shard norm-cid)]
+      (if (and (.exists dest)
+               (= (.length dest) (long (alength bs)))
+               (try
+                 (= norm-cid (data/compute-cid (Files/readAllBytes (.toPath dest))))
+                 (catch Exception _ false)))
+        {:ok? true :cid norm-cid :skipped? true :path (.getAbsolutePath dest)}
+        (do
+          (write-state-bytes-atomic! dest bs)
+          {:ok? true :cid norm-cid :skipped? false :path (.getAbsolutePath dest)})))))
+
+(defn save-cache-index!
+  "BIP-025 §2.2 (Axiom A2): Atomically persists `<state-dir>/cache/index.fressian` (`0600`)."
+  [state-dir cache-index]
+  (let [idx-f (cache-index-file state-dir)
+        encoded (fressian/encode-wire-uncompressed cache-index)]
+    (write-state-bytes-atomic! idx-f encoded)
+    {:ok? true :bytes (alength ^bytes encoded) :path (.getAbsolutePath idx-f)}))
+
+(defn delete-cache-blob!
+  "BIP-025 F1: Unlinks an evicted CID from `<state-dir>/cache/blobs/<2>/<cid>`."
+  [state-dir cid]
+  (when-let [[shard norm-cid] (cache/cid-shard-relpath cid)]
+    (let [f (io/file (cache-blobs-root state-dir) shard norm-cid)]
+      (when (.exists f)
+        (io/delete-file f true))
+      {:ok? true :cid norm-cid})))
+
+(defn execute-cache-effects!
+  "BIP-025 F1: Drains pure `:cache-effects` (`:cache-put`) emitted by `light_node/core` reducers:
+   1. Writes each blob atomically to `<state-dir>/cache/blobs/<2>/<cid>` (`0600`).
+   2. Records entry in `jvm-light-telemetry-atom` `:cache-index` via `cache/record-put`.
+   3. Runs `cache/plan-evictions`, unlinks evicted files from disk, and emits counted `:diagnose` events.
+   4. Persists `<state-dir>/cache/index.fressian`.
+   5. Bounds/drops live `:blobs` in `state-atom` (`cache/prune-inline-hot-blobs`) so RSS stays flat."
+  ([state-dir cache-effects state-atom]
+   (execute-cache-effects! state-dir cache-effects state-atom nil))
+  ([state-dir cache-effects state-atom opts]
+   (when (and (some? state-dir) (seq cache-effects))
+     (let [max-budget (long (or (:max-cache-bytes opts)
+                                (:cache-budget-bytes @jvm-light-telemetry-atom)
+                                cache/default-max-cache-bytes))
+           max-hot (long (or (:max-hot-blobs opts) 0))
+           st-snap (when state-atom @state-atom)
+           pinned (set (or (:pinned-cids opts) (:pinned-cids st-snap) #{}))
+           active (into #{} (keep :pointer/target) (vals (or (:pointers st-snap) {})))]
+       (doseq [eff cache-effects]
+         (when (= :cache-put (:effect eff))
+           (let [cid (cache/normalize-cid (:cid eff))
+                 blob (:blob eff)
+                 bs (or (:blob/bytes blob) (:bytes eff))
+                 sz (long (or (:size-bytes eff) (when bs (fressian/count-bytes bs)) 0))
+                 mt (or (:media-type eff) (:blob/media-type blob) "application/octet-stream")
+                 tier (or (:tier eff) (cache/classify-tier cid pinned active))]
+             (when (and cid bs)
+               (write-cache-blob! state-dir cid bs)
+               (swap! jvm-light-telemetry-atom update :cache-index cache/record-put
+                      {:cid cid :size-bytes sz :media-type mt :tier tier})))))
+       (let [host-free (if (contains? opts :host-free-bytes)
+                         (:host-free-bytes opts)
+                         (try (.getUsableSpace (io/file state-dir)) (catch Exception _ nil)))
+             ev-res (cache/plan-evictions (:cache-index @jvm-light-telemetry-atom)
+                                          {:max-cache-bytes max-budget
+                                           :host-free-bytes host-free
+                                           :min-free-disk-bytes (or (:min-free-disk-bytes opts) 0)
+                                           :pinned-cids pinned
+                                           :active-pointer-cids active})]
+         (swap! jvm-light-telemetry-atom assoc :cache-index (:cache-index ev-res))
+         (doseq [eff (:effects ev-res)]
+           (case (:effect eff)
+             :cache-delete (delete-cache-blob! state-dir (:cid eff))
+             :diagnose (let [r (:reason eff)]
+                         (swap! jvm-light-telemetry-atom update-in [:diagnostics r] (fnil inc 0))
+                         (when state-atom
+                           (swap! state-atom update-in [:diagnostics r] (fnil inc 0))))
+             nil))
+         (try (save-cache-index! state-dir (:cache-index ev-res)) (catch Exception _ nil))
+         (when state-atom
+           (swap! state-atom cache/prune-inline-hot-blobs max-hot))
+         {:ok? true
+          :evicted (:evicted ev-res)
+          :cache-index (:cache-index ev-res)
+          :effects (:effects ev-res)})))))
+
+(defn hydrate-cache-blob!
+  "BIP-025 F1: Read-through hydration for JVM local blob cache.
+   Checks hot `(:blobs @state-atom)` first; on miss, reads `<state-dir>/cache/blobs/<2>/<cid>`,
+   verifies `sha256 == cid`, increments GDSF hit count (`cache/record-hit`) and persists index,
+   or emits counted `:cache-miss` diagnostic on miss."
+  [state-dir cid state-atom]
+  (let [norm-cid (cache/normalize-cid cid)
+        hot-blob (when (and norm-cid state-atom) (get-in @state-atom [:blobs norm-cid]))]
+    (cond
+      (nil? norm-cid)
+      (do
+        (swap! jvm-light-telemetry-atom update-in [:diagnostics :cache-miss] (fnil inc 0))
+        (when state-atom (swap! state-atom update-in [:diagnostics :cache-miss] (fnil inc 0)))
+        {:ok? false :error :cache-miss :cid cid})
+
+      (some? hot-blob)
+      (do
+        (swap! jvm-light-telemetry-atom update :cache-index cache/record-hit norm-cid)
+        {:ok? true :blob hot-blob :hydrated? false :cid norm-cid})
+
+      :else
+      (let [[shard _] (cache/cid-shard-relpath norm-cid)
+            f (io/file (cache-blobs-root state-dir) shard norm-cid)]
+        (if-let [bs (when (.exists f)
+                      (try
+                        (let [raw (Files/readAllBytes (.toPath f))]
+                          (when (= norm-cid (data/compute-cid raw)) raw))
+                        (catch Exception _ nil)))]
+          (let [mt (or (get-in @jvm-light-telemetry-atom [:cache-index :entries norm-cid :media-type])
+                       "application/octet-stream")
+                blob {:blob/cid norm-cid :blob/bytes bs :blob/media-type mt}]
+            (swap! jvm-light-telemetry-atom update :cache-index cache/record-hit norm-cid)
+            (try (save-cache-index! state-dir (:cache-index @jvm-light-telemetry-atom)) (catch Exception _ nil))
+            {:ok? true :blob blob :hydrated? true :cid norm-cid})
+          (do
+            (swap! jvm-light-telemetry-atom update-in [:diagnostics :cache-miss] (fnil inc 0))
+            (when state-atom (swap! state-atom update-in [:diagnostics :cache-miss] (fnil inc 0)))
+            {:ok? false :error :cache-miss :cid norm-cid}))))))
+
+(defn maybe-hydrate-state-for-read!
+  "BIP-025 F7: Production read-through hydration for JVM `storage-get` / `artifact-get`.
+   If the target CID is absent from hot `:blobs`/`:storage-blobs`/`:artifact-blobs`, hydrates
+   it from `<state-dir>/cache/blobs/<2>/<cid>`, updates GDSF hit count (`cache/record-hit`),
+   and ephemerally injects it into the returned transient state map (leaving `state-atom` pruned)."
+  [state-dir state-atom eff-verb cmd-map]
+  (let [st @state-atom]
+    (if-let [target-cid (and state-dir (cache/resolve-read-target-cid st eff-verb cmd-map))]
+      (let [hyd (hydrate-cache-blob! state-dir target-cid state-atom)]
+        (if (:ok? hyd)
+          (cache/inject-hydrated-blob @state-atom target-cid (:blob hyd))
+          @state-atom))
+      st)))
+
+(defn load-or-rebuild-cache-index!
+  "BIP-025 §2.2 (Axiom A2): Loads `<state-dir>/cache/index.fressian` or, if missing/corrupt,
+   scans `<state-dir>/cache/blobs/<2>/<cid>`, invokes pure `cache/rebuild-index-from-disk`,
+   writes a fresh `cache/index.fressian`, and returns `{:cache-index idx :effects [...]}`."
+  ([state-dir core-state] (load-or-rebuild-cache-index! state-dir core-state nil))
+  ([state-dir core-state _opts]
+   (let [idx-f (cache-index-file state-dir)
+         pinned (set (or (:pinned-cids core-state) #{}))
+         active (into #{} (keep :pointer/target) (vals (or (:pointers core-state) {})))
+         loaded (when (.exists idx-f)
+                  (try
+                    (let [raw (Files/readAllBytes (.toPath idx-f))
+                          dec-idx (when (pos? (alength raw)) (fressian/decode-wire raw))]
+                      (when (and (map? dec-idx)
+                                 (= cache/cache-index-schema-version (:schema dec-idx))
+                                 (map? (:entries dec-idx)))
+                        dec-idx))
+                    (catch Exception _ nil)))]
+     (if loaded
+       {:cache-index (cache/reclassify-tiers loaded pinned active) :effects []}
+       (let [root (cache-blobs-root state-dir)
+             disk-entries (if (.exists root)
+                            (for [^java.io.File f (file-seq root)
+                                  :when (.isFile f)
+                                  :when (not (str/ends-with? (.getName f) ".tmp"))]
+                              {:cid (.getName f)
+                               :size-bytes (.length f)
+                               :mtime-ms (.lastModified f)})
+                            [])
+             rebuilt (cache/rebuild-index-from-disk (vec disk-entries)
+                                                    {:pinned-cids pinned
+                                                     :active-pointer-cids active})]
+         (try (save-cache-index! state-dir (:cache-index rebuilt)) (catch Exception _ nil))
+         rebuilt)))))
+
+(defn migrate-legacy-state-file!
+  "BIP-025 §2.4 (V2, A1, A2): Crash-safe, idempotent extract-before-compact migration of legacy
+   bloated `state.fressian` into `<state-dir>/cache/blobs/<2>/<cid>` + `<state-dir>/cache/index.fressian`.
+   Checks host free bytes before and during extraction; spills Tier 2 when tight; fails closed on
+   ENOSPC / insufficient headroom leaving original `state.fressian` byte-for-byte intact."
+  ([state-file decoded-state] (migrate-legacy-state-file! state-file decoded-state nil))
+  ([state-file decoded-state opts]
+   (let [ex (light-core/extract-legacy-inline-blobs decoded-state)]
+     (if-not (:had-inline-blobs? ex)
+       {:ok? true :migrated? false :state (:compacted-state ex) :effects []}
+       (let [f (io/file state-file)
+             state-dir (or (.getParent f) ".")
+             compacted (:compacted-state ex)
+             compacted-bytes (light-core/encode-light-state compacted)
+             pinned (set (or (:pinned-cids compacted) #{}))
+             active (into #{} (keep :pointer/target) (vals (or (:pointers compacted) {})))
+             host-free (if (contains? opts :host-free-bytes)
+                         (:host-free-bytes opts)
+                         (try (.getUsableSpace (io/file state-dir)) (catch Exception _ nil)))
+             min-free (if (contains? opts :min-free-disk-bytes)
+                        (:min-free-disk-bytes opts)
+                        cache/default-min-free-disk-bytes)
+             plan (cache/plan-migration-spill (:unique-blobs ex)
+                                              {:pinned-cids pinned
+                                               :active-pointer-cids active
+                                               :host-free-bytes host-free
+                                               :compacted-core-bytes (alength ^bytes compacted-bytes)
+                                               :min-free-disk-bytes min-free
+                                               :legacy-state-bytes (if (.exists f) (.length f) 0)})]
+         (if-not (:ok? plan)
+           (do
+             (swap! light-state-load-diagnostics-atom update :migration-insufficient-disk-space (fnil inc 0))
+             {:ok? false
+              :error :migration-insufficient-disk-space
+              :state decoded-state
+              :effects (:effects plan)})
+           (try
+             (let [retained-set (set (:retained-cids plan))
+                   idx0 (reduce (fn [idx cid]
+                                  (let [info (get (:unique-blobs ex) cid)
+                                        _ (write-cache-blob! state-dir cid (:bytes info))
+                                        tier (cache/classify-tier cid pinned active)]
+                                    (cache/record-put idx {:cid cid
+                                                           :size-bytes (:size-bytes info)
+                                                           :media-type (:media-type info)
+                                                           :tier tier})))
+                                (cache/init-cache-index)
+                                (sort retained-set))
+                   _ (save-cache-index! state-dir idx0)
+                   _ (write-state-bytes-atomic! f compacted-bytes)
+                   mig-diag {:effect :diagnose
+                             :reason :legacy-blobs-migrated-to-cache
+                             :migrated-count (count retained-set)
+                             :deduplicated-count (:deduplicated-count ex)
+                             :spilled-tier2-count (count (:spilled-cids plan))
+                             :corrupt-skipped-count (:corrupt-skipped-count ex)
+                             :reclaimed-bytes (:reclaimed-bytes ex)}]
+               (swap! light-state-load-diagnostics-atom update :legacy-blobs-migrated-to-cache (fnil inc 0))
+               {:ok? true
+                :migrated? true
+                :state compacted
+                :cache-index idx0
+                :effects (conj (vec (:effects plan)) mig-diag)})
+             (catch Exception e
+               (swap! light-state-load-diagnostics-atom update :migration-insufficient-disk-space (fnil inc 0))
+               {:ok? false
+                :error :migration-insufficient-disk-space
+                :detail (.getMessage e)
+                :state decoded-state
+                :effects [{:effect :diagnose
+                           :reason :migration-insufficient-disk-space
+                           :detail (.getMessage e)}]}))))))))
+
 (defn load-light-state!
   "Loads persisted light-node state strictly from `state.fressian`.
    Rejects legacy Nippy ('NPY') bytes fail-closed with a counted :diagnose
@@ -652,7 +1012,14 @@
                        (let [bak-f (io/file (str (.getAbsolutePath f) ".v0238.bak"))]
                          (when-not (.exists bak-f)
                            (try (write-state-bytes-atomic! bak-f b) (catch Exception _ nil)))))
-                     (light-core/migrate-light-state decoded))))))))))))
+                     (let [migrated-v0238 (light-core/migrate-light-state decoded)
+                           mig-res (migrate-legacy-state-file! (str f) migrated-v0238 opts)]
+                       (if (:ok? mig-res)
+                         (:state mig-res)
+                         ;; BIP-025 F2 (A1): Preserve original unmigrated blobs & retry path; never strip/clobber on failure!
+                         (-> (:state mig-res)
+                             (assoc :migration-deferred? true)
+                             (update-in [:diagnostics :migration-insufficient-disk-space] (fnil inc 0))))))))))))))))
 
 (defn load-or-create-light-identity!
   "Loads or creates persistent light-node identity in state-dir (supporting Row 11 Phase 1
@@ -1064,7 +1431,7 @@
                               (update-in [:diagnostics :local-state-corrupt-auto-restored] (fnil inc 0)))]
                   (reset! state-atom st')
                   (when state-file
-                    (try (save-light-state! state-file st') (catch Exception _ nil)))
+                    (try (save-light-state-async! state-file st') (catch Exception _ nil)))
                   (emit-diag! :local-state-corrupt-auto-restored (:cid res))
                   {:ok? true :reason :local-state-corrupt-auto-restored :seq (:seq res) :cid (:cid res) :summary (:summary res)})
                 (do
@@ -1976,19 +2343,23 @@
                              (let [lock-obj (or (:cmd-lock ctx) state-atom)
                                    res (locking lock-obj
                                          (let [st @state-atom
-                                               r (light-core/handle-wire-payload st payload (:privkey-bytes identity))]
+                                               r (light-core/handle-wire-payload st payload (:privkey-bytes identity))
+                                               cache-effs (:cache-effects r)]
                                            (reset! state-atom (:state r))
-                                           (when (and state-file (not= st (:state r)))
-                                             (try
-                                               (save-light-state-async! state-file (:state r))
-                                               (catch Exception e
-                                                 (when conn-atom
-                                                   (apply-conn-event! conn-atom
-                                                                      {:type :persist-failed
-                                                                       :error (or (.getMessage e) "persist-failed")}
-                                                                      cb-opts)
-                                                   (sync-conn-diagnostics! state-atom conn-atom)))))
-                                           r))]
+                                           (when (and state-file (seq cache-effs))
+                                             (execute-cache-effects! (.getParent (io/file state-file)) cache-effs state-atom))
+                                           (let [next-st @state-atom]
+                                             (when (and state-file (not= st next-st))
+                                               (try
+                                                 (save-light-state-async! state-file next-st)
+                                                 (catch Exception e
+                                                   (when conn-atom
+                                                     (apply-conn-event! conn-atom
+                                                                        {:type :persist-failed
+                                                                         :error (or (.getMessage e) "persist-failed")}
+                                                                        cb-opts)
+                                                     (sync-conn-diagnostics! state-atom conn-atom)))))
+                                             (assoc r :state next-st))))]
                                (when (and event-out (seq (:stdout-events res)))
                                  (doseq [ev (:stdout-events res)]
                                    (event-out ev)))
@@ -2905,6 +3276,7 @@
                                     st-rej (+ (long (or (get-in st [:diagnostics :p2p-signaling-rejected]) 0))
                                               (long (or (get-in st [:diagnostics :broadcast-rejected]) 0)))
                                     res (light-core/handle-wire-payload st payload (:privkey-bytes identity))
+                                    cache-effs (:cache-effects res)
                                     new-st (:state res)
                                     new-rej (+ (long (or (get-in new-st [:diagnostics :p2p-signaling-rejected]) 0))
                                                (long (or (get-in new-st [:diagnostics :broadcast-rejected]) 0)))]
@@ -2917,8 +3289,10 @@
                                       (reset! bound-sender norm-sender)
                                       (swap! p2p-peers-atom update norm-sender #(merge {:send-fn peer-send! :close-fn peer-close!} %)))))
                                 (reset! state-atom new-st)
-                                (when (and state-file (not= st new-st))
-                                  (try (save-light-state! state-file new-st) (catch Exception _ nil)))
+                                (when (and state-file (seq cache-effs))
+                                  (execute-cache-effects! (.getParent (io/file state-file)) cache-effs state-atom))
+                                (when (and state-file (not= st @state-atom))
+                                  (try (save-light-state-async! state-file @state-atom) (catch Exception _ nil)))
                                 (when (and event-out (seq (:stdout-events res)))
                                   (doseq [ev (:stdout-events res)]
                                     (event-out ev)))
@@ -3244,9 +3618,28 @@
                                    :net-envelopes (if (:ok? committed) (:net-envelopes prep) [])))))
 
                       :else
-                      (light-core/handle-command @state-atom effective-map-with-now (:privkey-bytes identity)))
+                      (let [read-blob-cmd? (contains? #{"storage-get" "artifact-get"} eff-domain-verb)
+                            hydrated-from-cache? (and read-blob-cmd?
+                                                      state-file
+                                                      (some? (cache/resolve-read-target-cid @state-atom eff-domain-verb effective-map-with-now)))
+                            st-for-cmd (cond
+                                         (= eff-domain-verb "status")
+                                         (assoc @state-atom :runtime-ctx (merge (:runtime-ctx @state-atom) (build-light-runtime-ctx)))
+
+                                         hydrated-from-cache?
+                                         (maybe-hydrate-state-for-read! (or (.getParent (io/file state-file)) ".") state-atom eff-domain-verb effective-map-with-now)
+
+                                         :else
+                                         @state-atom)
+                            cmd-res (light-core/handle-command st-for-cmd effective-map-with-now (:privkey-bytes identity))]
+                        (if hydrated-from-cache?
+                          (assoc cmd-res :state (cache/prune-inline-hot-blobs (:state cmd-res) 0))
+                          cmd-res)))
                 _ (when (:state res)
                     (reset! state-atom (:state res)))
+                _ (when (and state-file (seq (:cache-effects res)))
+                    (let [sd (or (.getParent (io/file state-file)) ".")]
+                      (execute-cache-effects! sd (:cache-effects res) state-atom)))
                 out-write-res (maybe-write-artifact-out-file! eff-domain-verb effective-map (:response res) state-atom)
                 res (if (:applied? out-write-res)
                       (assoc res :response (:response out-write-res) :state @state-atom)
@@ -3338,7 +3731,7 @@
                                                :mesh-peers-targeted (max (long (or (:mesh-peers-targeted route-res) 0))
                                                                          (if mirror-ok? 1 0))))]
                     (sync-conn-diagnostics! state-atom conn-atom)
-                    (when state-file (save-light-state! state-file @state-atom))
+                    (when state-file (save-light-state-async! state-file @state-atom))
                     (finish-resp! committed-resp))
                   (let [sent-ingress? (boolean
                                        (when (and ingress-peers-atom (seq @ingress-peers-atom))
@@ -3357,7 +3750,7 @@
                                              :p2p-peers-targeted (if sent-ingress? 1 0)})]
                         (swap! state-atom assoc :connected? true :connection-error nil)
                         (sync-conn-diagnostics! state-atom conn-atom)
-                        (when state-file (save-light-state! state-file @state-atom))
+                        (when state-file (save-light-state-async! state-file @state-atom))
                         (finish-resp! committed-resp))
                       (do
                         (swap! state-atom assoc :connected? false :connection-error "send-failed")
@@ -3386,7 +3779,7 @@
                                                          :p2p-peers-targeted 0})]
                                     (swap! state-atom assoc :connected? true :connection-error nil)
                                     (sync-conn-diagnostics! state-atom conn-atom)
-                                    (when state-file (save-light-state! state-file @state-atom))
+                                    (when state-file (save-light-state-async! state-file @state-atom))
                                     (finish-resp! committed-resp))
                                   (let [err "send-failed"]
                                     (swap! state-atom
@@ -3404,7 +3797,7 @@
                                         (when-let [intent (:fanout-intent res)]
                                           (swap! state-atom #(:state (light-core/commit-delivery-outcome % intent {:mesh-submitted? false :p2p-direct? false :error err :now-ms (System/currentTimeMillis)}))))
                                         (sync-conn-diagnostics! state-atom conn-atom)
-                                        (when state-file (save-light-state! state-file @state-atom))
+                                        (when state-file (save-light-state-async! state-file @state-atom))
                                         (let [err-map (assoc (or (:response res) {"ok" false}) "ok" false "queued" true "mesh_submitted" false "transport_error" err "error" err)]
                                           (emit! err-map)
                                           err-map))
@@ -3433,7 +3826,7 @@
                               (if (= verb "send")
                                 (do
                                   (sync-conn-diagnostics! state-atom conn-atom)
-                                  (when state-file (save-light-state! state-file @state-atom))
+                                  (when state-file (save-light-state-async! state-file @state-atom))
                                   (let [err-map (assoc (or (:response res) {"ok" true}) "ok" true "queued" true "transport_error" err)]
                                     (emit! err-map)
                                     err-map))
@@ -3455,7 +3848,7 @@
                                    (assoc (:response res) "pending_forward_count" (count (:net-envelopes res))))
                                  (:response res))]
                 (sync-conn-diagnostics! state-atom conn-atom)
-                (when state-file (save-light-state! state-file @state-atom))
+                (when state-file (save-light-state-async! state-file @state-atom))
                 (finish-resp! final-resp)))))))))
 
 (defn- extract-pid []
@@ -3593,7 +3986,8 @@
                                 (.sendResponseHeaders exchange 400 (alength resp-bytes))
                                 (with-open [os (.getResponseBody exchange)]
                                   (.write os resp-bytes)))
-                              (let [cmd-lock (or (:cmd-lock ctx) (:serve-cmd-lock ctx) (Object.))
+                              (let [ctl-t0 (System/currentTimeMillis)
+                                    cmd-lock (or (:cmd-lock ctx) (:serve-cmd-lock ctx) (Object.))
                                     res (if (= (get cmd-map "cmd") "wait")
                                           (let [peek? (or (true? (get cmd-map "peek"))
                                                           (true? (:peek cmd-map))
@@ -3669,6 +4063,9 @@
                                                        "session_phase"
                                                        (or (get-in @state-atom [:sessions sid :state]) "initiating")))
                                               raw-res)))
+                                    _ (record-ctl-latency! (max 0 (- (System/currentTimeMillis) ctl-t0))
+                                                           state-atom
+                                                           (:ctl-warn-ms conn-opts))
                                     resp-bytes (.getBytes (json/write-str res) "UTF-8")]
                                 (.sendResponseHeaders exchange 200 (alength resp-bytes))
                                 (with-open [os (.getResponseBody exchange)]
@@ -3848,7 +4245,7 @@
                                (-> (update-in [:diagnostics :auto-sync-stalled] (fnil inc 0))
                                    (update-in [:diagnostics :finalized-epoch-stalled] (fnil inc 0)))))))
                 _ (when state-file
-                    (try (save-light-state! state-file @state-atom) (catch Exception _ nil)))]
+                    (try (save-light-state-async! state-file @state-atom) (catch Exception _ nil)))]
             (doseq [eff effs]
               (case (:effect eff)
                 :diagnose
@@ -4160,7 +4557,9 @@
             identity (load-or-create-light-identity! state-dir opts)
             bootstrap (discovery/load-bootstrap-descriptor! (:bootstrap opts))
             load-diags-atom (atom [])
-            loaded-state (load-light-state! state-file {:diagnostics-atom load-diags-atom})
+            loaded-state (load-light-state! state-file
+                                            (cond-> {:diagnostics-atom load-diags-atom}
+                                              (some? (:min-free-disk-bytes opts)) (assoc :min-free-disk-bytes (:min-free-disk-bytes opts))))
             reconciled-res (when loaded-state
                              (light-core/reconcile-startup-subnet-id
                               loaded-state
@@ -4422,14 +4821,17 @@
                                        wire-bytes (when env-raw (try (basalt/hex->bytes (str env-raw)) (catch Exception _ nil)))]
                                    (when wire-bytes
                                      (let [r-box (atom nil)
-                                           new-st (swap! state-atom
-                                                         (fn [st]
-                                                           (let [r (light-core/handle-wire-payload st wire-bytes (:privkey-bytes identity))]
-                                                             (reset! r-box r)
-                                                             (:state r))))
-                                           r @r-box]
+                                           _ (swap! state-atom
+                                                    (fn [st]
+                                                      (let [r (light-core/handle-wire-payload st wire-bytes (:privkey-bytes identity))]
+                                                        (reset! r-box r)
+                                                        (:state r))))
+                                           r @r-box
+                                           _ (when (and state-file (seq (:cache-effects r)))
+                                               (execute-cache-effects! (.getParent (io/file state-file)) (:cache-effects r) state-atom))
+                                           new-st @state-atom]
                                        (when state-file
-                                         (try (save-light-state! state-file new-st) (catch Exception _ nil)))
+                                         (try (save-light-state-async! state-file new-st) (catch Exception _ nil)))
                                        (when r
                                          (doseq [ev (:stdout-events r)]
                                            (event-out ev))
@@ -4653,8 +5055,11 @@
                         (get item :envelope_hex) (get item :envelope))
             wire-bytes (when env-raw (try (basalt/hex->bytes (str env-raw)) (catch Exception _ nil)))]
         (when wire-bytes
-          (let [r (light-core/handle-wire-payload @state-atom wire-bytes priv-bytes)]
+          (let [r (light-core/handle-wire-payload @state-atom wire-bytes priv-bytes)
+                cache-effs (:cache-effects r)]
             (reset! state-atom (:state r))
+            (when (and state-file (seq cache-effs))
+              (execute-cache-effects! (.getParent (io/file state-file)) cache-effs state-atom))
             (when (and (:p2p-dial r) (:p2p-peers-atom opts))
               (dial-p2p-peer! state-atom
                               (:p2p-peers-atom opts)
@@ -4668,7 +5073,7 @@
     (when (and (not (:peek? opts))
                (or (not= new-mseq since-mseq) (not= new-bseq since-bseq) (seq all-items)))
       (when state-file
-        (try (save-light-state! state-file @state-atom) (catch Exception _ nil))))
+        (try (save-light-state-async! state-file @state-atom) (catch Exception _ nil))))
     (when (and (not (:peek? opts))
                (or (seq msgs) (seq bcasts) (> new-bseq since-bseq)))
       (try
@@ -4696,7 +5101,9 @@
             identity (load-or-create-light-identity! state-dir opts)
             bootstrap (discovery/load-bootstrap-descriptor! (:bootstrap opts))
             load-diags-atom (atom [])
-            loaded-state (load-light-state! state-file {:diagnostics-atom load-diags-atom})
+            loaded-state (load-light-state! state-file
+                                            (cond-> {:diagnostics-atom load-diags-atom}
+                                              (some? (:min-free-disk-bytes opts)) (assoc :min-free-disk-bytes (:min-free-disk-bytes opts))))
             reconciled-res (when loaded-state
                              (light-core/reconcile-startup-subnet-id
                               loaded-state
@@ -4835,8 +5242,21 @@
                                      :net-envelopes (if (:ok? committed) (:net-envelopes prep) [])))))
 
                         :else
-                        (light-core/handle-command @state-atom cmd-map (:privkey-bytes identity)))
+                        (let [read-blob-cmd? (contains? #{"storage-get" "artifact-get"} eff-domain-verb)
+                              hydrated-from-cache? (and read-blob-cmd?
+                                                        state-file
+                                                        (some? (cache/resolve-read-target-cid @state-atom eff-domain-verb cmd-map)))
+                              st-for-cmd (if hydrated-from-cache?
+                                           (maybe-hydrate-state-for-read! (or (.getParent (io/file state-file)) ".") state-atom eff-domain-verb cmd-map)
+                                           @state-atom)
+                              cmd-res (light-core/handle-command st-for-cmd cmd-map (:privkey-bytes identity))]
+                          (if hydrated-from-cache?
+                            (assoc cmd-res :state (cache/prune-inline-hot-blobs (:state cmd-res) 0))
+                            cmd-res)))
                   _ (when (:state res) (reset! state-atom (:state res)))
+                  _ (when (and state-file (seq (:cache-effects res)))
+                      (let [sd (or (.getParent (io/file state-file)) ".")]
+                        (execute-cache-effects! sd (:cache-effects res) state-atom)))
                   out-write-res (maybe-write-artifact-out-file! eff-domain-verb cmd-map (:response res) state-atom)
                   res (if (:applied? out-write-res)
                         (assoc res :response (:response out-write-res) :state @state-atom)
@@ -5016,7 +5436,9 @@
       (let [identity (load-or-create-light-identity! state-dir)
             bootstrap (try (discovery/load-bootstrap-descriptor! (:bootstrap opts))
                            (catch Exception _ nil))
-            loaded-state (load-light-state! state-file)
+            loaded-state (load-light-state! state-file
+                                            (cond-> {}
+                                              (some? (:min-free-disk-bytes opts)) (assoc :min-free-disk-bytes (:min-free-disk-bytes opts))))
             base-state (or loaded-state
                            (light-core/init-light-state identity (cond-> {:bootstrap bootstrap}
                                                                    (:subnet-id opts) (assoc :subnet-id (:subnet-id opts)))))
@@ -5032,7 +5454,7 @@
                                   res (light-core/handle-command @state-atom enriched (:privkey-bytes identity))]
                               (reset! state-atom (:state res))
                               (when-not (get enriched "peek")
-                                (try (save-light-state! state-file (:state res)) (catch Exception _ nil)))
+                                (try (save-light-state-async! state-file (:state res)) (catch Exception _ nil)))
                               (when (and effective-relay-url (seq (:net-envelopes res)))
                                 (doseq [env (:net-envelopes res)]
                                   (try (submit-relay-envelope! effective-relay-url env {:timeout-ms 5000})

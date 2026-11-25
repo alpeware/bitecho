@@ -652,4 +652,29 @@
               p-default (shell/parse-light-node-args ["serve"])]
           (is (contains? flags "--cold-root-recovery-cid"))
           (is (= cid (:cold-root-recovery-cid p-rec)))
-          (is (not (contains? p-default :cold-root-recovery-cid))))))))
+          (is (not (contains? p-default :cold-root-recovery-cid)))))
+
+      (testing "BIP-025 cache, events-log rotation, and latency warning threshold flags"
+        (let [flags (set cli/known-command-flags)
+              parsed (shell/parse-light-node-args
+                      ["serve"
+                       "--max-cache-bytes" "536870912"
+                       "--min-free-disk-bytes" "268435456"
+                       "--min-free-disk-pct" "10"
+                       "--max-events-log-bytes" "16777216"
+                       "--state-save-warn-ms" "200"
+                       "--ctl-warn-ms" "150"
+                       "--event-loop-lag-warn-ms" "400"
+                       "--snapshot-encode-warn-ms" "220"])]
+          (doseq [f ["--max-cache-bytes" "--min-free-disk-bytes" "--min-free-disk-pct"
+                     "--max-events-log-bytes" "--state-save-warn-ms" "--ctl-warn-ms"
+                     "--event-loop-lag-warn-ms" "--snapshot-encode-warn-ms"]]
+            (is (contains? flags f)))
+          (is (= 536870912 (:max-cache-bytes parsed)))
+          (is (= 268435456 (:min-free-disk-bytes parsed)))
+          (is (= 10 (:min-free-disk-pct parsed)))
+          (is (= 16777216 (:max-events-log-bytes parsed)))
+          (is (= 200 (:state-save-warn-ms parsed)))
+          (is (= 150 (:ctl-warn-ms parsed)))
+          (is (= 400 (:event-loop-lag-warn-ms parsed)))
+          (is (= 220 (:snapshot-encode-warn-ms parsed))))))))

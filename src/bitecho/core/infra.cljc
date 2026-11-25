@@ -726,18 +726,59 @@
      :array-buffers-bytes array-buffers
      :off-heap-bytes off-heap}))
 
+(def default-offheap-gc-cooldown-ms
+  "BIP-025 §4.2: Base cooldown (ms) between forced V8 off-heap GCs (raised from 30s to 120s)."
+  120000)
+
+(def max-offheap-gc-cooldown-ms
+  "BIP-025 §4.2: Maximum exponential backoff cooldown (ms) after consecutive ineffective GCs (600s)."
+  600000)
+
+(def default-offheap-gc-max-array-buffers-bytes
+  "BIP-025 §4.2: Trigger threshold for `arrayBuffers` (raised from 8 MiB to 32 MiB)."
+  (* 32 1024 1024))
+
+(def default-offheap-gc-low-water-array-buffers-bytes
+  "BIP-025 §4.2: Hysteresis low-water reset threshold for `arrayBuffers` (16 MiB)."
+  (* 16 1024 1024))
+
+(def default-offheap-gc-max-external-bytes
+  "BIP-025 §4.2: Trigger threshold for `external` (raised from 16 MiB to 64 MiB)."
+  (* 64 1024 1024))
+
+(def default-offheap-gc-low-water-external-bytes
+  "BIP-025 §4.2: Hysteresis low-water reset threshold for `external` (32 MiB)."
+  (* 32 1024 1024))
+
+(defn init-offheap-gc-state
+  "BIP-025 §4.2: Initializes pure off-heap GC monitor state with hysteresis & exponential backoff."
+  ([] (init-offheap-gc-state {}))
+  ([opts]
+   {:last-gc-ms 0
+    :base-cooldown-ms (long (or (:cooldown-ms opts) default-offheap-gc-cooldown-ms))
+    :effective-cooldown-ms (long (or (:cooldown-ms opts) default-offheap-gc-cooldown-ms))
+    :max-cooldown-ms (long (or (:max-cooldown-ms opts) max-offheap-gc-cooldown-ms))
+    :max-array-buffers-bytes (long (or (:max-array-buffers-bytes opts) default-offheap-gc-max-array-buffers-bytes))
+    :low-water-array-buffers-bytes (long (or (:low-water-array-buffers-bytes opts) default-offheap-gc-low-water-array-buffers-bytes))
+    :max-external-bytes (long (or (:max-external-bytes opts) default-offheap-gc-max-external-bytes))
+    :low-water-external-bytes (long (or (:low-water-external-bytes opts) default-offheap-gc-low-water-external-bytes))
+    :consecutive-ineffective 0
+    :triggered-count 0
+    :ineffective-backoff-count 0
+    :last-gc-pause-ms 0}))
+
 (defn should-trigger-offheap-gc?
   "Purely decides whether a throttled V8 major GC should be triggered to reclaim
    uncounted off-heap `ArrayBuffer`/`Buffer` backing stores in Node.js v26 / V8 14.6
-   (BIP-018-SOAK-F1). Returns `true` only when `gc-available?` is true, at least
-   `cooldown-ms` (default 30s) has elapsed since `last-gc-ms`, and either
-   `array-buffers-bytes >= max-array-buffers-bytes` (default 8 MiB) or
-   `external-bytes >= max-external-bytes` (default 16 MiB)."
+   (BIP-018-SOAK-F1, hardened by BIP-025 §4.2). Returns `true` only when `gc-available?`
+   is true, at least `cooldown-ms` (default 120s) has elapsed since `last-gc-ms`, and either
+   `array-buffers-bytes >= max-array-buffers-bytes` (default 32 MiB) or
+   `external-bytes >= max-external-bytes` (default 64 MiB)."
   [{:keys [memory last-gc-ms now-ms gc-available? cooldown-ms max-array-buffers-bytes max-external-bytes]}]
   (let [m (normalize-memory-telemetry memory)
-        cd (long (or cooldown-ms 30000))
-        ab-cap (long (or max-array-buffers-bytes (* 8 1024 1024)))
-        ext-cap (long (or max-external-bytes (* 16 1024 1024)))
+        cd (long (or cooldown-ms default-offheap-gc-cooldown-ms))
+        ab-cap (long (or max-array-buffers-bytes default-offheap-gc-max-array-buffers-bytes))
+        ext-cap (long (or max-external-bytes default-offheap-gc-max-external-bytes))
         last-t (long (or last-gc-ms 0))
         now-t (long (or now-ms 0))]
     (boolean
@@ -745,6 +786,52 @@
           (>= (- now-t last-t) cd)
           (or (>= (:array-buffers-bytes m) ab-cap)
               (>= (:external-bytes m) ext-cap))))))
+
+(defn record-offheap-gc-result
+  "BIP-025 §4.2: Pure reducer updating `gc-state` after a forced `global.gc()` completes.
+   If `< 10%` of `arrayBuffers + external` was reclaimed, doubles `effective-cooldown-ms`
+   up to `max-cooldown-ms` (600s) and emits counted Rule 5 `:offheap-gc-ineffective-backoff`.
+   If `>= 10%` was reclaimed or post-GC memory is below low-water hysteresis, resets cooldown to base (120s).
+   Returns `[new-gc-state effects]`."
+  [gc-state {:keys [now-ms pre-memory post-memory pause-ms]}]
+  (let [st (merge (init-offheap-gc-state) gc-state)
+        pre-m (normalize-memory-telemetry pre-memory)
+        post-m (normalize-memory-telemetry post-memory)
+        pre-total (+ (long (:array-buffers-bytes pre-m)) (long (:external-bytes pre-m)))
+        post-total (+ (long (:array-buffers-bytes post-m)) (long (:external-bytes post-m)))
+        reclaimed (max 0 (- pre-total post-total))
+        reclaimed-ratio (if (pos? pre-total) (/ (double reclaimed) (double pre-total)) 1.0)
+        below-low-water? (and (< (long (:array-buffers-bytes post-m)) (long (:low-water-array-buffers-bytes st)))
+                              (< (long (:external-bytes post-m)) (long (:low-water-external-bytes st))))
+        ineffective? (and (not below-low-water?) (< reclaimed-ratio 0.10))
+        pause (max 0 (long (or pause-ms 0)))
+        next-cd (if ineffective?
+                  (min (long (:max-cooldown-ms st))
+                       (* 2 (long (:effective-cooldown-ms st))))
+                  (long (:base-cooldown-ms st)))
+        st' (-> st
+                (assoc :last-gc-ms (long (or now-ms 0))
+                       :effective-cooldown-ms next-cd
+                       :last-gc-pause-ms pause
+                       :consecutive-ineffective (if ineffective? (inc (long (:consecutive-ineffective st 0))) 0))
+                (update :triggered-count (fnil inc 0))
+                (cond-> ineffective?
+                  (update :ineffective-backoff-count (fnil inc 0))))
+        trig-diag {:effect :diagnose
+                   :reason :offheap-gc-triggered
+                   :array-buffers-bytes (:array-buffers-bytes pre-m)
+                   :external-bytes (:external-bytes pre-m)
+                   :reclaimed-bytes reclaimed
+                   :gc-pause-ms pause}
+        effs (cond-> [trig-diag]
+               ineffective?
+               (conj {:effect :diagnose
+                      :reason :offheap-gc-ineffective-backoff
+                      :reclaimed-bytes reclaimed
+                      :pre-bytes pre-total
+                      :next-cooldown-ms next-cd
+                      :gc-pause-ms pause}))]
+    [st' effs]))
 
 ;; =============================================================================
 ;; 11. Pure Passthrough Socket Pair Lifecycle Reducer (BIP-018-SOAK-F1, Rules 4 & 5)

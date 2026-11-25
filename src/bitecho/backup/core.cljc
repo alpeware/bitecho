@@ -30,6 +30,11 @@
   #{:connected? :connection-error :conn-diagnostics :p2p :active-ws
     :mesh-conns :auto-sync-in-flight? :instance-lock :private-key :privkey})
 
+(def excluded-local-cache-keys
+  "BIP-025 §2.3 (Lumen L1 & Axiom A2): Local blob cache bytes and cache index MUST NEVER
+   be included in encrypted on-network backups (Core State ONLY)."
+  #{:blobs :artifact-blobs :storage-blobs :capability-blobs :blob-index :cache-index})
+
 (defn safe-map-get
   "CLJS-safe map lookup that never throws `CompareError` on string-keyed `sorted-map`s."
   ([m k] (safe-map-get m k nil))
@@ -128,26 +133,29 @@
    from any shell's state map (Browser, Node.js, JVM, or Full Node config/rolodex).
    Strictly strips all `excluded-runtime-liveness-keys` and uses `safe-map-get` for CLJS sorted-map safety."
   [state {:keys [node-role seq now-ms pubkey]}]
-  (let [clean-state (apply dissoc (or state {}) excluded-runtime-liveness-keys)
+  (let [clean-state (apply dissoc (or state {}) (concat excluded-runtime-liveness-keys excluded-local-cache-keys))
         norm-pk (or (kp/normalize-pubkey-hex (or pubkey (safe-map-get clean-state :pubkey))) "")
         sessions-map (sanitize-sessions (safe-map-get clean-state :sessions))
-        subs-vec (vec (sort (distinct (map str (or (safe-map-get clean-state :subscribed-subnets) [])))))]
-    {:schema backup-schema-version
-     :pubkey norm-pk
-     :node-role (or node-role :light)
-     :seq (max 1 (long (or seq (inc (long (or (safe-map-get clean-state :backup-seq) 0))))))
-     :created-ms (long (or now-ms 0))
-     :subnet-id (str (or (safe-map-get clean-state :subnet-id) "global"))
-     :subscribed-subnets subs-vec
-     :petnames (sanitize-petname-map (safe-map-get clean-state :petnames))
-     :petname-meta (sanitize-petname-meta (safe-map-get clean-state :petname-meta))
-     :petname-tombstones (sanitize-petname-tombstones (safe-map-get clean-state :petname-tombstones))
-     :artifact-tombstones (sanitize-artifact-tombstones (safe-map-get clean-state :artifact-tombstones))
-     :sessions sessions-map
-     :session-high-water (build-session-high-water clean-state sessions-map)
-     :rolodex-seq (long (or (safe-map-get (safe-map-get clean-state :rolodex) :seq)
-                            (safe-map-get clean-state :rolodex-seq)
-                            0))}))
+        subs-vec (vec (sort (distinct (map str (or (safe-map-get clean-state :subscribed-subnets) [])))))
+        pinned-vec (vec (sort (distinct (keep #(when (string? %) (str/lower-case (str/trim %)))
+                                              (or (safe-map-get clean-state :pinned-cids) #{})))))]
+    (cond-> {:schema backup-schema-version
+             :pubkey norm-pk
+             :node-role (or node-role :light)
+             :seq (max 1 (long (or seq (inc (long (or (safe-map-get clean-state :backup-seq) 0))))))
+             :created-ms (long (or now-ms 0))
+             :subnet-id (str (or (safe-map-get clean-state :subnet-id) "global"))
+             :subscribed-subnets subs-vec
+             :petnames (sanitize-petname-map (safe-map-get clean-state :petnames))
+             :petname-meta (sanitize-petname-meta (safe-map-get clean-state :petname-meta))
+             :petname-tombstones (sanitize-petname-tombstones (safe-map-get clean-state :petname-tombstones))
+             :artifact-tombstones (sanitize-artifact-tombstones (safe-map-get clean-state :artifact-tombstones))
+             :sessions sessions-map
+             :session-high-water (build-session-high-water clean-state sessions-map)
+             :rolodex-seq (long (or (safe-map-get (safe-map-get clean-state :rolodex) :seq)
+                                    (safe-map-get clean-state :rolodex-seq)
+                                    0))}
+      (pos? (count pinned-vec)) (assoc :pinned-cids pinned-vec))))
 
 (defn- provider-error?
   [x]

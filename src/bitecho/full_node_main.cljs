@@ -73,10 +73,15 @@
 (def ^:private validator-event-error-count (atom 0))
 (def ^:private runtime-metrics-atom
   (atom {:loop-lag-samples []
+         :snapshot-encode-samples []
          :last-snapshot-encode-ms 0
+         :last-snapshot-bytes 0
+         :last-gc-pause-ms 0
          :http-5xx-count 0
          :heap-samples []
-         :loop-sampler-started? false}))
+         :loop-sampler-started? false
+         :diagnostics {:event-loop-lag-high 0
+                       :snapshot-encode-slow 0}}))
 (def ^:private running-bundle-sha256-atom (atom nil))
 
 (defn- running-bundle-sha256
@@ -94,20 +99,28 @@
         @running-bundle-sha256-atom)))
 
 (defn- start-event-loop-lag-sampler!
-  "Starts a lightweight 1s event-loop lag probe (bounded to last 60 samples)."
+  "Starts a lightweight 1s event-loop lag probe (bounded to last 60 samples) with BIP-025 §5.3 threshold diagnostics."
   []
   (when-not (:loop-sampler-started? @runtime-metrics-atom)
     (swap! runtime-metrics-atom assoc :loop-sampler-started? true)
     (let [expected-atom (atom (+ (.now js/Date) 1000))
+          warn-ms (long (or (some-> (aget (.-env js/process) "BITECHO_EVENT_LOOP_LAG_WARN_MS") js/parseInt)
+                            (:event-loop-lag-ms status-core/default-latency-thresholds)))
           iv (js/setInterval
               (fn []
                 (let [now (.now js/Date)
                       lag (max 0 (- now @expected-atom))]
                   (reset! expected-atom (+ now 1000))
-                  (swap! runtime-metrics-atom update :loop-lag-samples
-                         (fn [v]
-                           (let [v' (conj (vec (or v [])) lag)]
-                             (if (> (count v') 60) (subvec v' (- (count v') 60)) v'))))))
+                  (let [[next-ring effs] (status-core/record-latency-sample
+                                          (:loop-lag-samples @runtime-metrics-atom)
+                                          lag
+                                          {:max-samples status-core/default-latency-ring-max
+                                           :warn-ms warn-ms
+                                           :diag-reason :event-loop-lag-high})]
+                    (swap! runtime-metrics-atom
+                           (fn [m]
+                             (cond-> (assoc m :loop-lag-samples next-ring)
+                               (seq effs) (update-in [:diagnostics :event-loop-lag-high] (fnil inc 0))))))))
               1000)]
       (when (.-unref iv) (.unref iv)))))
 
@@ -162,35 +175,51 @@
 (declare apply-shell-event! fetch-validator-chain-state-snapshots! forward-gossip-to-agents! start-validator-mesh-node! step-validator-event!)
 
 (defn- start-offheap-gc-monitor!
-  "Throttled 30s off-heap ArrayBuffer/external GC monitor for Node.js v26 (V8 14.6)
-   where ArrayBuffer backing stores do not count toward --max-old-space-size (BIP-018-SOAK-F1).
-   Gated by pure `core-infra/should-trigger-offheap-gc?` and emits Rule 5 `:offheap-gc-triggered`."
+  "BIP-025 §4.2: Hysteresis + exponential-backoff off-heap ArrayBuffer/external GC monitor
+   for Node.js v26 (V8 14.6). Gated by pure `core-infra/should-trigger-offheap-gc?` and
+   `core-infra/record-offheap-gc-result` (32 MiB arrayBuffers / 64 MiB external, 120s base cooldown,
+   up to 600s backoff on <10% reclaim), emitting Rule 5 `:offheap-gc-triggered` and
+   `:offheap-gc-ineffective-backoff` with measured `gc_pause_ms`."
   [shell-atom]
-  (let [last-gc-atom (atom 0)
+  (let [gc-state-atom (atom (core-infra/init-offheap-gc-state))
+        read-mem (fn []
+                   (let [raw-mem (.memoryUsage js/process)]
+                     (core-infra/normalize-memory-telemetry
+                      {:rss (.-rss raw-mem)
+                       :heapUsed (.-heapUsed raw-mem)
+                       :heapTotal (.-heapTotal raw-mem)
+                       :external (.-external raw-mem)
+                       :arrayBuffers (.-arrayBuffers raw-mem)})))
         timer (js/setInterval
                (fn []
                  (try
                    (let [gc-fn (aget js/globalThis "gc")
                          now-ms (.now js/Date)
-                         raw-mem (.memoryUsage js/process)
-                         norm-mem (core-infra/normalize-memory-telemetry
-                                   {:rss (.-rss raw-mem)
-                                    :heapUsed (.-heapUsed raw-mem)
-                                    :heapTotal (.-heapTotal raw-mem)
-                                    :external (.-external raw-mem)
-                                    :arrayBuffers (.-arrayBuffers raw-mem)})]
+                         pre-mem (read-mem)
+                         gst @gc-state-atom]
                      (when (core-infra/should-trigger-offheap-gc?
-                            {:memory norm-mem
-                             :last-gc-ms @last-gc-atom
+                            {:memory pre-mem
+                             :last-gc-ms (:last-gc-ms gst)
                              :now-ms now-ms
-                             :gc-available? (fn? gc-fn)})
-                       (reset! last-gc-atom now-ms)
-                       (gc-fn)
-                       (apply-shell-event! shell-atom
-                                           {:type :diagnose
-                                            :reason :offheap-gc-triggered
-                                            :array-buffers-bytes (:array-buffers-bytes norm-mem)
-                                            :external-bytes (:external-bytes norm-mem)})))
+                             :gc-available? (fn? gc-fn)
+                             :cooldown-ms (:effective-cooldown-ms gst)
+                             :max-array-buffers-bytes (:max-array-buffers-bytes gst)
+                             :max-external-bytes (:max-external-bytes gst)})
+                       (let [t0 (.now js/Date)
+                             _ (gc-fn)
+                             pause-ms (max 0 (- (.now js/Date) t0))
+                             post-mem (read-mem)
+                             [gst' effs] (core-infra/record-offheap-gc-result
+                                          gst
+                                          {:now-ms now-ms
+                                           :pre-memory pre-mem
+                                           :post-memory post-mem
+                                           :pause-ms pause-ms})]
+                         (reset! gc-state-atom gst')
+                         (swap! runtime-metrics-atom assoc :last-gc-pause-ms pause-ms)
+                         (doseq [eff effs]
+                           (apply-shell-event! shell-atom
+                                               (assoc eff :type :diagnose))))))
                    (catch :default _ nil)))
                30000)]
     (when (.-unref timer) (.unref timer))
@@ -1333,6 +1362,8 @@
                   (catch :default _ nil))
         memory (core-infra/normalize-memory-telemetry mem-raw)
         pt-reg @passthrough-registry-atom
+        rt-metrics @runtime-metrics-atom
+        blob-store (get-in sub [:data :blobs])
         base {:ok true
               :runtime "nodejs"
               :version full-node-version
@@ -1345,7 +1376,7 @@
               :healthy (count (or (:healthy-nodes le) #{}))
               :egress_bytes egress
               :pointer_count (count (get-in sub [:data :pointers]))
-              :memory memory
+              :memory (assoc memory :gc_pause_ms (long (:last-gc-pause-ms rt-metrics 0)))
               :passthrough {:active_pairs (count (:active-pairs pt-reg))
                             :draining_pairs (count (:draining-order pt-reg))
                             :active_drain_timers (long (:active-timers pt-reg 0))
@@ -1364,11 +1395,19 @@
               :diagnostics {:runtime (core-infra/shell-status-summary @(:shell-atom rt))
                             :http (when http-shell-atom (core-infra/shell-status-summary @http-shell-atom))
                             :dns (when dns-shell-atom (core-infra/shell-status-summary @dns-shell-atom))
-                            :smtp (when smtp-shell-atom (core-infra/shell-status-summary @smtp-shell-atom))}}]
+                            :smtp (when smtp-shell-atom (core-infra/shell-status-summary @smtp-shell-atom))
+                            :event_loop_lag_high (long (get-in rt-metrics [:diagnostics :event-loop-lag-high] 0))
+                            :snapshot_encode_slow (long (get-in rt-metrics [:diagnostics :snapshot-encode-slow] 0))}}]
     (status-core/merge-full-node-statusz-contract
      base
      {:runtime :full-node
-      :lock-state (:lock-state rt)})))
+      :lock-state (:lock-state rt)
+      :storage {:state-bytes (long (:last-snapshot-bytes rt-metrics 0))
+                :cache-bytes (long (or (:hot-bytes blob-store) 0))
+                :cache-entries (count (or (:entries blob-store) {}))
+                :cache-budget-bytes (long (or (:max-hot-bytes blob-store) 0))}
+      :latency {:event-loop-lag-ms (:loop-lag-samples rt-metrics)
+                :snapshot-encode-ms (:snapshot-encode-samples rt-metrics)}})))
 
 (defn- resolve-safe-content-root-async!
   "Zero-Sync-IO async static content-root file resolver via `fs.promises`, invoking `(cb result-map)`."
@@ -3158,7 +3197,22 @@
                    safe-state (core-mesh/strip-unserializable-state st-to-save)
                    encoded-u8 (fressian/write-standard-fressian safe-state)
                    encode-ms (max 0 (- (.now js/Date) encode-t0))
-                   _ (swap! runtime-metrics-atom assoc :last-snapshot-encode-ms encode-ms)
+                   snap-bytes (fressian/count-bytes encoded-u8)
+                   warn-ms (long (or (some-> (aget (.-env js/process) "BITECHO_SNAPSHOT_ENCODE_WARN_MS") js/parseInt)
+                                     (:snapshot-encode-ms status-core/default-latency-thresholds)))
+                   [next-ring slow-effs] (status-core/record-latency-sample
+                                          (:snapshot-encode-samples @runtime-metrics-atom)
+                                          encode-ms
+                                          {:max-samples status-core/default-latency-ring-max
+                                           :warn-ms warn-ms
+                                           :diag-reason :snapshot-encode-slow})
+                   _ (swap! runtime-metrics-atom
+                            (fn [m]
+                              (cond-> (assoc m
+                                             :last-snapshot-encode-ms encode-ms
+                                             :last-snapshot-bytes snap-bytes
+                                             :snapshot-encode-samples next-ring)
+                                (seq slow-effs) (update-in [:diagnostics :snapshot-encode-slow] (fnil inc 0)))))
                    buf (u8->buf encoded-u8)]
                (-> (atomic-write-file-async! dest-path buf 0600)
                    (.then (fn [_]
@@ -5268,6 +5322,10 @@
                        :all-nodes all-nodes
                        :max-hot-bytes (or (get-in config [:http :max-hot-bytes])
                                           (* 16 1024 1024))
+                       :hot-evict-low-water-ratio (or (get-in config [:http :hot-evict-low-water-ratio]) 0.85)
+                       :scan-resistant-admission? (if (contains? (get config :http {}) :scan-resistant-admission?)
+                                                    (boolean (get-in config [:http :scan-resistant-admission?]))
+                                                    true)
                        :max-hot-blob-bytes (or (get-in config [:http :max-hot-blob-bytes])
                                                data/default-infra-max-hot-blob-bytes)
                        :max-pinned-app-bytes (or (get-in config [:http :max-pinned-app-bytes])
@@ -5561,12 +5619,42 @@
           (when (zero? total-listeners)
             (maybe-emit-ready!))
 
-      ;; Graceful shutdown on SIGTERM / SIGINT / exit
-          (let [shutdown! (fn []
-                            (doseq [f @stop-fns]
-                              (try (f) (catch :default _ nil)))
-                            (release-full-node-lock! state-dir my-lock-pid my-lock-token)
-                            (.exit js/process 0))]
+      ;; Graceful shutdown on SIGTERM / SIGINT / exit with BIP-025 §4.4 5s hard exit watchdog (V4)
+          (let [watchdog-ms (let [raw (aget (.-env js/process) "BITECHO_SHUTDOWN_WATCHDOG_MS")
+                                  parsed (if raw (js/parseInt raw 10) 0)]
+                              (if (and (not (js/isNaN parsed)) (> (long parsed) 0))
+                                (long parsed)
+                                5000))
+                hang-ms (let [raw (aget (.-env js/process) "BITECHO_TEST_HANG_SHUTDOWN_MS")
+                              parsed (if raw (js/parseInt raw 10) 0)]
+                          (if (and (not (js/isNaN parsed)) (> (long parsed) 0))
+                            (long parsed)
+                            0))
+                shutting-down? (atom false)
+                shutdown! (fn []
+                            (when (compare-and-set! shutting-down? false true)
+                              (let [wd (js/setTimeout
+                                        (fn []
+                                          (try
+                                            (.write (.-stderr js/process)
+                                                    (str (.stringify js/JSON
+                                                                     #js {:event "diagnose"
+                                                                          :reason "shutdown-watchdog-forced-exit"
+                                                                          :timeout_ms watchdog-ms})
+                                                         "\n"))
+                                            (catch :default _ nil))
+                                          (.exit js/process 124))
+                                        watchdog-ms)
+                                    pre-flush-p (if (pos? hang-ms)
+                                                  (js/Promise. (fn [resolve _] (js/setTimeout #(resolve true) hang-ms)))
+                                                  (js/Promise.resolve true))]
+                                (-> pre-flush-p
+                                    (.then (fn [_]
+                                             (doseq [f @stop-fns]
+                                               (try (f) (catch :default _ nil)))
+                                             (release-full-node-lock! state-dir my-lock-pid my-lock-token)
+                                             (js/clearTimeout wd)
+                                             (.exit js/process 0)))))))]
             (.on js/process "exit" (fn [_] (release-full-node-lock! state-dir my-lock-pid my-lock-token)))
             (.on js/process "SIGTERM" shutdown!)
             (.on js/process "SIGINT" shutdown!)))))))
@@ -5705,10 +5793,40 @@
                  (when-not (:ok? r)
                    (js/console.error (str "FATAL: --cold-root-recovery-cid failed verification: " (name (or (:error r) :cold-root-recovery-rejected))))
                    (.exit js/process 1)))))
+         watchdog-ms (let [raw (aget (.-env js/process) "BITECHO_SHUTDOWN_WATCHDOG_MS")
+                           parsed (if raw (js/parseInt raw 10) 0)]
+                       (if (and (not (js/isNaN parsed)) (> (long parsed) 0))
+                         (long parsed)
+                         5000))
+         hang-ms (let [raw (aget (.-env js/process) "BITECHO_TEST_HANG_SHUTDOWN_MS")
+                       parsed (if raw (js/parseInt raw 10) 0)]
+                   (if (and (not (js/isNaN parsed)) (> (long parsed) 0))
+                     (long parsed)
+                     0))
+         shutting-down? (atom false)
          shutdown! (fn []
-                     (println "Shutting down Bitecho node...")
-                     (try ((:stop! node)) (catch :default _ nil))
-                     (.exit js/process 0))]
+                     (when (compare-and-set! shutting-down? false true)
+                       (let [wd (js/setTimeout
+                                 (fn []
+                                   (try
+                                     (.write (.-stderr js/process)
+                                             (str (.stringify js/JSON
+                                                              #js {:event "diagnose"
+                                                                   :reason "shutdown-watchdog-forced-exit"
+                                                                   :timeout_ms watchdog-ms})
+                                                  "\n"))
+                                     (catch :default _ nil))
+                                   (.exit js/process 124))
+                                 watchdog-ms)
+                             pre-flush-p (if (pos? hang-ms)
+                                           (js/Promise. (fn [resolve _] (js/setTimeout #(resolve true) hang-ms)))
+                                           (js/Promise.resolve true))]
+                         (-> pre-flush-p
+                             (.then (fn [_]
+                                      (println "Shutting down Bitecho node...")
+                                      (try ((:stop! node)) (catch :default _ nil))
+                                      (js/clearTimeout wd)
+                                      (.exit js/process 0)))))))]
      (.on js/process "SIGTERM" shutdown!)
      (.on js/process "SIGINT" shutdown!))))
 

@@ -92,26 +92,113 @@
                     [sid s1])))]
       (assoc state :sessions clean-sessions))))
 
-(defn strip-sensitive-keys
-  "Pure helper to remove single-use ECDH `:ephemeral-priv` keys from session state prior to persistence,
-   and dissoc transient runtime connection liveness keys (`:connected?`, `:connection-error`, `:conn-diagnostics`, `:p2p`)
-   so persisted state never includes them.
-   NOTE (`M2a-1` Trust Boundary): Active session symmetric `:tx-key` and `:rx-key` are intentionally retained
-   inside `state.fressian` (enforced `0600` POSIX permissions alongside `<state-dir>/identity/node-identity.edn`)
-   so stateless one-shot CLI invocations (`send`, `inbox`, `close`) can encrypt and decrypt ongoing session
-   messages across process invocations without re-running the X25519 handshake."
+(def inline-blob-state-keys
+  "BIP-025 §2.2 (Axiom A2): Keys that MUST NEVER be persisted inside Core State (`state.fressian`).
+   Raw blob bytes live in `<state-dir>/cache/blobs/<2>/<cid>` and cache metadata in `<state-dir>/cache/index.fressian`."
+  [:blobs :artifact-blobs :storage-blobs :capability-blobs :blob-index])
+
+(defn sanitize-core-state-for-persistence
+  "BIP-025 §2.2: Strips sensitive/transient runtime keys AND enforces the hard Core State invariant
+   removing any residual inline blob maps (`:blobs`, `:artifact-blobs`, `:storage-blobs`,
+   `:capability-blobs`, `[:governance :blobs]`) and `:blob-index` before `state.fressian` encoding.
+   Returns `[clean-state diagnostics]` emitting `:core-state-inline-blob-stripped` if any were present."
   [state]
   (let [invalidated (invalidate-stale-p2p-sessions state)
         clean-sessions (into {} (for [[sid s] (:sessions invalidated)]
                                   (let [cleaned (cond-> (dissoc s :ephemeral-priv :ratchet :pq-secret-key :handshake-state)
                                                   (not= "offered" (:state s)) (dissoc :offer-nonce))]
-                                    [sid cleaned])))]
-    (-> invalidated
-        (assoc :sessions clean-sessions)
-        (dissoc :connected? :connection-error :conn-diagnostics :runtime-ctx))))
+                                    [sid cleaned])))
+        had-inline? (boolean (or (some #(seq (get invalidated %)) inline-blob-state-keys)
+                                 (some #(contains? invalidated %) inline-blob-state-keys)
+                                 (contains? (:governance invalidated) :blobs)))
+        stripped (-> (apply dissoc invalidated :connected? :connection-error :conn-diagnostics :runtime-ctx inline-blob-state-keys)
+                     (assoc :sessions clean-sessions)
+                     (cond-> (map? (:governance invalidated))
+                       (update :governance dissoc :blobs)))
+        diags (if had-inline?
+                [{:effect :diagnose
+                  :reason :core-state-inline-blob-stripped}]
+                [])]
+    [stripped diags]))
+
+(defn strip-sensitive-keys
+  "Pure helper to remove single-use ECDH `:ephemeral-priv` keys from session state prior to persistence,
+   dissoc transient runtime connection liveness keys (`:connected?`, `:connection-error`, `:conn-diagnostics`, `:p2p`),
+   and enforce the BIP-025 §2.2 Core State invariant (zero inline blob maps and zero `:blob-index`).
+   NOTE (`M2a-1` Trust Boundary): Active session symmetric `:tx-key` and `:rx-key` are intentionally retained
+   inside `state.fressian` (enforced `0600` POSIX permissions alongside `<state-dir>/identity/node-identity.edn`)
+   so stateless one-shot CLI invocations (`send`, `inbox`, `close`) can encrypt and decrypt ongoing session
+   messages across process invocations without re-running the X25519 handshake."
+  [state]
+  (first (sanitize-core-state-for-persistence state)))
+
+(defn extract-legacy-inline-blobs
+  "BIP-025 §2.4: Purely scans legacy inline blob maps (`:blobs`, `:artifact-blobs`, `:storage-blobs`,
+   `:capability-blobs`, `[:governance :blobs]`), deduplicates by lowercase 64-hex CID, verifies
+   `sha256(:blob/bytes) == cid`, and returns a compacted Core State with zero inline blobs and zero `:blob-index`.
+   Idempotent: running on an already-migrated state is a zero-cost no-op (`:had-inline-blobs? false`)."
+  [state]
+  (if-not (map? state)
+    {:compacted-state state
+     :unique-blobs {}
+     :migrated-count 0
+     :deduplicated-count 0
+     :corrupt-skipped-count 0
+     :reclaimed-bytes 0
+     :had-inline-blobs? false}
+    (let [sources [(:blobs state)
+                   (:artifact-blobs state)
+                   (:storage-blobs state)
+                   (:capability-blobs state)
+                   (get-in state [:governance :blobs])]
+          has-any-key? (boolean (or (some #(contains? state %) inline-blob-state-keys)
+                                    (contains? (:governance state) :blobs)))
+          {:keys [unique dup-count corrupt-count total-raw-bytes]}
+          (reduce (fn [acc src]
+                    (if (map? src)
+                      (reduce-kv
+                       (fn [a k v]
+                         (let [raw-cid (or (when (map? v) (:blob/cid v)) (when (string? k) k))
+                               norm-cid (when (string? raw-cid) (str/lower-case (str/trim raw-cid)))
+                               bs (cond
+                                    (and (map? v) (bytes? (:blob/bytes v))) (:blob/bytes v)
+                                    (bytes? v) v
+                                    :else nil)
+                               sz (if bs (fressian/count-bytes bs) 0)
+                               mt (if (and (map? v) (string? (:blob/media-type v)))
+                                    (:blob/media-type v)
+                                    "application/octet-stream")]
+                           (if (and norm-cid bs (data/verify-blob {:blob/cid norm-cid :blob/bytes bs :blob/media-type mt}))
+                             (if (contains? (:unique a) norm-cid)
+                               (-> a
+                                   (update :dup-count inc)
+                                   (update :total-raw-bytes + sz))
+                               (-> a
+                                   (assoc-in [:unique norm-cid] {:cid norm-cid
+                                                                 :bytes bs
+                                                                 :size-bytes sz
+                                                                 :media-type mt})
+                                   (update :total-raw-bytes + sz)))
+                             (update a :corrupt-count inc))))
+                       acc
+                       src)
+                      acc))
+                  {:unique {} :dup-count 0 :corrupt-count 0 :total-raw-bytes 0}
+                  sources)
+          compacted (-> (apply dissoc state inline-blob-state-keys)
+                        (cond-> (map? (:governance state))
+                          (update :governance dissoc :blobs)))]
+      {:compacted-state compacted
+       :unique-blobs unique
+       :migrated-count (count unique)
+       :deduplicated-count dup-count
+       :corrupt-skipped-count corrupt-count
+       :reclaimed-bytes total-raw-bytes
+       :had-inline-blobs? (or has-any-key? (pos? (count unique)) (pos? corrupt-count))})))
 
 (defn encode-light-state
-  "Serializes sanitized light-node state into cross-platform Fressian bytes (`state.fressian`)."
+  "Serializes sanitized light-node Core State into cross-platform Fressian bytes (`state.fressian`).
+   Enforces BIP-025 §2.2 hard invariant: zero inline blob bytes and zero `:blob-index`."
   [state]
   (fressian/encode-wire-uncompressed (strip-sensitive-keys state)))
 
@@ -6428,10 +6515,15 @@
                     {:state (-> st-after-burn
                                 (assoc-in [:blobs cid] blob)
                                 (assoc-in [:pointers [subnet path]] ptr)
-                                (assoc-in [:artifact-blobs cid] blob)
                                 (assoc-in [:artifact-pointers [subnet path]] ptr)
                                 (update :artifact-tombstones dissoc [subnet path])
                                 (assoc-in [:artifact-min-seqs [subnet path]] seq-num))
+                     :cache-effects [{:effect :cache-put
+                                      :cid cid
+                                      :blob blob
+                                      :size-bytes (fressian/count-bytes bs)
+                                      :media-type (:blob/media-type blob)
+                                      :tier :active-pointer}]
                      :response (cond-> {"ok" true
                                         "subnet_id" subnet
                                         "path" path
@@ -9435,9 +9527,14 @@
         {:state (-> state
                     (assoc-in [:blobs (:blob/cid blob)] blob)
                     (assoc-in [:pointers [subnet path]] ptr)
-                    (assoc-in [:storage-blobs (:blob/cid blob)] blob)
                     (assoc-in [:storage-pointers [subnet path]] ptr)
                     (assoc-in [:storage-min-seqs [subnet path]] (:pointer/seq ptr)))
+         :cache-effects [{:effect :cache-put
+                          :cid (:blob/cid blob)
+                          :blob blob
+                          :size-bytes (fressian/count-bytes (:blob/bytes blob))
+                          :media-type (:blob/media-type blob)
+                          :tier :active-pointer}]
          :net-envelopes []
          :stdout-events [evt]}))))
 
@@ -9474,9 +9571,16 @@
                                    (> (long (:pointer/seq ptr)) current-seq))))
         valid? (and valid-ptr? target-match? seq-valid?)]
     (if duplicate-ptr?
-      {:state (-> state
-                  (cond-> valid-blob? (assoc-in [:blobs (:blob/cid blob)] blob))
-                  (cond-> valid-blob? (assoc-in [:artifact-blobs (:blob/cid blob)] blob)))
+      {:state (cond-> state
+                valid-blob? (assoc-in [:blobs (:blob/cid blob)] blob))
+       :cache-effects (if valid-blob?
+                        [{:effect :cache-put
+                          :cid (:blob/cid blob)
+                          :blob blob
+                          :size-bytes (fressian/count-bytes (:blob/bytes blob))
+                          :media-type (:blob/media-type blob)
+                          :tier :active-pointer}]
+                        [])
        :net-envelopes []
        :stdout-events []}
       (if-not valid?
@@ -9518,10 +9622,17 @@
             {:state (-> state
                         (cond-> valid-blob? (assoc-in [:blobs (:blob/cid blob)] blob))
                         (assoc-in [:pointers [subnet path]] ptr)
-                        (cond-> valid-blob? (assoc-in [:artifact-blobs (:blob/cid blob)] blob))
                         (assoc :artifact-pointers (assoc (or (:artifact-pointers state) {}) [subnet path] ptr))
                         (assoc :artifact-tombstones (dissoc (or (:artifact-tombstones state) {}) [subnet path]))
                         (assoc-in [:artifact-min-seqs [subnet path]] (:pointer/seq ptr)))
+             :cache-effects (if valid-blob?
+                              [{:effect :cache-put
+                                :cid (:blob/cid blob)
+                                :blob blob
+                                :size-bytes (fressian/count-bytes (:blob/bytes blob))
+                                :media-type (:blob/media-type blob)
+                                :tier :active-pointer}]
+                              [])
              :net-envelopes []
              :stdout-events [evt]}))))))
 

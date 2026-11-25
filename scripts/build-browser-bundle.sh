@@ -1214,8 +1214,8 @@ cat <<EOF > dist/index.html
     <pre id="outputLog">Loading BitechoBrowser bundle...</pre>
   </div>
 
-  <script src="/app/bitecho-browser.js?v=0.23.22-bip024" integrity="${SRI_384}" crossorigin="anonymous"></script>
-  <script src="/app/legacy.js?v=0.23.22-bip024" integrity="${LEGACY_SRI_384}" crossorigin="anonymous"></script>
+  <script src="/app/bitecho-browser.js?v=0.23.22-bip025" integrity="${SRI_384}" crossorigin="anonymous"></script>
+  <script src="/app/legacy.js?v=0.23.22-bip025" integrity="${LEGACY_SRI_384}" crossorigin="anonymous"></script>
 </body>
 </html>
 EOF

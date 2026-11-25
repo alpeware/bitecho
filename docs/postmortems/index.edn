@@ -1,5 +1,5 @@
 {:schema :bitecho/postmortem-index-v1
- :updated-at "2026-11-22"
+ :updated-at "2026-11-24"
  :incidents [{:incident-id "INC-2026-11-22-ns1"
               :severity :sev-2
               :bip-id "BIP-018"
@@ -11,4 +11,10 @@
               :bip-id "BIP-019"
               :edn-path "docs/postmortems/INC-2026-11-22-fepoch1.edn"
               :md-path "docs/postmortems/INC-2026-11-22-fepoch1.md"
-              :rendered-bip-cid "1ee44bdd2876041ada0508574d1854d6137ad62fbcedfce768f048f436593e9d"}]}
+              :rendered-bip-cid "1ee44bdd2876041ada0508574d1854d6137ad62fbcedfce768f048f436593e9d"}
+             {:incident-id "INC-2026-11-24-ns1-event-loop-wedge"
+              :severity :sev-2
+              :bip-id "BIP-025"
+              :edn-path "docs/postmortems/INC-2026-11-24-ns1-event-loop-wedge.edn"
+              :md-path "docs/postmortems/INC-2026-11-24-ns1-event-loop-wedge.md"
+              :rendered-bip-cid "83984cf37d31b232dfad10429395a5a061aaadaa76c304509117a92524d936cc"}]}

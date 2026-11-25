@@ -6,6 +6,7 @@
             [bitecho.basalt.core :as basalt]
             [bitecho.bech32m :as bech32m]
             [bitecho.browser-cli :as browser-cli]
+            [bitecho.cache.core :as cache]
             [bitecho.config :as config]
             [bitecho.config.flags :as flags]
             [bitecho.core.protocol.relay :as relay]
@@ -704,6 +705,15 @@
                           :burned-ech 0
                           :autonomous? false})]
      (reset! active-node-atom node-atom)
+     ;; BIP-025 (V-RT5): Trigger v1->v2 IDB blob migration before any persist-state overwrite can occur.
+     (when-not (false? (:restore-persisted? opts-map))
+       (try
+         (browser/load-persisted-state
+          (fn [err _loaded]
+            (when err
+              (browser/record-browser-cache-diagnostic! :browser-cache-persist-failed (str err)))))
+         (catch :default e
+           (browser/record-browser-cache-diagnostic! :browser-cache-persist-failed (str e)))))
      (start-browser-tab-lock! node-atom)
      (when-not (false? (:auto-sync? opts-map))
        (start-browser-auto-sync! node-atom))
@@ -1140,7 +1150,9 @@
                                        :degraded? degraded?}
                         :sync-state (:auto-sync node)
                         :lock-state (:instance-lock node)
-                        :security-flags sec-flags-echo}
+                        :security-flags sec-flags-echo
+                        :storage (merge (cache/cache-storage-summary @browser/*browser-cache-index*)
+                                        {:cache-budget-bytes cache/default-browser-max-cache-bytes})}
            canonical (status-core/render-status st-for-render runtime-ctx)
            canon-diags (get canonical "diagnostics")
            merged-diags (merge
@@ -1454,6 +1466,8 @@
             prev-inbox (vec (get-in st [:inbox] []))
             prev-bcasts (vec (get-in st [:broadcast-inbox] []))
             res (light-core/handle-wire-payload st env privkey)
+            _ (when (seq (:cache-effects res))
+                (browser/execute-browser-cache-effects! (:cache-effects res) node-atom))
             new-st (:state res)
             curr-inbox (vec (get-in new-st [:inbox] []))
             curr-bcasts (vec (get-in new-st [:broadcast-inbox] []))
@@ -3169,18 +3183,42 @@
                                  (and (:ok? p) (= "status" (:verb p)))))]
            (if status-cmd?
              (resolve (get-status node-atom))
-             (let [exec-res (browser/exec-browser-cli @node-atom input-clj priv)
-                   resp (:response exec-res)]
-               (when (:state exec-res)
-                 (reset! node-atom (:state exec-res))
-                 (when (seq (:net-envelopes exec-res))
-                   (doseq [env (:net-envelopes exec-res)]
-                     (route-browser-envelope! node-atom env)))
-                 (when-let [dial-info (:p2p-dial exec-res)]
-                   (dial-browser-p2p-peer! node-atom dial-info))
-                 (browser/persist-state! (browser/sanitize-state-for-persistence @node-atom))
-                 (notify-ui-listeners!))
-               (resolve (clj->js resp))))))))))
+             (let [parsed-cli (cli/parse-cli-command input-clj)
+                   eff-verb (when (:ok? parsed-cli) (:verb parsed-cli))
+                   cmd-map (when (:ok? parsed-cli) (:cmd-map parsed-cli))
+                   read-blob-cmd? (contains? #{"storage-get" "artifact-get"} eff-verb)
+                   finish-exec!
+                   (fn [node-snap hydrated-from-cache?]
+                     (let [exec-res (browser/exec-browser-cli node-snap input-clj priv)
+                           resp (:response exec-res)]
+                       (when (:state exec-res)
+                         (let [next-node (if hydrated-from-cache?
+                                           (update (:state exec-res) :light-state #(cache/prune-inline-hot-blobs % 0))
+                                           (:state exec-res))]
+                           (reset! node-atom next-node)
+                           (when (seq (:cache-effects exec-res))
+                             (browser/execute-browser-cache-effects! (:cache-effects exec-res) node-atom))
+                           (when (seq (:net-envelopes exec-res))
+                             (doseq [env (:net-envelopes exec-res)]
+                               (route-browser-envelope! node-atom env)))
+                           (when-let [dial-info (:p2p-dial exec-res)]
+                             (dial-browser-p2p-peer! node-atom dial-info))
+                           (browser/persist-state! (browser/sanitize-state-for-persistence @node-atom))
+                           (notify-ui-listeners!)))
+                       (resolve (clj->js resp))))]
+               ;; BIP-025 F7: Read-through hydration from IDB "bitecho-blob-cache" on storage-get / artifact-get hot miss.
+               (if-let [target-cid (and read-blob-cmd?
+                                        (cache/resolve-read-target-cid (:light-state @node-atom) eff-verb cmd-map))]
+                 (browser/hydrate-browser-cache-blob!
+                  target-cid
+                  node-atom
+                  (fn [hyd]
+                    (let [base-snap @node-atom
+                          snap-for-read (if (:ok? hyd)
+                                          (update base-snap :light-state #(cache/inject-hydrated-blob % target-cid (:blob hyd)))
+                                          base-snap)]
+                      (finish-exec! snap-for-read (true? (:ok? hyd))))))
+                 (finish-exec! @node-atom false))))))))))
 
 (defn- run-browser-governance-cmd!
   [cmd-map]
@@ -3197,6 +3235,8 @@
                 out-envs (:net-envelopes cmd-res)
                 resp (:response cmd-res)]
             (swap! na assoc :light-state new-st)
+            (when (seq (:cache-effects cmd-res))
+              (browser/execute-browser-cache-effects! (:cache-effects cmd-res) na))
             (doseq [env out-envs]
               (route-browser-envelope! na env))
             (browser/persist-state! (browser/sanitize-state-for-persistence @na))

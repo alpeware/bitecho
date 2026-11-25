@@ -10,11 +10,13 @@
    - Async WebCrypto boundary implementing ICryptoBoundary.
    - Deterministic multi-peer browser subnet simulation."
   (:require [bitecho.basalt.core :as basalt]
+            [bitecho.cache.core :as cache]
             [bitecho.crypto :as crypto]
             [bitecho.fressian :as fressian]
             [bitecho.light-node.cli :as cli]
             [bitecho.light-node.core :as light-node]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            #?(:cljs [goog.object :as gobj])))
 
 ;; =============================================================================
 ;; Rule 4 & Rule 5 Single-Authority Connection Lifecycle State Machine
@@ -973,6 +975,7 @@
     "broadcast-gap-detected" "foreign-unicast-dropped" "events-out-mismatch"
     ;; BIP-018 blob-store persistence keys
     "blob-hot-evicted" "max-pinned-app-bytes" "max-hot-blob-bytes"
+    "hot-evict-low-water-ratio" "scan-resistant-admission?" "pinned-cids"
     "pinned-app-bytes" "pinned-app-cap-exceeded" "blob-stored-cold"
     ;; v0.23.22 client hotfix diagnostic keys
     "subnet-id-startup-override" "ctl-socket-error"
@@ -1077,12 +1080,321 @@
   *in-memory-idb-store*
   (atom {}))
 
+(defonce ^{:doc "In-memory lossy blob cache fallback for environments without native IndexedDB (BIP-025 §2.5)."
+           :dynamic true}
+  *in-memory-idb-blob-cache*
+  (atom {}))
+
+(defonce ^{:doc "Pure Sans-IO local cache index for browser blob cache eviction & telemetry (BIP-025 F1)."
+           :dynamic true}
+  *browser-cache-index*
+  (atom (cache/init-cache-index)))
+
+(defonce ^{:doc "Counted Rule 5 diagnostics for browser blob cache operations (BIP-025 F1 & F5)."
+           :dynamic true}
+  *browser-cache-diagnostics*
+  (atom {}))
+
+(defn clear-in-memory-blob-cache!
+  "Resets in-memory browser blob cache fallback, cache index, and cache diagnostics (for tests)."
+  []
+  (reset! *in-memory-idb-blob-cache* {})
+  (reset! *browser-cache-index* (cache/init-cache-index))
+  (reset! *browser-cache-diagnostics* {})
+  nil)
+
+(defn record-browser-cache-diagnostic!
+  "BIP-025 F5 (Rule 5): Increments counted diagnostic `reason` in `*browser-cache-diagnostics*`
+   and optionally in `state-atom` `[:light-state :diagnostics reason]` or `[:diagnostics reason]`."
+  ([reason] (record-browser-cache-diagnostic! reason nil nil))
+  ([reason detail] (record-browser-cache-diagnostic! reason nil detail))
+  ([reason state-atom _detail]
+   (when (keyword? reason)
+     (swap! *browser-cache-diagnostics* update reason (fnil inc 0))
+     (when state-atom
+       (swap! state-atom
+              (fn [st]
+                (if (contains? st :light-state)
+                  (update-in st [:light-state :diagnostics reason] (fnil inc 0))
+                  (update-in st [:diagnostics reason] (fnil inc 0)))))))))
+
+(def idb-schema-version
+  "BIP-025 §2.5 (V3): Atomic IndexedDB schema version (v1 -> v2) adding lossy `\"bitecho-blob-cache\"`."
+  2)
+
+#?(:cljs
+   (defn- idb-has-store?
+     "Closure `:advanced`-safe `db.objectStoreNames.contains(name)` check (V3)."
+     [db store-name]
+     (let [names (gobj/get db "objectStoreNames")
+           contains-fn (when names (gobj/get names "contains"))]
+       (boolean (and contains-fn (.call contains-fn names store-name))))))
+
+#?(:cljs
+   (defn- idb-create-store!
+     "Closure `:advanced`-safe `db.createObjectStore(name)` call (V3)."
+     [db store-name]
+     (when-let [create-fn (gobj/get db "createObjectStore")]
+       (.call create-fn db store-name))))
+
+#?(:cljs
+   (defn- upgrade-bitecho-idb-v2!
+     "BIP-025 §2.5 (V3, A4): Atomic `onupgradeneeded` handler for `\"bitecho-db\"` v1 -> v2.
+      Preserves `\"bitecho-state\"` intact and creates lossy/reconstructible `\"bitecho-blob-cache\"`."
+     [e]
+     (let [target (gobj/get e "target")
+           db (when target (gobj/get target "result"))]
+       (when db
+         (when-not (idb-has-store? db "bitecho-state")
+           (idb-create-store! db "bitecho-state"))
+         (when-not (idb-has-store? db "bitecho-blob-cache")
+           (idb-create-store! db "bitecho-blob-cache"))))))
+
+(defn estimate-browser-cache-budget!
+  "BIP-025 §2.5 & §3.2 (V3): Queries `navigator.storage.estimate()` via Closure `:advanced`-safe
+   `gobj/get` accessors, invoking `(cb budget-bytes)` with `min(512 MiB, 50% quota)`.
+   Gracefully falls back to `512 MiB` in restricted/private contexts or JVM."
+  [cb]
+  (let [fallback cache/default-browser-max-cache-bytes]
+    #?(:cljs
+       (try
+         (let [nav (when (exists? js/navigator) js/navigator)
+               storage (when nav (gobj/get nav "storage"))
+               est-fn (when storage (gobj/get storage "estimate"))]
+           (if (fn? est-fn)
+             (-> (.call est-fn storage)
+                 (.then (fn [res]
+                          (let [quota (when res (gobj/get res "quota"))
+                                budget (if (and (number? quota) (pos? quota))
+                                         (min fallback (long (* 0.5 (double quota))))
+                                         fallback)]
+                            (when cb (cb budget)))))
+                 (.catch (fn [_] (when cb (cb fallback)))))
+             (when cb (cb fallback))))
+         (catch :default _
+           (when cb (cb fallback))))
+       :clj
+       (do (when cb (cb fallback)) fallback))))
+
+(defn persist-blob-cache-entry!
+  "BIP-025 §2.5 (V3, A4): Persists a lossy/reconstructible blob `{:bytes u8 :meta m}` under CID
+   in IndexedDB `\"bitecho-db\"` v2 object store `\"bitecho-blob-cache\"` (strictly orthogonal to F6b-1)."
+  ([cid bytes-val meta-map] (persist-blob-cache-entry! cid bytes-val meta-map nil))
+  ([cid bytes-val meta-map cb]
+   (let [norm-cid (cache/normalize-cid cid)]
+     (if-not norm-cid
+       (let [err {:ok? false :error :invalid-cid}]
+         (when cb (cb err nil))
+         err)
+       #?(:cljs
+          (if (and (exists? js/indexedDB) (some? js/indexedDB))
+            (try
+              (let [req (.open js/indexedDB "bitecho-db" 2)]
+                (gobj/set req "onupgradeneeded" upgrade-bitecho-idb-v2!)
+                (gobj/set req "onsuccess"
+                          (fn [e]
+                            (let [db (gobj/get (gobj/get e "target") "result")
+                                  tx-fn (gobj/get db "transaction")
+                                  tx (.call tx-fn db #js ["bitecho-blob-cache"] "readwrite")
+                                  os-fn (gobj/get tx "objectStore")
+                                  store (.call os-fn tx "bitecho-blob-cache")
+                                  put-fn (gobj/get store "put")
+                                  put-req (.call put-fn store #js {:bytes bytes-val :meta (clj->js (or meta-map {}))} norm-cid)]
+                              (gobj/set put-req "onsuccess" (fn [_] (when cb (cb nil {:ok? true :cid norm-cid}))))
+                              (gobj/set put-req "onerror" (fn [err] (when cb (cb err nil)))))))
+                (gobj/set req "onerror"
+                          (fn [_]
+                            (swap! *in-memory-idb-blob-cache* assoc norm-cid {:bytes bytes-val :meta meta-map})
+                            (when cb (cb nil {:ok? true :cid norm-cid :in-memory? true})))))
+              (catch :default _
+                (swap! *in-memory-idb-blob-cache* assoc norm-cid {:bytes bytes-val :meta meta-map})
+                (when cb (cb nil {:ok? true :cid norm-cid :in-memory? true}))))
+            (do
+              (swap! *in-memory-idb-blob-cache* assoc norm-cid {:bytes bytes-val :meta meta-map})
+              (when cb (cb nil {:ok? true :cid norm-cid :in-memory? true}))))
+          :clj
+          (do
+            (swap! *in-memory-idb-blob-cache* assoc norm-cid {:bytes bytes-val :meta meta-map})
+            (when cb (cb nil {:ok? true :cid norm-cid :in-memory? true}))))))))
+
+(defn load-blob-cache-entry
+  "BIP-025 §2.5 (V3, A4): Loads a lossy blob entry from IndexedDB `\"bitecho-blob-cache\"` by CID."
+  [cid cb]
+  (let [norm-cid (cache/normalize-cid cid)]
+    (if-not norm-cid
+      (when cb (cb nil nil))
+      #?(:cljs
+         (if (and (exists? js/indexedDB) (some? js/indexedDB))
+           (try
+             (let [req (.open js/indexedDB "bitecho-db" 2)]
+               (gobj/set req "onupgradeneeded" upgrade-bitecho-idb-v2!)
+               (gobj/set req "onsuccess"
+                         (fn [e]
+                           (let [db (gobj/get (gobj/get e "target") "result")
+                                 tx-fn (gobj/get db "transaction")
+                                 tx (.call tx-fn db #js ["bitecho-blob-cache"] "readonly")
+                                 os-fn (gobj/get tx "objectStore")
+                                 store (.call os-fn tx "bitecho-blob-cache")
+                                 get-fn (gobj/get store "get")
+                                 get-req (.call get-fn store norm-cid)]
+                             (gobj/set get-req "onsuccess"
+                                       (fn [ev]
+                                         (let [res (gobj/get (gobj/get ev "target") "result")]
+                                           (if res
+                                             (when cb (cb nil {:bytes (gobj/get res "bytes")
+                                                               :meta (js->clj (gobj/get res "meta") :keywordize-keys true)}))
+                                             (when cb (cb nil nil))))))
+                             (gobj/set get-req "onerror" (fn [err] (when cb (cb err nil)))))))
+               (gobj/set req "onerror"
+                         (fn [_] (when cb (cb nil (get @*in-memory-idb-blob-cache* norm-cid))))))
+             (catch :default _
+               (when cb (cb nil (get @*in-memory-idb-blob-cache* norm-cid)))))
+           (when cb (cb nil (get @*in-memory-idb-blob-cache* norm-cid))))
+         :clj
+         (when cb (cb nil (get @*in-memory-idb-blob-cache* norm-cid)))))))
+
+(defn delete-blob-cache-entry!
+  "BIP-025 F1: Deletes an evicted CID from IndexedDB `\"bitecho-blob-cache\"` and in-memory fallback.
+   Never swallows errors silently (Rule 5: emits `:browser-cache-delete-failed`)."
+  ([cid] (delete-blob-cache-entry! cid nil))
+  ([cid cb]
+   (let [norm-cid (cache/normalize-cid cid)]
+     (if-not norm-cid
+       (do (when cb (cb {:ok? false :error :invalid-cid} nil))
+           {:ok? false :error :invalid-cid})
+       (do
+         (swap! *in-memory-idb-blob-cache* dissoc norm-cid)
+         #?(:cljs
+            (if (and (exists? js/indexedDB) (some? js/indexedDB))
+              (try
+                (let [req (.open js/indexedDB "bitecho-db" 2)]
+                  (gobj/set req "onupgradeneeded" upgrade-bitecho-idb-v2!)
+                  (gobj/set req "onsuccess"
+                            (fn [e]
+                              (let [db (gobj/get (gobj/get e "target") "result")
+                                    tx-fn (gobj/get db "transaction")
+                                    tx (.call tx-fn db #js ["bitecho-blob-cache"] "readwrite")
+                                    os-fn (gobj/get tx "objectStore")
+                                    store (.call os-fn tx "bitecho-blob-cache")
+                                    del-fn (gobj/get store "delete")
+                                    del-req (.call del-fn store norm-cid)]
+                                (gobj/set del-req "onsuccess" (fn [_] (when cb (cb nil {:ok? true :cid norm-cid}))))
+                                (gobj/set del-req "onerror"
+                                          (fn [err]
+                                            (record-browser-cache-diagnostic! :browser-cache-delete-failed nil err)
+                                            (when cb (cb err nil)))))))
+                  (gobj/set req "onerror"
+                            (fn [err]
+                              (record-browser-cache-diagnostic! :browser-cache-delete-failed nil err)
+                              (when cb (cb err nil)))))
+                (catch :default err
+                  (record-browser-cache-diagnostic! :browser-cache-delete-failed nil err)
+                  (when cb (cb err nil))))
+              (when cb (cb nil {:ok? true :cid norm-cid :in-memory? true})))
+            :clj
+            (do
+              (when cb (cb nil {:ok? true :cid norm-cid :in-memory? true}))
+              {:ok? true :cid norm-cid :in-memory? true})))))))
+
+(defn execute-browser-cache-effects!
+  "BIP-025 F1: Drains pure `:cache-effects` (`:cache-put`) emitted by `light_node/core` reducers:
+   1. Persists each blob into IndexedDB `\"bitecho-blob-cache\"` (with Rule 5 error callback).
+   2. Updates `*browser-cache-index*` via `cache/record-put`.
+   3. Runs `cache/plan-evictions` against `max-cache-bytes` and deletes evicted CIDs from IDB + emits counted `:diagnose`.
+   4. Bounds/drops live `:blobs` in `node-atom` (`cache/prune-inline-hot-blobs`) so Browser RAM stays flat."
+  ([cache-effects node-atom] (execute-browser-cache-effects! cache-effects node-atom nil))
+  ([cache-effects node-atom opts]
+   (when (seq cache-effects)
+     (let [max-budget (long (or (:max-cache-bytes opts) cache/default-browser-max-cache-bytes))
+           max-hot (long (or (:max-hot-blobs opts) 0))
+           st-snap (when node-atom
+                     (let [v @node-atom]
+                       (or (:light-state v) v)))
+           pinned (set (or (:pinned-cids opts) (:pinned-cids st-snap) #{}))
+           active (into #{} (keep :pointer/target) (vals (or (:pointers st-snap) {})))]
+       (doseq [eff cache-effects]
+         (when (= :cache-put (:effect eff))
+           (let [cid (cache/normalize-cid (:cid eff))
+                 blob (:blob eff)
+                 bs (or (:blob/bytes blob) (:bytes eff))
+                 sz (long (or (:size-bytes eff) (when bs (fressian/count-bytes bs)) 0))
+                 mt (or (:media-type eff) (:blob/media-type blob) "application/octet-stream")
+                 tier (or (:tier eff) (cache/classify-tier cid pinned active))]
+             (when (and cid bs)
+               (persist-blob-cache-entry!
+                cid bs {:media-type mt :size-bytes sz}
+                (fn [err _]
+                  (when err
+                    (record-browser-cache-diagnostic! :browser-cache-persist-failed node-atom err))))
+               (swap! *browser-cache-index* cache/record-put
+                      {:cid cid :size-bytes sz :media-type mt :tier tier})))))
+       ;; Plan and execute GDSF evictions
+       (let [ev-res (cache/plan-evictions @*browser-cache-index*
+                                          {:max-cache-bytes max-budget
+                                           :pinned-cids pinned
+                                           :active-pointer-cids active})]
+         (reset! *browser-cache-index* (:cache-index ev-res))
+         (doseq [eff (:effects ev-res)]
+           (case (:effect eff)
+             :cache-delete (delete-blob-cache-entry! (:cid eff))
+             :diagnose (record-browser-cache-diagnostic! (:reason eff) node-atom eff)
+             nil)))
+       ;; Bound live in-memory :blobs so RAM stays flat
+       (when node-atom
+         (swap! node-atom
+                (fn [cur]
+                  (if (contains? cur :light-state)
+                    (update cur :light-state cache/prune-inline-hot-blobs max-hot)
+                    (cache/prune-inline-hot-blobs cur max-hot)))))
+       {:ok? true
+        :cache-summary (cache/cache-storage-summary @*browser-cache-index*)}))))
+
+(defn hydrate-browser-cache-blob!
+  "BIP-025 F1: Read-through hydration for Browser blob cache.
+   Checks hot `:blobs` in `node-atom` first; on miss, loads from IndexedDB `\"bitecho-blob-cache\"`,
+   increments GDSF hit count (`cache/record-hit`) on hit, or emits counted `:cache-miss` diagnostic on miss.
+   Invokes `(cb {:ok? bool :blob blob :hydrated? bool :error kw})`."
+  [cid node-atom cb]
+  (let [norm-cid (cache/normalize-cid cid)
+        st-snap (when node-atom
+                  (let [v @node-atom]
+                    (or (:light-state v) v)))
+        hot-blob (when norm-cid (get-in st-snap [:blobs norm-cid]))]
+    (cond
+      (nil? norm-cid)
+      (do
+        (record-browser-cache-diagnostic! :cache-miss node-atom {:cid cid})
+        (when cb (cb {:ok? false :error :cache-miss :cid cid})))
+
+      (some? hot-blob)
+      (do
+        (swap! *browser-cache-index* cache/record-hit norm-cid)
+        (when cb (cb {:ok? true :blob hot-blob :hydrated? false :cid norm-cid})))
+
+      :else
+      (load-blob-cache-entry
+       norm-cid
+       (fn [err entry]
+         (if (and (nil? err) (some? (:bytes entry)))
+           (let [blob {:blob/cid norm-cid
+                       :blob/bytes (:bytes entry)
+                       :blob/media-type (or (get-in entry [:meta :media-type]) "application/octet-stream")}]
+             (swap! *browser-cache-index* cache/record-hit norm-cid)
+             (when cb (cb {:ok? true :blob blob :hydrated? true :cid norm-cid})))
+           (do
+             (record-browser-cache-diagnostic! :cache-miss node-atom {:cid norm-cid :error err})
+             (when cb (cb {:ok? false :error :cache-miss :cid norm-cid})))))))))
+
 (defn persist-state!
-  "Persists sanitized state into IndexedDB (store 'bitecho-state', key 'light-node-state')
-   or fallback atom, returning a map or invoking callback (cb [err result])."
+  "Persists sanitized Core State into IndexedDB (`\"bitecho-db\"` v2, store `\"bitecho-state\"`,
+   key `\"light-node-state\"`) or fallback atom, stripping inline blob maps per BIP-025 §2.2/2.5."
   ([state] (persist-state! state nil))
   ([state cb]
-   (let [clean-state (sanitize-state-for-persistence state)
+   (let [core-only (if (map? state)
+                     (cond-> (apply dissoc state light-node/inline-blob-state-keys)
+                       (map? (:governance state)) (update :governance dissoc :blobs))
+                     {})
+         clean-state (sanitize-state-for-persistence core-only)
          encoded-bytes (try (fressian/encode-wire clean-state) (catch #?(:clj Exception :cljs :default) _ nil))]
      (if (or (nil? encoded-bytes) (zero? (fressian/count-bytes encoded-bytes)))
        (let [err-res {:ok? false :error :encode-failed}]
@@ -1091,26 +1403,25 @@
        #?(:cljs
           (if (and (exists? js/indexedDB) (some? js/indexedDB))
             (try
-              (let [req (.open js/indexedDB "bitecho-db" 1)]
-                (set! (.-onupgradeneeded req)
-                      (fn [e]
-                        (let [db (.. e -target -result)]
-                          (when-not (.contains (.-objectStoreNames db) "bitecho-state")
-                            (.createObjectStore db "bitecho-state")))))
-                (set! (.-onsuccess req)
-                      (fn [e]
-                        (let [db (.. e -target -result)
-                              tx (.transaction db (clj->js ["bitecho-state"]) "readwrite")
-                              store (.objectStore tx "bitecho-state")
-                              put-req (.put store encoded-bytes "light-node-state")]
-                          (set! (.-onsuccess put-req)
-                                (fn [_] (when cb (cb nil {:ok? true :bytes-stored (fressian/count-bytes encoded-bytes)}))))
-                          (set! (.-onerror put-req)
-                                (fn [err] (when cb (cb err nil)))))))
-                (set! (.-onerror req)
-                      (fn [_err]
-                        (swap! *in-memory-idb-store* assoc "light-node-state" encoded-bytes)
-                        (when cb (cb nil {:ok? true :in-memory? true})))))
+              (let [req (.open js/indexedDB "bitecho-db" 2)]
+                (gobj/set req "onupgradeneeded" upgrade-bitecho-idb-v2!)
+                (gobj/set req "onsuccess"
+                          (fn [e]
+                            (let [db (gobj/get (gobj/get e "target") "result")
+                                  tx-fn (gobj/get db "transaction")
+                                  tx (.call tx-fn db #js ["bitecho-state"] "readwrite")
+                                  os-fn (gobj/get tx "objectStore")
+                                  store (.call os-fn tx "bitecho-state")
+                                  put-fn (gobj/get store "put")
+                                  put-req (.call put-fn store encoded-bytes "light-node-state")]
+                              (gobj/set put-req "onsuccess"
+                                        (fn [_] (when cb (cb nil {:ok? true :bytes-stored (fressian/count-bytes encoded-bytes)}))))
+                              (gobj/set put-req "onerror"
+                                        (fn [err] (when cb (cb err nil)))))))
+                (gobj/set req "onerror"
+                          (fn [_err]
+                            (swap! *in-memory-idb-store* assoc "light-node-state" encoded-bytes)
+                            (when cb (cb nil {:ok? true :in-memory? true})))))
               (catch :default _err
                 (swap! *in-memory-idb-store* assoc "light-node-state" encoded-bytes)
                 (when cb (cb nil {:ok? true :in-memory? true}))))
@@ -1123,37 +1434,46 @@
             (when cb (cb nil {:ok? true :in-memory? true}))))))))
 
 (defn load-persisted-state
-  "Loads persisted state from IndexedDB or in-memory fallback, invoking cb (cb [err state])."
+  "Loads persisted Core State from IndexedDB (`\"bitecho-db\"` v2) or in-memory fallback,
+   migrating any legacy inline blobs into `\"bitecho-blob-cache\"` and invoking `(cb [err state])`."
   [cb]
   #?(:cljs
      (if (and (exists? js/indexedDB) (some? js/indexedDB))
        (try
-         (let [req (.open js/indexedDB "bitecho-db" 1)]
-           (set! (.-onupgradeneeded req)
-                 (fn [e]
-                   (let [db (.. e -target -result)]
-                     (when-not (.contains (.-objectStoreNames db) "bitecho-state")
-                       (.createObjectStore db "bitecho-state")))))
-           (set! (.-onsuccess req)
-                 (fn [e]
-                   (let [db (.. e -target -result)
-                         tx (.transaction db (clj->js ["bitecho-state"]) "readonly")
-                         store (.objectStore tx "bitecho-state")
-                         get-req (.get store "light-node-state")]
-                     (set! (.-onsuccess get-req)
-                           (fn [ev]
-                             (let [bytes (.. ev -target -result)]
-                               (if bytes
-                                 (let [decoded (sanitize-state-for-persistence (fressian/decode-wire bytes))]
-                                   (cb nil decoded))
-                                 (cb nil nil)))))
-                     (set! (.-onerror get-req)
-                           (fn [err] (cb err nil))))))
-           (set! (.-onerror req)
-                 (fn [_]
-                   (let [bytes (get @*in-memory-idb-store* "light-node-state")
-                         decoded (when bytes (sanitize-state-for-persistence (fressian/decode-wire bytes)))]
-                     (cb nil decoded)))))
+         (let [req (.open js/indexedDB "bitecho-db" 2)]
+           (gobj/set req "onupgradeneeded" upgrade-bitecho-idb-v2!)
+           (gobj/set req "onsuccess"
+                     (fn [e]
+                       (let [db (gobj/get (gobj/get e "target") "result")
+                             tx-fn (gobj/get db "transaction")
+                             tx (.call tx-fn db #js ["bitecho-state"] "readonly")
+                             os-fn (gobj/get tx "objectStore")
+                             store (.call os-fn tx "bitecho-state")
+                             get-fn (gobj/get store "get")
+                             get-req (.call get-fn store "light-node-state")]
+                         (gobj/set get-req "onsuccess"
+                                   (fn [ev]
+                                     (let [bytes (gobj/get (gobj/get ev "target") "result")]
+                                       (if bytes
+                                         (let [raw-decoded (fressian/decode-wire bytes)
+                                               extracted (light-node/extract-legacy-inline-blobs raw-decoded)
+                                               _ (when (:had-inline-blobs? extracted)
+                                                   (doseq [[cid info] (:unique-blobs extracted)]
+                                                     (persist-blob-cache-entry!
+                                                      cid (:bytes info) {:media-type (:media-type info) :size-bytes (:size-bytes info)}
+                                                      (fn [err _]
+                                                        (when err
+                                                          (record-browser-cache-diagnostic! :browser-cache-persist-failed nil err))))))
+                                               decoded (sanitize-state-for-persistence (:compacted-state extracted))]
+                                           (cb nil decoded))
+                                         (cb nil nil)))))
+                         (gobj/set get-req "onerror"
+                                   (fn [err] (cb err nil))))))
+           (gobj/set req "onerror"
+                     (fn [_]
+                       (let [bytes (get @*in-memory-idb-store* "light-node-state")
+                             decoded (when bytes (sanitize-state-for-persistence (fressian/decode-wire bytes)))]
+                         (cb nil decoded)))))
          (catch :default _
            (let [bytes (get @*in-memory-idb-store* "light-node-state")
                  decoded (when bytes (sanitize-state-for-persistence (fressian/decode-wire bytes)))]
@@ -1790,7 +2110,8 @@
          :verb (:verb parse-res)
          :response (:response res)
          :net-envelopes (or (:net-envelopes res) [])
-         :stdout-events (or (:stdout-events res) [])}))))
+         :stdout-events (or (:stdout-events res) [])
+         :cache-effects (or (:cache-effects res) [])}))))
 
 (defn- parse-semver-tuple
   [v]

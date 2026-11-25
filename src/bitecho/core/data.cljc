@@ -86,6 +86,9 @@
     :pinned-app-bytes 0
     :access-seq 0
     :max-hot-bytes (long (or (:max-hot-bytes opts) default-max-hot-bytes))
+    :hot-evict-low-water-ratio (double (or (:hot-evict-low-water-ratio opts) 0.85))
+    :scan-resistant-admission? (boolean (or (:scan-resistant-admission? opts)
+                                            (:cold-on-first-write? opts)))
     :max-hot-blob-bytes (when-let [m (:max-hot-blob-bytes opts)] (long m))
     :max-unpinned-bytes (long (or (:max-unpinned-bytes opts) default-max-unpinned-bytes))
     :max-pinned-app-bytes (long (or (:max-pinned-app-bytes opts) default-pinned-app-max-bytes))
@@ -133,50 +136,56 @@
             st))))))
 
 (defn evict-hot-lru
-  "Demotes hot `:bytes` to `nil` (cold metadata) in oldest-access-first order until :hot-bytes <= :max-hot-bytes.
-   Protects `:app-pinned?` web-app entries while any non-app-pinned hot entry is available, keeping pinned
-   web-app blobs isolated under their separate `<= 16 MiB` cap. Emits counted `:diagnose` `{:reason :blob-hot-evicted}`
-   effects for every evicted blob. Returns `[updated-store effects]`."
+  "Demotes hot `:bytes` to `nil` (cold metadata) in oldest-access-first order when `:hot-bytes > :max-hot-bytes`,
+   evicting down to `low-water = :hot-evict-low-water-ratio * :max-hot-bytes` (BIP-025 §4.3 hysteresis,
+   default `0.85` when configured or exact `max-h` when `low-water-ratio` is 1.0) to eliminate single-entry
+   boundary churn. Protects `:app-pinned?` web-app entries while any non-app-pinned hot entry is available.
+   Emits counted `:diagnose` `{:reason :blob-hot-evicted}` effects for every evicted blob.
+   Returns `[updated-store effects]`."
   ([store]
    (evict-hot-lru store nil))
   ([store keep-cid]
-   (let [max-h (long (:max-hot-bytes store default-max-hot-bytes))]
-     (loop [st store
-            effs []]
-       (if (<= (long (:hot-bytes st 0)) max-h)
-         [st effs]
-         (let [regular-cands (->> (:entries st)
-                                  (keep (fn [[cid entry]]
-                                          (when (and (some? (:bytes entry))
-                                                     (not (:app-pinned? entry))
-                                                     (not= cid keep-cid))
-                                            [cid entry])))
-                                  (sort-by (fn [[cid entry]] [(:last-access entry 0) cid])))
-               candidates (if (seq regular-cands)
-                            regular-cands
-                            (->> (:entries st)
-                                 (keep (fn [[cid entry]]
-                                         (when (and (some? (:bytes entry))
-                                                    (not= cid keep-cid))
-                                           [cid entry])))
-                                 (sort-by (fn [[cid entry]] [(:last-access entry 0) cid]))))]
-           (if-let [[victim-cid victim] (first candidates)]
-             (let [sz (long (:size victim 0))
-                   was-app-pinned? (boolean (:app-pinned? victim))
-                   diag {:effect :diagnose
-                         :type :diagnose
-                         :reason :blob-hot-evicted
-                         :cid victim-cid
-                         :size sz}]
-               (recur (-> st
-                          (assoc-in [:entries victim-cid :bytes] nil)
-                          (update :hot-bytes #(max 0 (- (long (or % 0)) sz)))
-                          (cond-> was-app-pinned?
-                            (update :pinned-app-bytes #(max 0 (- (long (or % 0)) sz))))
-                          (update-in [:diagnostics :evicted-hot] (fnil inc 0))
-                          (update-in [:diagnostics :blob-hot-evicted] (fnil inc 0)))
-                      (conj effs diag)))
-             [st effs])))))))
+   (let [max-h (long (:max-hot-bytes store default-max-hot-bytes))
+         ratio (double (or (:hot-evict-low-water-ratio store) 0.85))
+         low-water (max 0 (min max-h (long (* (double max-h) ratio))))]
+     (if (<= (long (:hot-bytes store 0)) max-h)
+       [store []]
+       (loop [st store
+              effs []]
+         (if (<= (long (:hot-bytes st 0)) low-water)
+           [st effs]
+           (let [regular-cands (->> (:entries st)
+                                    (keep (fn [[cid entry]]
+                                            (when (and (some? (:bytes entry))
+                                                       (not (:app-pinned? entry))
+                                                       (not= cid keep-cid))
+                                              [cid entry])))
+                                    (sort-by (fn [[cid entry]] [(:last-access entry 0) cid])))
+                 candidates (if (seq regular-cands)
+                              regular-cands
+                              (->> (:entries st)
+                                   (keep (fn [[cid entry]]
+                                           (when (and (some? (:bytes entry))
+                                                      (not= cid keep-cid))
+                                             [cid entry])))
+                                   (sort-by (fn [[cid entry]] [(:last-access entry 0) cid]))))]
+             (if-let [[victim-cid victim] (first candidates)]
+               (let [sz (long (:size victim 0))
+                     was-app-pinned? (boolean (:app-pinned? victim))
+                     diag {:effect :diagnose
+                           :type :diagnose
+                           :reason :blob-hot-evicted
+                           :cid victim-cid
+                           :size sz}]
+                 (recur (-> st
+                            (assoc-in [:entries victim-cid :bytes] nil)
+                            (update :hot-bytes #(max 0 (- (long (or % 0)) sz)))
+                            (cond-> was-app-pinned?
+                              (update :pinned-app-bytes #(max 0 (- (long (or % 0)) sz))))
+                            (update-in [:diagnostics :evicted-hot] (fnil inc 0))
+                            (update-in [:diagnostics :blob-hot-evicted] (fnil inc 0)))
+                        (conj effs diag)))
+               [st effs]))))))))
 
 (defn demote-blob-to-cold
   "BIP-021 §2.7: Demotes an unpinned (or superseded) hot blob in `store` to cold metadata,
@@ -258,10 +267,20 @@
                      app-pinned? (boolean (:app-pinned? existing))
                      was-present? (some? existing)
                      max-entry (:max-hot-blob-bytes store)
-                     store-cold? (and (some? max-entry)
-                                      (pos? (long max-entry))
-                                      (> sz (long max-entry))
-                                      (not app-pinned?))]
+                     oversize-cold? (and (some? max-entry)
+                                         (pos? (long max-entry))
+                                         (> sz (long max-entry))
+                                         (not app-pinned?))
+                     scan-resist? (boolean (or (:scan-resistant-admission? store)
+                                               (:cold-on-first-write? store)))
+                     ;; BIP-025 §4.3: 2-hit scan-resistant admission — first write of unpinned
+                     ;; blob stores cold so one-shot pass-through traffic does not evict warm working set;
+                     ;; second hit promotes to hot RAM.
+                     first-hit-cold? (and scan-resist?
+                                          (not was-present?)
+                                          (not app-pinned?)
+                                          (zero? pins))
+                     store-cold? (or oversize-cold? first-hit-cold?)]
                  (if store-cold?
                    (if (and existing (nil? (:bytes existing)) (= sz (long (or (:size existing) 0))))
                      {:ok? true

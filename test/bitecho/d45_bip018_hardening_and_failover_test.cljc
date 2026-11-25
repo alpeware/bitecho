@@ -514,11 +514,11 @@
          (is (str/includes? fn-src ":offheap-gc-triggered")
              "full_node_main.cljs must emit counted :offheap-gc-triggered diagnostic on GC")))))
 
-(defspec ^{:doc "BIP-018-SOAK-F1: should-trigger-offheap-gc? enforces cooldown, gc availability, and ArrayBuffer/external thresholds."}
+(defspec ^{:doc "BIP-018-SOAK-F1 / BIP-025 §4.2: should-trigger-offheap-gc? enforces cooldown (120s), gc availability, and ArrayBuffer/external thresholds (32 MiB / 64 MiB)."}
   prop-offheap-gc-trigger-throttled-and-bounded 100
-  (prop/for-all [ab-bytes (gen/choose 0 33554432)
-                 ext-bytes (gen/choose 0 33554432)
-                 elapsed-ms (gen/choose 0 120000)
+  (prop/for-all [ab-bytes (gen/choose 0 (* 64 1024 1024))
+                 ext-bytes (gen/choose 0 (* 96 1024 1024))
+                 elapsed-ms (gen/choose 0 240000)
                  gc-avail? gen/boolean]
                 (let [last-gc 1000000
                       now-ms (+ last-gc elapsed-ms)
@@ -530,9 +530,9 @@
                                  :now-ms now-ms
                                  :gc-available? gc-avail?})
                       expected? (and gc-avail?
-                                     (>= elapsed-ms 30000)
-                                     (or (>= ab-bytes (* 8 1024 1024))
-                                         (>= ext-bytes (* 16 1024 1024))))]
+                                     (>= elapsed-ms core-infra/default-offheap-gc-cooldown-ms)
+                                     (or (>= ab-bytes core-infra/default-offheap-gc-max-array-buffers-bytes)
+                                         (>= ext-bytes core-infra/default-offheap-gc-max-external-bytes)))]
                   (= expected? trigger?))))
 
 ;; =============================================================================
