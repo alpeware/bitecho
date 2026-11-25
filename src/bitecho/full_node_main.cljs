@@ -2923,7 +2923,10 @@
         on-pre-error (fn [_] (reset! handled? true))
         dispatch! (fn []
                     (when (compare-and-set! handled? false true)
-                      (.setTimeout client-sock 0)
+                      (.setTimeout client-sock 120000
+                                   (fn []
+                                     (when-not (.-destroyed client-sock)
+                                       (.destroy client-sock))))
                       (let [^js buf (.concat js/Buffer chunks)
                             _ (set! (.-length chunks) 0)
                             n (.-length buf)]
@@ -5563,6 +5566,7 @@
                                               :connect-routes (get-in config [:http :connect-routes])
                                               :peek-timeout-ms (get-in config [:http :peek-timeout-ms] 2000)
                                               :shell-atom http-shell-atom})))]
+                           (gobj/set front-srv "maxConnections" 256)
                            (.listen front-srv https-port bind-ip
                                     (fn []
                                       (let [bp (.-port (.address front-srv))]
@@ -5583,6 +5587,10 @@
                                 :dns-shell-atom (:shell-atom @dns-handle-atom)
                                 :smtp-shell-atom (:shell-atom @smtp-handle-atom)
                                 :https? false :bound-https-port (:https-port @ports-atom)})))]
+              (gobj/set http-srv "keepAliveTimeout" 65000)
+              (gobj/set http-srv "headersTimeout" 66000)
+              (gobj/set http-srv "requestTimeout" 120000)
+              (gobj/set http-srv "maxConnections" 256)
               (.listen http-srv http-port bind-ip
                        (fn []
                          (let [bp (.-port (.address http-srv))]
