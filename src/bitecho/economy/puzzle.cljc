@@ -221,6 +221,28 @@
                               :else (fressian/encode-canonical msg-data))]
                      (boolean (crypto/verify pubkey-hex bs sig-hex)))
                    (catch #?(:clj Throwable :cljs :default) _ false)))
+        sla-verify-fn (fn [oracle-pubkey att]
+                        (step! 25)
+                        (try
+                          (let [pk (str (or (when (map? att) (:oracle-pubkey att)) oracle-pubkey))
+                                att-ep (long (or (:epoch att) -1))
+                                att-seq (long (or (:vault-seq att) -1))
+                                score-bps (long (or (:score-bps att) -1))
+                                sig (:signature att)
+                                net-uri (str (or (:network-uri norm-env) ""))
+                                gen-cid (str (or (:network-genesis-cid norm-env) ""))
+                                vid (str (or (:vault-id att) (:vault-id norm-env) ""))
+                                tuple (if (some? (:metric-id att))
+                                        ["bitecho-sla-attestation-v1" net-uri gen-cid vid att-seq att-ep (str (:metric-id att)) score-bps]
+                                        ["bitecho-sla-attestation-v1" net-uri gen-cid vid att-seq att-ep score-bps])]
+                            (boolean
+                             (and (map? att)
+                                  (= vid (str (or (:vault-id norm-env) "")))
+                                  (= att-seq (long (or (:vault-seq norm-env) -2)))
+                                  (<= 0 score-bps 10000)
+                                  (string? sig)
+                                  (crypto/verify-with-fallback pk (fressian/encode-canonical tuple) sig))))
+                          (catch #?(:clj Throwable :cljs :default) _ false)))
         safe-range (fn [& args]
                      (let [n (case (count args)
                                1 (first args)
@@ -242,6 +264,7 @@
      'sha256-hex sha-fn
      'verify-signature sig-fn
      'verify-sig sig-fn
+     'verify-sla-attestation sla-verify-fn
      'bytes= (wrap-1 =)
      '= (wrap-1 =)
      'not= (wrap-1 not=)

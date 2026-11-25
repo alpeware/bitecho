@@ -3382,7 +3382,8 @@
       (if (and (map? res) (contains? res :ok?) (false? (:ok? res)))
         (cb res)
         (let [snaps (if (map? res) (or (:snapshots res) [res]) res)
-              trusted (set (keep :pubkey (vals (:nodes bootstrap))))
+              snap-ep (reduce max 0 (map #(long (or (:finalized-epoch %) (get % "finalized-epoch") (get % "finalized_epoch") 0)) snaps))
+              trusted (light-core/trusted-validators-for-epoch (or (:state opts) {:bootstrap bootstrap}) snap-ep)
               q-opts (assoc opts
                             :expected-pubkey pubkey
                             :trusted-validators trusted
@@ -3414,7 +3415,9 @@
                  (let [snaps @results]
                    (if (empty? snaps)
                      (cb {:ok? false :error "no-inband-snapshots-returned"})
-                     (cb (light-core/verify-chain-state-quorum snaps verify-opts)))))))))))))
+                     (let [snap-ep (reduce max 0 (map #(long (or (:finalized-epoch %) (get % "finalized-epoch") (get % "finalized_epoch") 0)) snaps))
+                           trusted' (light-core/trusted-validators-for-epoch (or (:state opts) {:bootstrap bootstrap}) snap-ep)]
+                       (cb (light-core/verify-chain-state-quorum snaps (assoc verify-opts :trusted-validators trusted')))))))))))))))
 
 (defn fetch-validator-accountz!
   "Fallback HTTP `/accountz` fetcher across validator candidates."
@@ -3471,7 +3474,8 @@
                                                s))
                                            raw-snaps))]
            (if (seq signed-snaps)
-             (let [trusted (set (keep :pubkey (vals (:nodes bootstrap))))
+             (let [snap-ep (reduce max 0 (map #(long (or (:finalized-epoch %) (get % "finalized-epoch") (get % "finalized_epoch") 0)) signed-snaps))
+                   trusted (light-core/trusted-validators-for-epoch (assoc @state-atom :bootstrap (or (:bootstrap @state-atom) bootstrap)) snap-ep)
                    verify-opts (assoc opts
                                       :expected-pubkey pubkey
                                       :expected-nonce nonce
@@ -3554,7 +3558,8 @@
                                                    s))
                                                raw-snaps))]
                (if (seq signed-snaps)
-                 (let [trusted (set (keep :pubkey (vals (:nodes bootstrap))))
+                 (let [snap-ep (reduce max 0 (map #(long (or (:finalized-epoch %) (get % "finalized-epoch") (get % "finalized_epoch") 0)) signed-snaps))
+                       trusted (light-core/trusted-validators-for-epoch (assoc @state-atom :bootstrap (or (:bootstrap @state-atom) bootstrap)) snap-ep)
                        verify-opts (assoc opts
                                           :expected-pubkey pubkey
                                           :expected-nonce nonce

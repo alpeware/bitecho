@@ -33,8 +33,15 @@
         (update :bootstrap-sunset-epoch scale-epoch-constant c)
         (update :treasury-trailing-epochs scale-epoch-constant c)
         (update :descriptor-ttl-epochs scale-epoch-constant c)
-        (update :validator-activation-lead-epochs #(max 1 (scale-epoch-constant % c)))
-        (update :bootstrap-drawdown-lambda #(* (double (or % 0.0001)) (double c))))))
+        (update :validator-activation-lead-epochs #(max 3 (scale-epoch-constant % c)))
+        (update :bootstrap-drawdown-lambda
+                (fn [lam]
+                  (let [l (double (or lam 0.0001))]
+                    (cond
+                      (<= l 0.0) 0.0
+                      (>= l 1.0) 1.0
+                      :else (- 1.0 #?(:clj (Math/pow (- 1.0 l) (double c))
+                                      :cljs (js/Math.pow (- 1.0 l) (double c)))))))))))
 
 (defn- deterministic-spki-hex
   "Deterministically derives a synthetic valid 88-char SPKI hex identifier from `rng`."

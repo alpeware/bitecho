@@ -2196,17 +2196,21 @@
                      (get-in validator-identity [:keypair :private])
                      (when-let [pk-hex (:privkey-hex validator-identity)]
                        (basalt/hex->bytes pk-hex)))
-        base-snap {:bitecho/type :chain-state-snapshot
-                   :type :chain-state-snapshot
-                   :validator-pubkey val-pub
-                   :pubkey pubkey
-                   :finalized-epoch fin-epoch
-                   :balance balance
-                   :spendable spendable
-                   :seq seq-num
-                   :deps deps
-                   :escrows matching-escrows
-                   :nonce (or nonce "")}
+        base-snap (cond-> {:bitecho/type :chain-state-snapshot
+                           :type :chain-state-snapshot
+                           :validator-pubkey val-pub
+                           :pubkey pubkey
+                           :finalized-epoch fin-epoch
+                           :balance balance
+                           :spendable spendable
+                           :seq seq-num
+                           :deps deps
+                           :escrows matching-escrows
+                           :nonce (or nonce "")}
+                    (seq (:validator-set-history st))
+                    (assoc :validator-set-history (:validator-set-history st))
+                    (map? (:validator-set-mirror st))
+                    (assoc :validator-set-mirror (:validator-set-mirror st)))
         sign-fn (try (requiring-resolve 'bitecho.light-node.core/sign-chain-state-snapshot) (catch Exception _ nil))]
     (if (and sign-fn val-priv)
       (let [signed (sign-fn base-snap val-priv)]

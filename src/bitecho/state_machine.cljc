@@ -1036,13 +1036,78 @@
             (recur (:parent-hash block) (conj visited curr) (into acc rids)))
           acc)))))
 
+(defn promote-active-validators
+  "Pure BIP-026 §1.2 P2.1 (B4) validator-set promotion helper.
+   Consults `streamlet/committee-at-epoch` on `(:validator-set-history state)` for `epoch`
+   with canonical 64/88-hex normalization. Whenever an entry with `ep-eff <= epoch` yields
+   a committee distinct from `(:validators state)`, atomically updates `:validators`,
+   `[:config :validators]`, `:peers-map`, `:mesh-nodes`, and `:quorum-threshold`, increments
+   `[:diagnostics :validator-set-promoted]`, and emits a `:validator-set-promoted` `:diagnose`
+   effect. Returns `{:state st' :promoted? bool :effects [...]}`."
+  [state epoch]
+  (let [ep (long (or epoch (:epoch state) 0))
+        entry (streamlet/committee-at-epoch (:validator-set-history state) ep)]
+    (if-not (and (map? entry) (seq (:committee entry)))
+      {:state state :promoted? false :effects []}
+      (let [new-vals (vec (sort (distinct (keep streamlet/normalize-validator-hex (:committee entry)))))
+            cur-vals (vec (sort (distinct (keep streamlet/normalize-validator-hex
+                                                (or (:validators state)
+                                                    (get-in state [:config :validators])
+                                                    [])))))
+            new-q (long (or (:quorum-threshold entry)
+                            (streamlet/quorum-threshold (count new-vals))))
+            cur-q (when (some? (:quorum-threshold state)) (long (:quorum-threshold state)))
+            changed? (or (not= cur-vals new-vals)
+                         (and (some? cur-q) (not= cur-q new-q)))]
+        (if-not changed?
+          {:state state :promoted? false :effects []}
+          (let [existing-peers (or (:peers-map state) {})
+                merged-peers (reduce (fn [m pk]
+                                       (if (or (contains? m pk)
+                                               (and (= 88 (count pk))
+                                                    (string/starts-with? pk streamlet/spki-ed25519-prefix)
+                                                    (contains? m (subs pk 24))))
+                                         (if (contains? m pk)
+                                           m
+                                           (assoc m pk (get m (subs pk 24))))
+                                         (if (and (string? pk)
+                                                  (or (= 64 (count pk)) (= 88 (count pk)))
+                                                  (re-matches #"^[0-9a-fA-F]+$" pk))
+                                           (assoc m pk (fressian/hex->bytes pk))
+                                           m)))
+                                     existing-peers
+                                     new-vals)
+                new-mesh (into {} (map (fn [pk] [pk 1]) new-vals))
+                st' (-> state
+                        (assoc :validators new-vals
+                               :peers-map merged-peers
+                               :mesh-nodes new-mesh
+                               :quorum-threshold new-q)
+                        (assoc-in [:config :validators] new-vals)
+                        (assoc-in [:config :peers-map] merged-peers)
+                        (assoc-in [:config :mesh-nodes] new-mesh)
+                        (update-in [:diagnostics :validator-set-promoted] (fnil inc 0)))
+                diag {:type :diagnose
+                      :effect :diagnose
+                      :reason :validator-set-promoted
+                      :epoch ep
+                      :committee new-vals
+                      :quorum-threshold new-q}]
+            {:state st'
+             :promoted? true
+             :effects [diag]}))))))
+
 (defn- apply-streamlet-tick
   "Steps Streamlet BFT tick if peers-map is configured, advancing consensus state and commands."
   ([state commands closing-epoch]
    (apply-streamlet-tick state commands closing-epoch nil))
   ([state commands closing-epoch now-ms]
    (if (consensus-mode? state)
-     (let [ancestor-rids (collect-ancestor-receipt-ids state)
+     (let [next-ep (inc (long (or closing-epoch 0)))
+           pre-prom (promote-active-validators state next-ep)
+           state (:state pre-prom)
+           commands (into (or commands []) (:effects pre-prom))
+           ancestor-rids (collect-ancestor-receipt-ids state)
            exec-rids (or (:executed-receipt-ids state) #{})
            max-rcpts (long (or (get-in state [:config :max-receipts-per-block])
                                (:max-receipts-per-block state)
@@ -1079,9 +1144,10 @@
            tick-ev (cond-> {:type :tick}
                      (integer? now-ms) (assoc :now-ms (long now-ms)))
            streamlet-res (streamlet/handle-streamlet-event tick-state tick-ev)
-           post-exec-state (execute-finalized-blocks (:state streamlet-res))]
-       {:state post-exec-state
-        :commands (into (or commands []) (:commands streamlet-res))})
+           post-exec-state (execute-finalized-blocks (:state streamlet-res))
+           post-prom (promote-active-validators post-exec-state (long (or (:epoch post-exec-state) next-ep)))]
+       {:state (:state post-prom)
+        :commands (into (into (or commands []) (:commands streamlet-res)) (:effects post-prom))})
      {:state state
       :commands commands})))
 
@@ -2592,7 +2658,7 @@
                                                         (assoc-in [:validator-set-history ep-eff] entry)
                                                         (assoc :validator-set-mirror mirror))]
                                              (if (<= ep-eff b-epoch)
-                                               (assoc s1 :validators comm)
+                                               (:state (promote-active-validators s1 b-epoch))
                                                s1))
                                            (-> s
                                                (update :failed-receipts-count (fnil inc 0))
@@ -2694,8 +2760,9 @@
              st-advanced (if (> b-epoch last-exec)
                            (let [st-settled (apply-epoch-voucher-settlement st-clean closing-ep)
                                  st-treasury (apply-epoch-treasury-boundary st-settled b-epoch)
-                                 st-pruned (prune-treasury-epoch-state st-treasury b-epoch (:config st-treasury))]
-                             (assoc st-pruned :last-executed-finalized-epoch b-epoch))
+                                 st-pruned (prune-treasury-epoch-state st-treasury b-epoch (:config st-treasury))
+                                 st-promoted (:state (promote-active-validators st-pruned b-epoch))]
+                             (assoc st-promoted :last-executed-finalized-epoch b-epoch))
                            st-clean)
              [next-blocks next-blocks-ord] (fifo-track (:executed-finalized-blocks st-advanced)
                                                        (:executed-finalized-blocks-order st-advanced)
@@ -4013,11 +4080,14 @@
         sender-hex (when sender (if (string? sender) sender (basalt/bytes->hex sender)))
         receipt (:receipt event)
         rid (when (map? receipt) (:receipt-id receipt))
-        known-peers (set/union (set (keys (:peers-map state)))
-                               (set (streamlet/extract-validator-hexes state)))
-        sender-ok? (or (nil? sender-hex)
+        active-res (streamlet/resolve-active-validators state (or (:epoch state) 0))
+        active-vals (if (:ok? active-res) (:validators active-res) (streamlet/extract-validator-hexes state))
+        known-peers (set/union (set (keep streamlet/normalize-validator-hex (keys (:peers-map state))))
+                               (set (keep streamlet/normalize-validator-hex active-vals)))
+        norm-sender (streamlet/normalize-validator-hex sender-hex)
+        sender-ok? (or (nil? norm-sender)
                        (empty? known-peers)
-                       (contains? known-peers sender-hex))
+                       (contains? known-peers norm-sender))
         already-known? (and (string? rid)
                             (or (contains? (or (:known-receipt-ids state) #{}) rid)
                                 (contains? (or (:executed-receipt-ids state) #{}) rid)))
@@ -4135,7 +4205,8 @@
         b-hash (:latest-finalized-block-hash state)
         raw-block (when b-hash (get-in state [:blocks b-hash]))
         block (when raw-block (if (record? raw-block) raw-block (streamlet/map->Block raw-block)))
-        vals-vec (streamlet/extract-validator-hexes state)
+        active-res (streamlet/resolve-active-validators state fin-epoch)
+        vals-vec (if (:ok? active-res) (:validators active-res) (streamlet/extract-validator-hexes state))
         mesh-map (canonical-membership-mesh (or (:mesh-nodes state) (get-in state [:config :mesh-nodes]) vals-vec))
         snap {:finalized-epoch fin-epoch
               :latest-finalized-block-hash b-hash
@@ -4193,7 +4264,8 @@
         block (when (map? raw-block) (streamlet/map->Block raw-block))
         b-hash (or (:latest-finalized-block-hash checkpoint) (:latest-finalized-block-hash snapshot))
         digest (or (:state-digest checkpoint) (:state-digest snapshot))
-        auth-vals (set (streamlet/extract-validator-hexes state))
+        active-res (streamlet/resolve-active-validators state (max 0 fin-epoch))
+        auth-vals (set (if (:ok? active-res) (:validators active-res) (streamlet/extract-validator-hexes state)))
         q-thresh (streamlet/quorum-threshold (count auth-vals))
         raw-qc (or (when (seq (:qc-signatures checkpoint)) (:qc-signatures checkpoint))
                    (when (seq (:checkpoint-qc checkpoint)) (:checkpoint-qc checkpoint))
@@ -4293,7 +4365,9 @@
         {:state state :commands []}))
     (let [targets (if-let [t (:target event)]
                     [t]
-                    (vec (sort (disj (set (streamlet/extract-validator-hexes state)) (:node-pubkey state)))))]
+                    (let [active-res (streamlet/resolve-active-validators state (or (:epoch state) 0))
+                          vals-vec (if (:ok? active-res) (:validators active-res) (streamlet/extract-validator-hexes state))]
+                      (vec (sort (remove #(streamlet/same-validator-key? % (:node-pubkey state)) vals-vec)))))]
       {:state state
        :commands (if (seq targets)
                    [{:type :send-request-checkpoint
@@ -4326,14 +4400,18 @@
                                   (map (fn [[k v]]
                                          [(str k) (if (record? v) v (account/map->AccountState v))])
                                        (or (:ledger snapshot) {})))
-            new-vals (vec (sort (map #(if (keyword? %) (name %) (str %))
-                                     (or (:validators snapshot) (streamlet/extract-validator-hexes state)))))
+            new-vals (vec (sort (distinct (keep streamlet/normalize-validator-hex
+                                                (or (:validators snapshot)
+                                                    (let [ar (streamlet/resolve-active-validators state (max 0 fin-epoch))]
+                                                      (if (:ok? ar) (:validators ar) (streamlet/extract-validator-hexes state))))))))
             new-mesh (canonical-membership-mesh (or (:mesh-nodes snapshot) new-vals))
             active-peer-set (set/union (set new-vals) (set (keys new-mesh)))
             auto-peers (reduce (fn [m pk]
                                  (if (contains? m pk)
                                    m
-                                   (if (and (string? pk) (= 64 (count pk)) (re-matches #"^[0-9a-fA-F]+$" pk))
+                                   (if (and (string? pk)
+                                            (or (= 64 (count pk)) (= 88 (count pk)))
+                                            (re-matches #"^[0-9a-fA-F]+$" pk))
                                      (assoc m pk (fressian/hex->bytes pk))
                                      m)))
                                (or (:peers-map state) {})

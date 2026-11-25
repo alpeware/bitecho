@@ -515,7 +515,7 @@
                         :network-genesis-cid test-genesis-cid})]
       (is (:ok? v-res))
       (is (false? (:ok? v-early)))
-      (is (= :validator-activation-lead-violated (:error v-early)))
+      (is (= :validator-rotation-lead-too-short (:error v-early)))
       (is (= (set [(:spki-hex v1) (:spki-hex v2) (:spki-hex v3) (:spki-hex v4)])
              (set (:committee (streamlet/committee-at-epoch history 10)))))
       (is (= (set [(:spki-hex v2) (:spki-hex v3) (:spki-hex v4) (:spki-hex v5)])

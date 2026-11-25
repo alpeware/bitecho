@@ -5,7 +5,8 @@
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.crypto :as crypto]
             [bitecho.fressian :as fressian]
-            [clojure.set :as set]))
+            [clojure.set :as set]
+            [clojure.string :as str]))
 
 (defrecord ^{:doc "Streamlet consensus block record."} Block [epoch parent-hash payload proposer signature])
 
@@ -605,12 +606,49 @@
         (when (seq validator-hexes) (count validator-hexes))
         1)))
 
+(def spki-ed25519-prefix
+  "ASN.1 DER SubjectPublicKeyInfo hex prefix for Ed25519 public keys (12 bytes = 24 hex chars)."
+  "302a300506032b6570032100")
+
+(defn normalize-validator-hex
+  "Normalizes a validator public key hex string for canonical committee matching (BIP-026 §1.2 P2.1, B4):
+   - 64-char raw Ed25519 hex -> lowercase 88-char SPKI hex (`302a300506032b6570032100` + raw)
+   - 88-char SPKI Ed25519 hex -> lowercase 88-char SPKI hex
+   - Other non-Ed25519 synthetic test identifiers -> string form unchanged."
+  [pk]
+  (when (some? pk)
+    (let [s (if (keyword? pk) (name pk) (str pk))
+          low (str/lower-case s)]
+      (cond
+        (and (= 64 (count low)) (re-matches #"[0-9a-f]{64}" low))
+        (str spki-ed25519-prefix low)
+
+        (and (= 88 (count low)) (re-matches #"[0-9a-f]{88}" low))
+        low
+
+        :else s))))
+
+(defn same-validator-key?
+  "Returns true iff `a` and `b` denote the same validator public key under canonical 64/88-hex normalization."
+  [a b]
+  (and (some? a) (some? b)
+       (= (normalize-validator-hex a) (normalize-validator-hex b))))
+
 (defn resolve-peer-pubkey-bytes
-  "Resolves the peer's public key byte array strictly from :peers-map in state.
+  "Resolves the peer's public key byte array strictly from :peers-map in state,
+   reconciling 64-char raw hex and 88-char SPKI hex aliases (BIP-026 §1.2 P2.1, B4).
    Returns nil if peer-hex is not present in :peers-map."
   [state peer-hex]
-  (when (and (map? (:peers-map state)) (contains? (:peers-map state) peer-hex))
-    (let [entry (get-in state [:peers-map peer-hex])]
+  (when (and (map? (:peers-map state)) (string? peer-hex))
+    (let [pm (:peers-map state)
+          norm (normalize-validator-hex peer-hex)
+          raw-64 (when (and (string? norm) (= 88 (count norm)) (str/starts-with? norm spki-ed25519-prefix))
+                   (subs norm 24))
+          entry (cond
+                  (contains? pm peer-hex) (get pm peer-hex)
+                  (and norm (contains? pm norm)) (get pm norm)
+                  (and raw-64 (contains? pm raw-64)) (get pm raw-64)
+                  :else nil)]
       (cond
         (bytes? entry) entry
         (string? entry) (try (hex->bytes entry) (catch #?(:clj Exception :cljs :default) _ nil))
@@ -628,10 +666,10 @@
         (get validator-set-history (apply max eligible))))))
 
 (defn resolve-active-validators
-  "BIP-024 §2.5 Anti-Downgrade Rule (F2): Static `:config :validators` fallback is permitted
-   strictly iff `last-finalized-epoch == 0`. Once `last-finalized-epoch >= 1`, nodes with
-   `:strict-validator-history? true` MUST reject static fallback with
-   `{:ok? false :error :static-validator-fallback-forbidden}` + counted `:diagnose`."
+  "BIP-024 §2.5 Anti-Downgrade Rule (F2) + BIP-026 §1.2 P2.1 (B4):
+   Resolves the active committee for `target-epoch` from `:validator-set-history` with canonical
+   64/88-hex normalization. Static `:config :validators` fallback is permitted strictly iff
+   `last-finalized-epoch == 0` (or `:strict-validator-history?` is false)."
   ([state]
    (resolve-active-validators state (or (:epoch state) (:last-finalized-epoch state) (:last-executed-finalized-epoch state) 0)))
   ([state target-epoch]
@@ -642,11 +680,12 @@
                      (boolean (get-in state [:config :strict-validator-history?])))]
      (cond
        entry
-       {:ok? true
-        :from-history? true
-        :validators (vec (sort (:committee entry)))
-        :quorum-threshold (or (:quorum-threshold entry)
-                              (quorum-threshold (count (:committee entry))))}
+       (let [norm-comm (vec (sort (distinct (keep normalize-validator-hex (:committee entry)))))]
+         {:ok? true
+          :from-history? true
+          :validators norm-comm
+          :quorum-threshold (or (:quorum-threshold entry)
+                                (quorum-threshold (count norm-comm)))})
 
        (and strict? (>= last-fin 1))
        {:ok? false
@@ -656,7 +695,7 @@
                    :last-finalized-epoch last-fin}]}
 
        :else
-       (let [vhex (extract-validator-hexes state)]
+       (let [vhex (vec (sort (distinct (keep normalize-validator-hex (extract-validator-hexes state)))))]
          {:ok? true
           :from-history? false
           :validators vhex
@@ -668,7 +707,7 @@
    - :peers-map must be non-empty
    - epoch must be a positive integer
    - proposer must be a string, in :peers-map, and in the Streamlet BFT committee active at `(:epoch block)`
-     (enforcing `resolve-active-validators` anti-downgrade guard, F2)
+     (enforcing `resolve-active-validators` anti-downgrade guard, F2, and 64/88-hex canonicalization, B4)
    - proposer must match expected round-robin leader for epoch
    - if :sender is present on event, must equal (:proposer block)
    - proposer signature must be valid Ed25519 signature verified by proposer's pubkey bytes"
@@ -685,6 +724,7 @@
                              (count validator-hexes)
                              (total-node-count state validator-hexes))
                proposer (:proposer block)
+               norm-proposer (when (string? proposer) (normalize-validator-hex proposer))
                sender (:sender event)
                sender-hex (cond
                             (string? sender) sender
@@ -695,13 +735,13 @@
                       (integer? epoch)
                       (pos? epoch)
                       (string? proposer)
-                      (contains? validator-set proposer)
+                      (contains? validator-set norm-proposer)
                       (pos? total-nodes)
-                      (or (nil? sender) (= sender-hex proposer)))
+                      (or (nil? sender) (same-validator-key? sender-hex proposer)))
              (let [expected-leader (nth validator-hexes (mod epoch total-nodes))
                    proposer-pk (resolve-peer-pubkey-bytes state proposer)]
                (and expected-leader
-                    (= proposer expected-leader)
+                    (same-validator-key? proposer expected-leader)
                     proposer-pk
                     (verify-block-signature block proposer-pk))))))))))
 
@@ -781,14 +821,12 @@
 
 (defn extract-notarized-ancestors
   "Extracts a vector of up to max-depth notarized ancestor blocks walking back from parent-hash in state.
-   Bundles each notarized ancestor as {:block block :votes vote-proofs} with verified quorum vote proofs.
+   Bundles each notarized ancestor as {:block block :votes vote-proofs} with verified quorum vote proofs
+   using epoch-indexed active committee resolution (BIP-026 §1.2 P2.1, B4).
    Guards against cycles using a visited set."
   [state parent-hash max-depth]
   (let [blocks (get state :blocks {})
-        notarized (get state :notarized-blocks #{})
-        validator-hexes (extract-validator-hexes state)
-        total-nodes (total-node-count state validator-hexes)
-        threshold (quorum-threshold total-nodes)]
+        notarized (get state :notarized-blocks #{})]
     (loop [curr-hash parent-hash
            depth 0
            visited #{parent-hash}
@@ -799,6 +837,11 @@
         acc
         (if-let [block (get blocks curr-hash)]
           (let [p-hash (:parent-hash block)
+                active-res (resolve-active-validators state (or (:epoch block) (:epoch state) 0))
+                threshold (if (:ok? active-res)
+                            (:quorum-threshold active-res)
+                            (let [vhex (extract-validator-hexes state)]
+                              (quorum-threshold (total-node-count state vhex))))
                 vote-proofs (get-in state [:block-vote-proofs curr-hash] {})
                 bundled-entry (when (>= (count vote-proofs) threshold)
                                 {:block block :votes vote-proofs})
@@ -836,7 +879,7 @@
               (into {}
                     (filter (fn [[voter-hex vote]]
                               (when (and (string? voter-hex)
-                                         (contains? validator-set voter-hex)
+                                         (contains? validator-set (normalize-validator-hex voter-hex))
                                          (map? vote)
                                          (= (:block-hash vote) b-hash))
                                 (when-let [voter-pk (resolve-peer-pubkey-bytes state voter-hex)]
@@ -1024,13 +1067,16 @@
           state (-> state
                     (advance-epoch new-epoch (:now-ms event))
                     update-head-hash)
-          validator-hexes (extract-validator-hexes state)]
+          active-res (resolve-active-validators state new-epoch)
+          validator-hexes (if (:ok? active-res) (:validators active-res) [])]
       (if (empty? validator-hexes)
-        {:state (prune-streamlet-state state) :commands []}
-        (let [total-nodes (total-node-count state validator-hexes)
+        {:state (prune-streamlet-state state) :commands (vec (or (:effects active-res) []))}
+        (let [total-nodes (if (:from-history? active-res)
+                            (count validator-hexes)
+                            (total-node-count state validator-hexes))
               proposer-idx (mod new-epoch total-nodes)
               proposer-hex (nth validator-hexes proposer-idx)
-              is-proposer? (= proposer-hex (:node-pubkey state))]
+              is-proposer? (same-validator-key? proposer-hex (:node-pubkey state))]
           (if is-proposer?
             (let [block (propose-block state new-epoch)
                   b-hash (hash-block block)
@@ -1078,38 +1124,45 @@
 
 (defn- valid-quorum-ancestor-epoch
   "Returns the maximum epoch of any quorum-certified ancestor entry in `ancestors` (verified
-   against the committee validator set), or nil if none has a valid quorum certificate."
+   against the epoch-indexed active committee validator set), or nil if none has a valid quorum certificate."
   [state ancestors]
   (when (seq ancestors)
-    (let [validator-hexes (extract-validator-hexes state)
-          validator-set (set validator-hexes)
-          total-nodes (total-node-count state validator-hexes)
-          q (quorum-threshold total-nodes)]
-      (reduce (fn [best entry]
-                (let [b (:block entry)
-                      votes (or (:votes entry) [])
-                      ep (when (and (map? b) (integer? (:epoch b))) (long (:epoch b)))]
-                  (if (and ep (pos? ep) (>= (count votes) q))
-                    (let [b-hash (hash-block b)
-                          valid-voters
-                          (reduce (fn [acc v]
-                                    (let [vhex (or (:voter-pubkey v) (:voter v))]
-                                      (if (and (string? vhex)
-                                               (contains? validator-set vhex)
-                                               (= b-hash (:block-hash v))
-                                               (= ep (:epoch v))
-                                               (valid-hex-string? (:voter-signature v))
-                                               (verify-vote-signature v (hex->bytes vhex)))
-                                        (conj acc vhex)
-                                        acc)))
-                                  #{}
-                                  votes)]
-                      (if (>= (count valid-voters) q)
-                        (max (or best 0) ep)
-                        best))
-                    best)))
-              nil
-              ancestors))))
+    (reduce (fn [best entry]
+              (let [b (:block entry)
+                    votes (or (:votes entry) [])
+                    ep (when (and (map? b) (integer? (:epoch b))) (long (:epoch b)))
+                    active-res (when ep (resolve-active-validators state ep))
+                    validator-hexes (if (:ok? active-res) (:validators active-res) [])
+                    validator-set (set validator-hexes)
+                    total-nodes (if (:from-history? active-res)
+                                  (count validator-hexes)
+                                  (total-node-count state validator-hexes))
+                    q (if (:ok? active-res)
+                        (:quorum-threshold active-res)
+                        (quorum-threshold total-nodes))]
+                (if (and ep (pos? ep) (seq validator-hexes) (>= (count votes) q))
+                  (let [b-hash (hash-block b)
+                        valid-voters
+                        (reduce (fn [acc v]
+                                  (let [vhex (or (:voter-pubkey v) (:voter v))
+                                        norm-vhex (normalize-validator-hex vhex)]
+                                    (if (and (string? vhex)
+                                             (contains? validator-set norm-vhex)
+                                             (= b-hash (:block-hash v))
+                                             (= ep (:epoch v))
+                                             (valid-hex-string? (:voter-signature v))
+                                             (verify-vote-signature v (or (resolve-peer-pubkey-bytes state vhex)
+                                                                          (hex->bytes vhex))))
+                                      (conj acc norm-vhex)
+                                      acc)))
+                                #{}
+                                votes)]
+                    (if (>= (count valid-voters) q)
+                      (max (or best 0) ep)
+                      best))
+                  best)))
+            nil
+            ancestors)))
 
 (defn- record-out-of-horizon-witness
   "Pure F-EPOCH-1 helper: records a verified committee sender's out-of-horizon epoch witness and
@@ -1117,16 +1170,20 @@
    Uses the `(f+1)`-th highest witnessed epoch so a single Byzantine peer cannot pull `:epoch`
    ahead of honest validators."
   [state sender-hex observed-epoch curr-epoch max-delta reason-on-drop ancestors now-ms]
-  (let [validator-hexes (extract-validator-hexes state)
-        total-nodes (total-node-count state validator-hexes)
+  (let [active-res (resolve-active-validators state curr-epoch)
+        validator-hexes (if (:ok? active-res) (:validators active-res) [])
+        total-nodes (if (:from-history? active-res)
+                      (count validator-hexes)
+                      (total-node-count state validator-hexes))
         threshold (catchup-corroboration-threshold total-nodes)
         horizon (+ (long curr-epoch) (long max-delta))
         qc-epoch (valid-quorum-ancestor-epoch state ancestors)
         prev-witnesses (or (:epoch-catchup-witnesses state) {})
         validator-set (set validator-hexes)
-        witnesses (if (and sender-hex (contains? validator-set sender-hex))
-                    (assoc prev-witnesses sender-hex (max (long observed-epoch)
-                                                          (long (get prev-witnesses sender-hex 0))))
+        norm-sender (normalize-validator-hex sender-hex)
+        witnesses (if (and norm-sender (contains? validator-set norm-sender))
+                    (assoc prev-witnesses norm-sender (max (long observed-epoch)
+                                                           (long (get prev-witnesses norm-sender 0))))
                     prev-witnesses)
         above-horizon (into {} (filter (fn [[_ ep]] (> (long ep) horizon)) witnesses))
         quorum-epoch (cond
@@ -1184,10 +1241,13 @@
         parent-hash (:parent-hash block)
         known-parent? (or (= parent-hash "genesis") (contains? (:blocks state) parent-hash))]
     (if known-parent?
-      (let [validator-hexes (extract-validator-hexes state)
+      (let [active-res (resolve-active-validators state (:epoch block))
+            validator-hexes (if (:ok? active-res) (:validators active-res) [])
             validator-set (set validator-hexes)
-            total-nodes (total-node-count state validator-hexes)
-            eligible-voter? (contains? validator-set (:node-pubkey state))
+            total-nodes (if (:from-history? active-res)
+                          (count validator-hexes)
+                          (total-node-count state validator-hexes))
+            eligible-voter? (contains? validator-set (normalize-validator-hex (:node-pubkey state)))
             vote (when eligible-voter? (cast-vote state block))
             local-pk (extract-local-pubkey-bytes state)
             state (if vote
@@ -1261,15 +1321,17 @@
   (let [vote (:vote event)
         sender-pk (extract-sender-pubkey-bytes state event)
         sender-hex (when sender-pk (bytes->hex sender-pk))
-        validator-hexes (extract-validator-hexes state)
-        validator-set (set validator-hexes)
         b-hash (when (map? vote) (:block-hash vote))
         sig (when (map? vote) (:voter-signature vote))
         epoch (when (map? vote) (:epoch vote))
         curr-epoch (or (:epoch state) 0)
+        active-res (resolve-active-validators state (or epoch curr-epoch))
+        validator-hexes (if (:ok? active-res) (:validators active-res) [])
+        validator-set (set validator-hexes)
+        norm-sender (normalize-validator-hex sender-hex)
         max-delta (or (:max-epoch-catchup-delta state) max-epoch-catchup-delta)]
     (if (or (nil? sender-pk)
-            (not (contains? validator-set sender-hex))
+            (not (contains? validator-set norm-sender))
             (not (string? b-hash))
             (not (valid-hex-string? sig))
             (not (integer? epoch))

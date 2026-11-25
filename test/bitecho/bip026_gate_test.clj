@@ -7,9 +7,12 @@
    2. Fails RED on pre-fix c6b558c for the exact documented reason.
    3. Flips GREEN only when BIP-026 Draft 2 (CID c72d4614...) normative fix lands."
   (:require [bitecho.basalt.core :as basalt]
+            [bitecho.circles.mc-harness :as mc-harness]
             [bitecho.circles.vault :as vault]
+            [bitecho.config :as config]
             [bitecho.core.circle :as circle]
             [bitecho.core.data :as data]
+            [bitecho.core.mesh :as core-mesh]
             [bitecho.core.subnet :as subnet]
             [bitecho.crypto :as crypto]
             [bitecho.economy.escrow :as escrow]
@@ -635,3 +638,560 @@
                        (not (contains? (:storage-accounting enc-ok) :payer-pubkey))
                        (:ok? v-enc-ok)
                        (false? (:ok? v-enc-bad))))))
+
+;; =============================================================================
+;; SCEN-B12: mc_harness.cljc Lead >= 3 Floor & Compound Drawdown 1 - (1 - lambda)^C
+;; =============================================================================
+
+(deftest scen-b12-mc-harness-lead-floor-and-compound-drawdown
+  (let [base-cfg {:bootstrap-drawdown-lambda 0.01
+                  :validator-activation-lead-epochs 6}]
+    (testing "Baseline sanity: at compression-factor C = 1, lambda = 0.01 and lead = 6"
+      (let [s1 (mc-harness/scale-lifecycle-config base-cfg 1)]
+        (is (< (Math/abs (- 0.01 (double (:bootstrap-drawdown-lambda s1)))) 1.0e-12))
+        (is (= 6 (:validator-activation-lead-epochs s1)))))
+
+    (testing "B12: at C = 120, compound drawdown is 1 - (1 - 0.01)^120 < 1.0 and lead >= 3"
+      (let [s120 (mc-harness/scale-lifecycle-config base-cfg 120)
+            expected-lambda (- 1.0 (Math/pow (- 1.0 0.01) 120))
+            actual-lambda (double (:bootstrap-drawdown-lambda s120))
+            actual-lead (long (:validator-activation-lead-epochs s120))]
+        (is (> actual-lambda 0.0))
+        (is (< actual-lambda 1.0)
+            "Compressed drawdown lambda MUST remain strictly < 1.0 (no 100%+ wipeout)")
+        (is (< (Math/abs (- expected-lambda actual-lambda)) 1.0e-12)
+            "Compressed drawdown lambda MUST equal exact compound 1 - (1 - lambda)^C")
+        (is (>= actual-lead 3)
+            "Compressed :validator-activation-lead-epochs MUST be clamped >= 3")))))
+
+;; =============================================================================
+;; SCEN-B6: SLA-Vesting Oracle Attestation Hardening (P4.1 / B6)
+;; =============================================================================
+
+(defn- make-sla-attestation
+  [oracle-kp {:keys [network-uri network-genesis-cid vault-id vault-seq epoch metric-id score-bps]}]
+  (let [tuple ["bitecho-sla-attestation-v1"
+               (str network-uri)
+               (str network-genesis-cid)
+               (str vault-id)
+               (long vault-seq)
+               (long epoch)
+               (str (or metric-id "sla-uptime"))
+               (long score-bps)]
+        sig-hex (basalt/bytes->hex (crypto/sign (:private oracle-kp) (fressian/encode-canonical tuple)))]
+    {:vault-id vault-id
+     :vault-seq (long vault-seq)
+     :epoch (long epoch)
+     :metric-id (str (or metric-id "sla-uptime"))
+     :score-bps (long score-bps)
+     :signature sig-hex}))
+
+(deftest scen-b6-sla-vesting-oracle-attestation-hardening
+  (let [o1 (gen-kp)
+        o2 (gen-kp)
+        twin (gen-kp)
+        recv (gen-kp)
+        o1-raw (subs (:spki o1) 24)
+        net-uri "devnet.bitecho.org"
+        gen-cid "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ;; SLA-vesting puzzle: requires 2 distinct verified oracle attestations in (:oracle-attestations env)
+        ;; matching [o1, o2] with score-bps >= 9500, releasing 1000 and relocking 9000.
+        sla-puzzle-src (str "(fn [env sol]"
+                            "  (let [atts (or (:oracle-attestations env) {})"
+                            "        allowed #{" (pr-str (:spki o1)) " " (pr-str (:spki o2)) "}"
+                            "        valid-oracles (filter (fn [pk]"
+                            "                                (let [att (get atts pk)]"
+                            "                                  (and (contains? allowed pk)"
+                            "                                       (map? att)"
+                            "                                       (:verified? att)"
+                            "                                       (>= (:score-bps att) 9500))))"
+                            "                              (keys atts))]"
+                            "    (if (>= (count valid-oracles) 2)"
+                            "      [{:type :release :receiver " (pr-str (:spki recv)) " :amount 1000}"
+                            "       {:type :relock :amount 9000 :next-puzzle-hash (or (:forced-relock-ph sol) (:puzzle-hash env))}]"
+                            "      false)))")
+        ph (puzzle/puzzle-cid sla-puzzle-src)
+        s0 (vault/init-vaults-state
+            {:network-uri net-uri
+             :network-genesis-cid gen-cid
+             :genesis-custody-supply 10000
+             :advisory-twin-pubkeys #{(:spki twin)}
+             :max-attestation-lag 5
+             :vaults {"v-sla" {:vault-id "v-sla"
+                               :entity-uri "root/sla"
+                               :custody-bucket nil
+                               :puzzle-hash ph
+                               :balance 10000
+                               :vault-seq 1
+                               :created-epoch 0
+                               :status :active}}})
+        att-o1 (make-sla-attestation o1 {:network-uri net-uri :network-genesis-cid gen-cid
+                                         :vault-id "v-sla" :vault-seq 1 :epoch 50 :score-bps 9900})
+        att-o2 (make-sla-attestation o2 {:network-uri net-uri :network-genesis-cid gen-cid
+                                         :vault-id "v-sla" :vault-seq 1 :epoch 50 :score-bps 9800})
+        att-twin (make-sla-attestation twin {:network-uri net-uri :network-genesis-cid gen-cid
+                                             :vault-id "v-sla" :vault-seq 1 :epoch 50 :score-bps 9900})]
+    (testing "Baseline sanity: 7-bucket conservation holds before trigger"
+      (is (:ok? (vault/verify-7-bucket-conservation s0))))
+
+    (testing "B6-a: Advisory twin pubkey in :oracle-attestations MUST fail closed with :advisory-twin-signing-forbidden"
+      (let [res (vault/spend-vault s0 {:vault-id "v-sla"
+                                       :vault-seq 1
+                                       :puzzle-source sla-puzzle-src
+                                       :solution {:oracle-attestations {(:spki o1) att-o1
+                                                                        (:spki twin) att-twin}}
+                                       :epoch 50})]
+        (is (not (:ok? res)))
+        (is (= :advisory-twin-signing-forbidden (:error res)))))
+
+    (testing "B6-b: 64-hex / 88-hex key aliasing for same oracle collapses to 1 canonical entry (cannot satisfy 2-of-2)"
+      (let [res (vault/spend-vault s0 {:vault-id "v-sla"
+                                       :vault-seq 1
+                                       :puzzle-source sla-puzzle-src
+                                       :solution {:oracle-attestations {(:spki o1) att-o1
+                                                                        o1-raw att-o1}}
+                                       :epoch 50})]
+        (is (not (:ok? res)) "Aliased 64-hex + 88-hex same oracle must not satisfy 2-of-2 quorum")))
+
+    (testing "B6-c: Stale epoch, mismatched :vault-seq, and score-bps > 10000 MUST fail closed"
+      (let [att-stale (make-sla-attestation o2 {:network-uri net-uri :network-genesis-cid gen-cid
+                                                :vault-id "v-sla" :vault-seq 1 :epoch 10 :score-bps 9800})
+            att-bad-seq (make-sla-attestation o2 {:network-uri net-uri :network-genesis-cid gen-cid
+                                                  :vault-id "v-sla" :vault-seq 2 :epoch 50 :score-bps 9800})
+            att-bad-bps (make-sla-attestation o2 {:network-uri net-uri :network-genesis-cid gen-cid
+                                                  :vault-id "v-sla" :vault-seq 1 :epoch 50 :score-bps 10001})
+            r-stale (vault/spend-vault s0 {:vault-id "v-sla" :vault-seq 1 :puzzle-source sla-puzzle-src
+                                           :solution {:oracle-attestations {(:spki o1) att-o1 (:spki o2) att-stale}}
+                                           :epoch 50})
+            r-seq (vault/spend-vault s0 {:vault-id "v-sla" :vault-seq 1 :puzzle-source sla-puzzle-src
+                                         :solution {:oracle-attestations {(:spki o1) att-o1 (:spki o2) att-bad-seq}}
+                                         :epoch 50})
+            r-bps (vault/spend-vault s0 {:vault-id "v-sla" :vault-seq 1 :puzzle-source sla-puzzle-src
+                                         :solution {:oracle-attestations {(:spki o1) att-o1 (:spki o2) att-bad-bps}}
+                                         :epoch 50})]
+        (is (not (:ok? r-stale)) "Stale oracle attestation must fail closed")
+        (is (not (:ok? r-seq)) "Mismatched :vault-seq attestation must fail closed")
+        (is (not (:ok? r-bps)) "score-bps > 10000 must fail closed")))
+
+    (testing "B6-d: Mismatched relock :next-puzzle-hash vs solution next-ph MUST fail closed with :relock-puzzle-hash-mismatch"
+      (let [hijacked-ph "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            res (vault/spend-vault s0 {:vault-id "v-sla"
+                                       :vault-seq 1
+                                       :puzzle-source sla-puzzle-src
+                                       :solution {:oracle-attestations {(:spki o1) att-o1
+                                                                        (:spki o2) att-o2}
+                                                  :next-puzzle-hash ph
+                                                  :forced-relock-ph hijacked-ph}
+                                       :epoch 50})]
+        (is (not (:ok? res)))
+        (is (= :relock-puzzle-hash-mismatch (:error res)))))
+
+    (testing "Control: Fresh canonical non-twin 2-of-2 attestations with matching next-ph unlock tranche"
+      (let [res (vault/spend-vault s0 {:vault-id "v-sla"
+                                       :vault-seq 1
+                                       :puzzle-source sla-puzzle-src
+                                       :solution {:oracle-attestations {(:spki o1) att-o1
+                                                                        (:spki o2) att-o2}
+                                                  :next-puzzle-hash ph}
+                                       :epoch 50})]
+        (is (:ok? res) "Valid 2-of-2 SLA oracle attestations must unlock tranche")
+        (is (= 9000 (get-in (:state res) [:vaults "v-sla" :balance])))
+        (is (= 2 (get-in (:state res) [:vaults "v-sla" :vault-seq])))
+        (is (:ok? (vault/verify-7-bucket-conservation (:state res))))))))
+
+;; =============================================================================
+;; SCEN-B4: Streamlet Validator-Rotation Deadlock, lead >= 3, & Light-Node Trust
+;; =============================================================================
+
+(defn- build-cluster-node
+  "Builds a deterministic consensus-mode validator node map for VOPR testing."
+  [kp-entry all-kps validators-vec root-ms net-uri gen-cid]
+  (let [my-pub (:wire-pub kp-entry)
+        peers-map (into {} (map (fn [k] [(:wire-pub k) (:public k)]) all-kps))
+        cfg (merge config/default-config
+                   {:network-uri net-uri
+                    :network-genesis-cid gen-cid
+                    :root-owner-multisig root-ms
+                    :validator-activation-lead-epochs 3
+                    :validators (vec validators-vec)
+                    :peers-map peers-map
+                    :keypair {:public (:public kp-entry) :private (:private kp-entry)}
+                    :economy-enabled? false
+                    :min-proposal-dwell-ms 0
+                    :require-signed-control-frames false
+                    :basalt-max-view-size 10})]
+    (-> (sm/init-state (mapv (fn [k] {:pubkey (:wire-pub k)}) all-kps) my-pub cfg)
+        (assoc :validators (vec validators-vec)
+               :peers-map peers-map
+               :node-pubkey my-pub
+               :node-private-key (:private kp-entry)
+               :keypair {:public (:public kp-entry) :private (:private kp-entry)}
+               :root-owner-multisig root-ms
+               :network-uri net-uri
+               :network-genesis-cid gen-cid))))
+
+(defn- step-cluster-epoch
+  "Runs one deterministic Streamlet epoch tick + message delivery round across `nodes-map`
+   (keyed by `:wire-pub`). Delivers all `:send-propose` and `:send-vote` commands synchronously."
+  [nodes-map]
+  (let [tick-results (into {}
+                           (map (fn [[pk st]]
+                                  [pk (sm/handle-event st {:type :tick})]))
+                           nodes-map)
+        after-tick (into {} (map (fn [[pk r]] [pk (:state r)]) tick-results))
+        init-msgs (vec (for [[sender-pk r] tick-results
+                             cmd (:commands r)
+                             :when (#{:send-propose :send-vote} (:type cmd))
+                             target (:targets cmd)]
+                         {:from sender-pk :to target :cmd cmd}))]
+    (loop [st-map after-tick
+           queue init-msgs
+           rounds 0]
+      (if (or (empty? queue) (>= rounds 16))
+        st-map
+        (let [[next-map next-q]
+              (reduce (fn [[acc q] {:keys [from to cmd]}]
+                        (if-let [target-st (get acc to)]
+                          (let [ev (case (:type cmd)
+                                     :send-propose {:type :receive-propose
+                                                    :sender from
+                                                    :block (:block cmd)
+                                                    :ancestors (:ancestors cmd)}
+                                     :send-vote {:type :receive-vote
+                                                 :sender from
+                                                 :vote (:vote cmd)})
+                                res (sm/handle-event target-st ev)
+                                emitted (for [c (:commands res)
+                                              :when (#{:send-propose :send-vote} (:type c))
+                                              t (:targets c)]
+                                          {:from to :to t :cmd c})]
+                            [(assoc acc to (:state res)) (into q emitted)])
+                          [acc q]))
+                      [st-map []]
+                      queue)]
+          (recur next-map next-q (inc rounds)))))))
+
+(deftest scen-b4-validator-rotation-lead-floor-and-light-node-trust
+  (let [root-kp (gen-kp)
+        root-ms {:threshold 1 :pubkeys [(:spki root-kp)]}
+        net-uri "devnet.bitecho.org"
+        gen-cid "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ;; 10 validator keypairs: V0 uses canonical SPKI hex so baseline sanity passes on pre-fix code,
+        ;; while rotated V1 mixes 64-char raw hex and 88-char SPKI hex keys
+        raw-kps (vec (repeatedly 10 gen-kp))
+        kps (mapv (fn [idx kp]
+                    (assoc kp :wire-pub (:spki kp)
+                           :mixed-pub (if (even? idx) (subs (:spki kp) 24) (:spki kp))))
+                  (range 10)
+                  raw-kps)
+        v0-kps (subvec kps 0 6)
+        v1-kps (vec (concat (subvec kps 0 2) (subvec kps 6 10)))
+        v0-pubs (mapv :wire-pub v0-kps)
+        v1-pubs (mapv :wire-pub v1-kps)
+        consent-cid "2222222222222222222222222222222222222222222222222222222222222222"
+        disc-fields {:retention-policy {:max-entries 128 :max-bytes 1048576 :rotate-every-entries 32 :ttl-epochs 52560}
+                     :storage-accounting {:bytes-at-rest 2048 :cache-incentive :free-self-hosted :payer-pubkey (:spki root-kp) :fee-ech 0}}
+        base-cluster (into {}
+                           (map (fn [kp]
+                                  [(:wire-pub kp) (build-cluster-node kp kps v0-pubs root-ms net-uri gen-cid)]))
+                           kps)
+        ;; Advance 10 epochs so V0 finalizes blocks cleanly
+        warmed-cluster (nth (iterate step-cluster-epoch base-cluster) 10)
+        v0-fin-ep (long (or (:last-executed-finalized-epoch (get warmed-cluster (first v0-pubs))) 0))
+        agent-kp (gen-kp)
+        bs-v0 {:network-uri net-uri
+               :nodes (into {}
+                            (map-indexed (fn [i kp]
+                                           [(keyword (str "v" i)) {:pubkey (:wire-pub kp)}])
+                                         v0-kps))}
+        l0 (light-core/init-light-state (:spki agent-kp) {:bootstrap bs-v0})]
+
+    (testing "Baseline sanity: V0 finalizes blocks cleanly and L0 verifies V0-signed snapshot"
+      (is (>= v0-fin-ep 5) "V0 6-node cluster must finalize blocks cleanly before rotation")
+      (let [v0-st (get warmed-cluster (first v0-pubs))
+            snap (core-mesh/build-validator-chain-state-snapshot v0-st nil (:spki agent-kp) "n0")
+            v-res (light-core/verify-chain-state-snapshot snap {:expected-pubkey (:spki agent-kp)
+                                                                :expected-nonce "n0"
+                                                                :trusted-validators (set v0-pubs)})]
+        (is (:ok? v-res) "L0 must verify V0-signed snapshot before rotation")))
+
+    (testing "B4-b: Normal rotation with lead = 2 MUST fail closed with :validator-rotation-lead-too-short; fast equivocation ejection at ep-fin + 1 MUST succeed"
+      (let [desc-short (circle/create-validator-set-descriptor
+                        (merge disc-fields
+                               {:network-uri net-uri
+                                :network-genesis-cid gen-cid
+                                :version 2
+                                :not-before-epoch 100
+                                :epoch-finalized 100
+                                :epoch-effective 102
+                                :quorum-threshold 4
+                                :consent-round-cid consent-cid
+                                :committee (mapv :spki v1-kps)})
+                        [{:pubkey (:spki root-kp) :privkey (:private root-kp)}])
+            v-short (circle/verify-validator-set-descriptor
+                     desc-short
+                     {:root-owner-multisig root-ms
+                      :network-uri net-uri
+                      :network-genesis-cid gen-cid
+                      :lead-epochs 2})
+            ;; Equivocation proof for v0[5]
+            bad-v (nth v0-kps 5)
+            m1 (fressian/encode-canonical [:vote 100 "hash-a"])
+            m2 (fressian/encode-canonical [:vote 100 "hash-b"])
+            equiv-proof {:validator-pubkey (:spki bad-v)
+                         :epoch 100
+                         :message-1 m1
+                         :sig-1 (basalt/bytes->hex (crypto/sign (:private bad-v) m1))
+                         :message-2 m2
+                         :sig-2 (basalt/bytes->hex (crypto/sign (:private bad-v) m2))}
+            desc-equiv (circle/create-validator-set-descriptor
+                        (merge disc-fields
+                               {:network-uri net-uri
+                                :network-genesis-cid gen-cid
+                                :version 2
+                                :not-before-epoch 100
+                                :epoch-finalized 100
+                                :epoch-effective 101
+                                :quorum-threshold 4
+                                :consent-round-cid consent-cid
+                                :committee (mapv :spki (subvec v0-kps 0 5))
+                                :equivocation-proof equiv-proof})
+                        [{:pubkey (:spki root-kp) :privkey (:private root-kp)}])
+            v-equiv (circle/verify-validator-set-descriptor
+                     desc-equiv
+                     {:root-owner-multisig root-ms
+                      :network-uri net-uri
+                      :network-genesis-cid gen-cid
+                      :lead-epochs 6})]
+        (is (not (:ok? v-short)) "Normal rotation with lead = 2 (< 3) must be rejected")
+        (is (= :validator-rotation-lead-too-short (:error v-short)))
+        (is (:ok? v-equiv) "Fast equivocation ejection at ep-fin + 1 with valid proof must succeed")))
+
+    (testing "B4-a & B4-c: Scheduled 4/6 validator rotation across ep-eff promotes active committee without deadlock and L0 verifies V1 snapshots"
+      (let [cur-ep (long (:epoch (get warmed-cluster (first v0-pubs))))
+            ep-eff (+ cur-ep 3)
+            rot-desc (circle/create-validator-set-descriptor
+                      (merge disc-fields
+                             {:network-uri net-uri
+                              :network-genesis-cid gen-cid
+                              :version 2
+                              :not-before-epoch cur-ep
+                              :epoch-finalized cur-ep
+                              :epoch-effective ep-eff
+                              :quorum-threshold 4
+                              :consent-round-cid consent-cid
+                              :committee (mapv :spki v1-kps)})
+                      [{:pubkey (:spki root-kp) :privkey (:private root-kp)}])
+            rot-rcpt {:type :rotate-validator-set
+                      :receipt-id "rcpt-rot-b4-1"
+                      :descriptor rot-desc
+                      :epoch cur-ep}
+            ;; Stage rotation receipt on all nodes
+            staged-cluster (into {}
+                                 (map (fn [[pk st]]
+                                        [pk (update st :pending-receipts (fnil conj []) rot-rcpt)]))
+                                 warmed-cluster)
+            ;; Run 20 epochs past ep-eff
+            rotated-cluster (nth (iterate step-cluster-epoch staged-cluster) 20)
+            v1-sample (get rotated-cluster (nth v1-pubs 2))
+            v1-fin-ep (long (or (:last-executed-finalized-epoch v1-sample) 0))
+            promoted-diag (long (get-in v1-sample [:diagnostics :validator-set-promoted] 0))]
+        (is (> v1-fin-ep (+ ep-eff 8))
+            (str "Cluster must finalize continuously past ep-eff+8 after 4/6 rotation, got fin-ep=" v1-fin-ep " ep-eff=" ep-eff))
+        (is (pos? promoted-diag)
+            "Promoting rotated validators must emit/count :validator-set-promoted")
+        ;; B4-c: V1-signed snapshots carry :validator-set-history and L0 verifies them via trusted-validators-for-epoch
+        (let [v1-snaps (mapv (fn [pk]
+                               (core-mesh/build-validator-chain-state-snapshot
+                                (get rotated-cluster pk) nil (:spki agent-kp) "n-rot"))
+                             (take 4 v1-pubs))
+              snap0 (first v1-snaps)
+              l0-with-hist (assoc l0 :validator-set-history (:validator-set-history v1-sample))
+              ;; Test handle-wire-chain-state-snapshot across 4 V1 snapshots
+              l0-synced (reduce (fn [st snap]
+                                  (:state (light-core/handle-wire-chain-state-snapshot st snap)))
+                                l0-with-hist
+                                v1-snaps)
+              ;; Also test exec-sync-account via handle-command
+              cmd-res (light-core/handle-command l0-with-hist
+                                                 {"cmd" "sync-account" "snapshots" v1-snaps}
+                                                 (:private agent-kp))]
+          (is (seq (:validator-set-history snap0))
+              "build-validator-chain-state-snapshot must include :validator-set-history")
+          (is (= v1-fin-ep (get-in l0-synced [:account :finalized-epoch]))
+              "handle-wire-chain-state-snapshot must trust rotated V1 committee")
+          (is (true? (get-in cmd-res [:response "ok"]))
+              "exec-sync-account must trust rotated V1 committee"))))))
+
+;; =============================================================================
+;; BIP-026 §4 Generative Properties (test.check defspec) for P2, P4, B12
+;; =============================================================================
+
+(defspec ^{:doc "P2.2 (B12): mc_harness/scale-lifecycle-config clamps :validator-activation-lead-epochs >= 3 and computes exact compound drawdown 1 - (1 - lambda)^C strictly in (0.0, 1.0) for all 0 < lambda < 1, C >= 1."}
+  prop-mc-harness-lead-floor-and-compound-drawdown
+  100
+  (prop/for-all [lambda-bps (gen/choose 1 9999)
+                 lead-base (gen/choose 1 30)
+                 c (gen/choose 1 500)]
+                (let [lam (/ (double lambda-bps) 10000.0)
+                      scaled (mc-harness/scale-lifecycle-config
+                              {:bootstrap-drawdown-lambda lam
+                               :validator-activation-lead-epochs lead-base}
+                              c)
+                      expected (- 1.0 (Math/pow (- 1.0 lam) (double c)))
+                      actual (double (:bootstrap-drawdown-lambda scaled))
+                      actual-lead (long (:validator-activation-lead-epochs scaled))]
+                  (and (>= actual-lead 3)
+                       (> actual 0.0)
+                       (<= actual 1.0)
+                       (< (Math/abs (- expected actual)) 1.0e-12)))))
+
+(defspec ^{:doc "P4.1 (B6): SLA-vesting vault spends enforce advisory-twin rejection, 64/88-hex oracle key deduplication, :vault-seq + epoch freshness + score-bps bounds, relock puzzle-hash binding, and 7-bucket conservation."}
+  prop-sla-vesting-oracle-attestation
+  25
+  (prop/for-all [cur-ep (gen/choose 20 500)
+                 lag (gen/choose 0 5)
+                 stale-extra (gen/choose 6 20)
+                 score1 (gen/choose 9500 10000)
+                 score2 (gen/choose 9500 10000)
+                 tranche (gen/choose 200 2000)]
+                (let [o1 (gen-kp)
+                      o2 (gen-kp)
+                      twin (gen-kp)
+                      recv (gen-kp)
+                      o1-raw (subs (:spki o1) 24)
+                      net-uri "devnet.bitecho.org"
+                      gen-cid "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                      total-bal (+ tranche 5000)
+                      relock-amt (- total-bal tranche)
+                      sla-src (str "(fn [env sol]"
+                                   "  (let [atts (or (:oracle-attestations env) {})"
+                                   "        allowed #{" (pr-str (:spki o1)) " " (pr-str (:spki o2)) "}"
+                                   "        valid (filter (fn [pk]"
+                                   "                        (let [a (get atts pk)]"
+                                   "                          (and (contains? allowed pk)"
+                                   "                               (map? a)"
+                                   "                               (:verified? a)"
+                                   "                               (>= (:score-bps a) 9500))))"
+                                   "                      (keys atts))]"
+                                   "    (if (>= (count valid) 2)"
+                                   "      [{:type :release :receiver " (pr-str (:spki recv)) " :amount " tranche "}"
+                                   "       {:type :relock :amount " relock-amt " :next-puzzle-hash (or (:forced-ph sol) (:puzzle-hash env))}]"
+                                   "      false)))")
+                      ph (puzzle/puzzle-cid sla-src)
+                      s0 (vault/init-vaults-state
+                          {:network-uri net-uri
+                           :network-genesis-cid gen-cid
+                           :genesis-custody-supply total-bal
+                           :advisory-twin-pubkeys #{(:spki twin)}
+                           :max-attestation-lag 5
+                           :vaults {"v-sla-prop" {:vault-id "v-sla-prop"
+                                                  :entity-uri "root/sla-prop"
+                                                  :custody-bucket nil
+                                                  :puzzle-hash ph
+                                                  :balance total-bal
+                                                  :vault-seq 1
+                                                  :created-epoch 0
+                                                  :status :active}}})
+                      att1 (make-sla-attestation o1 {:network-uri net-uri :network-genesis-cid gen-cid
+                                                     :vault-id "v-sla-prop" :vault-seq 1 :epoch (- cur-ep lag) :score-bps score1})
+                      att2 (make-sla-attestation o2 {:network-uri net-uri :network-genesis-cid gen-cid
+                                                     :vault-id "v-sla-prop" :vault-seq 1 :epoch (- cur-ep lag) :score-bps score2})
+                      att-stale (make-sla-attestation o2 {:network-uri net-uri :network-genesis-cid gen-cid
+                                                          :vault-id "v-sla-prop" :vault-seq 1 :epoch (- cur-ep stale-extra) :score-bps score2})
+                      att-twin (make-sla-attestation twin {:network-uri net-uri :network-genesis-cid gen-cid
+                                                           :vault-id "v-sla-prop" :vault-seq 1 :epoch cur-ep :score-bps score2})
+                      r-twin (vault/spend-vault s0 {:vault-id "v-sla-prop" :vault-seq 1 :puzzle-source sla-src
+                                                    :solution {:oracle-attestations {(:spki o1) att1 (:spki twin) att-twin}}
+                                                    :epoch cur-ep})
+                      r-alias (vault/spend-vault s0 {:vault-id "v-sla-prop" :vault-seq 1 :puzzle-source sla-src
+                                                     :solution {:oracle-attestations {(:spki o1) att1 o1-raw att1}}
+                                                     :epoch cur-ep})
+                      r-stale (vault/spend-vault s0 {:vault-id "v-sla-prop" :vault-seq 1 :puzzle-source sla-src
+                                                     :solution {:oracle-attestations {(:spki o1) att1 (:spki o2) att-stale}}
+                                                     :epoch cur-ep})
+                      r-hijack (vault/spend-vault s0 {:vault-id "v-sla-prop" :vault-seq 1 :puzzle-source sla-src
+                                                      :solution {:oracle-attestations {(:spki o1) att1 (:spki o2) att2}
+                                                                 :next-puzzle-hash ph
+                                                                 :forced-ph "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}
+                                                      :epoch cur-ep})
+                      r-ok (vault/spend-vault s0 {:vault-id "v-sla-prop" :vault-seq 1 :puzzle-source sla-src
+                                                  :solution {:oracle-attestations {(:spki o1) att1 (:spki o2) att2}
+                                                             :next-puzzle-hash ph}
+                                                  :epoch cur-ep})]
+                  (and (= :advisory-twin-signing-forbidden (:error r-twin))
+                       (not (:ok? r-alias))
+                       (not (:ok? r-stale))
+                       (= :relock-puzzle-hash-mismatch (:error r-hijack))
+                       (:ok? r-ok)
+                       (= relock-amt (get-in (:state r-ok) [:vaults "v-sla-prop" :balance]))
+                       (:ok? (vault/verify-7-bucket-conservation (:state r-ok)))))))
+
+(defspec ^{:doc "P2.1–P2.3 (B4): Deterministic 6-node Streamlet cluster rotating 4/6 validators across ep-eff (with lead >= 3) promotes active committee without deadlock, finalizes past ep-eff + 12, and light-node verifies rotated snapshots."}
+  vopr-6-node-validator-rotation-no-deadlock
+  3
+  (prop/for-all [lead (gen/elements [3 4 6])]
+                (let [root-kp (gen-kp)
+                      root-ms {:threshold 1 :pubkeys [(:spki root-kp)]}
+                      net-uri "devnet.bitecho.org"
+                      gen-cid "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                      raw-kps (vec (repeatedly 10 gen-kp))
+                      kps (mapv (fn [idx kp]
+                                  (assoc kp :wire-pub (if (even? idx) (subs (:spki kp) 24) (:spki kp))))
+                                (range 10)
+                                raw-kps)
+                      v0-kps (subvec kps 0 6)
+                      v1-kps (vec (concat (subvec kps 0 2) (subvec kps 6 10)))
+                      v0-pubs (mapv :wire-pub v0-kps)
+                      v1-pubs (mapv :wire-pub v1-kps)
+                      consent-cid "3333333333333333333333333333333333333333333333333333333333333333"
+                      disc-fields {:retention-policy {:max-entries 128 :max-bytes 1048576 :rotate-every-entries 32 :ttl-epochs 52560}
+                                   :storage-accounting {:bytes-at-rest 2048 :cache-incentive :free-self-hosted :payer-pubkey (:spki root-kp) :fee-ech 0}}
+                      base-cluster (into {}
+                                         (map (fn [kp]
+                                                [(:wire-pub kp) (build-cluster-node kp kps v0-pubs root-ms net-uri gen-cid)]))
+                                         kps)
+                      warmed (nth (iterate step-cluster-epoch base-cluster) 6)
+                      cur-ep (long (:epoch (get warmed (first v0-pubs))))
+                      ep-eff (+ cur-ep lead)
+                      rot-desc (circle/create-validator-set-descriptor
+                                (merge disc-fields
+                                       {:network-uri net-uri
+                                        :network-genesis-cid gen-cid
+                                        :version 2
+                                        :not-before-epoch cur-ep
+                                        :epoch-finalized cur-ep
+                                        :epoch-effective ep-eff
+                                        :quorum-threshold 4
+                                        :consent-round-cid consent-cid
+                                        :committee (mapv :spki v1-kps)})
+                                [{:pubkey (:spki root-kp) :privkey (:private root-kp)}])
+                      rot-rcpt {:type :rotate-validator-set
+                                :receipt-id (str "rcpt-vopr-rot-" lead)
+                                :descriptor rot-desc
+                                :epoch cur-ep}
+                      staged (into {}
+                                   (map (fn [[pk st]]
+                                          [pk (update st :pending-receipts (fnil conj []) rot-rcpt)]))
+                                   warmed)
+                      ;; Advance enough epochs to clear lead + 12+ finalized epochs
+                      after-rot (nth (iterate step-cluster-epoch staged) (+ lead 18))
+                      v1-node (get after-rot (nth v1-pubs 3))
+                      v1-fin-ep (long (or (:last-executed-finalized-epoch v1-node) 0))
+                      agent-kp (gen-kp)
+                      bs-v0 {:network-uri net-uri
+                             :nodes (into {} (map-indexed (fn [i kp] [(keyword (str "v" i)) {:pubkey (:wire-pub kp)}]) v0-kps))}
+                      l0 (-> (light-core/init-light-state (:spki agent-kp) {:bootstrap bs-v0})
+                             (assoc :validator-set-history (:validator-set-history v1-node)))
+                      v1-snaps (mapv (fn [pk]
+                                       (core-mesh/build-validator-chain-state-snapshot
+                                        (get after-rot pk) nil (:spki agent-kp) "n-vopr"))
+                                     (take 4 v1-pubs))
+                      l0-synced (reduce (fn [st snap]
+                                          (:state (light-core/handle-wire-chain-state-snapshot st snap)))
+                                        l0
+                                        v1-snaps)]
+                  (and (>= v1-fin-ep (+ ep-eff 12))
+                       (pos? (long (get-in v1-node [:diagnostics :validator-set-promoted] 0)))
+                       (seq (:validator-set-history (first v1-snaps)))
+                       (= v1-fin-ep (get-in l0-synced [:account :finalized-epoch]))))))

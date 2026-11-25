@@ -867,19 +867,26 @@
           (crypto/verify-with-fallback pk m1 s1)
           (crypto/verify-with-fallback pk m2 s2)))))
 
+(def min-validator-activation-lead-epochs
+  "Minimum activation lead time in epochs for normal scheduled validator-set rotations
+   to preserve Streamlet 3-chain finality (BIP-026 §1.2 P2.2, B4)."
+  3)
+
 (defn verify-validator-set-descriptor
   "Verifies a `:root/validator-set-descriptor` v2:
    - Network URI & genesis CID match
    - BIP-016 discipline (`:retention-policy` + `:storage-accounting`)
    - Root Association multisig quorum (excluding advisory twins)
-   - Activation lead time (`epoch-effective >= max(not-before-epoch, epoch-finalized + lead)`)
-     OR fast equivocation ejection (`epoch-effective >= epoch-finalized + 1`, remaining >= 4)"
+   - Activation lead time (`(- epoch-effective epoch-finalized) >= (max 3 configured-lead-epochs)`,
+     `epoch-effective >= not-before-epoch`) OR fast equivocation ejection
+     (`epoch-effective >= epoch-finalized + 1`, remaining >= 4) (BIP-026 §1.2 P2.2, B4)."
   [desc ctx]
   (let [root-ms (:root-owner-multisig ctx)
         root-pks (dedup-spki-pubkeys (:pubkeys root-ms))
         root-th (long (or (:threshold root-ms) 1))
         twin-set (or (:advisory-twin-pubkeys ctx) #{})
-        lead (long (or (:lead-epochs ctx) 6))
+        configured-lead (long (or (:lead-epochs ctx) 6))
+        effective-lead (max min-validator-activation-lead-epochs configured-lead)
         comm-pks (dedup-spki-pubkeys (map :pubkey (:committee desc)))
         ep-fin (long (or (:epoch-finalized desc) 0))
         ep-nb (long (or (:not-before-epoch desc) 0))
@@ -888,7 +895,7 @@
                        (verify-equivocation-proof? (:equivocation-proof desc)))
         min-eff (if equiv-ok?
                   (inc ep-fin)
-                  (max ep-nb (+ ep-fin lead)))
+                  (max ep-nb (+ ep-fin effective-lead)))
         tuple (validator-set-signing-tuple desc)
         valid-sigs (count-valid-multisig-signatures (:root-signatures desc) root-pks tuple twin-set)
         disc (mem-const/validate-pointer-discipline (assoc desc :owner-multisig root-ms))]
@@ -913,6 +920,13 @@
 
       (or (empty? comm-pks) (and equiv-ok? (< (count comm-pks) 4)))
       (diag-fail :insufficient-validator-committee-size {:size (count comm-pks)})
+
+      (and (not equiv-ok?) (< (- ep-eff ep-fin) effective-lead))
+      (diag-fail :validator-rotation-lead-too-short
+                 {:epoch-effective ep-eff
+                  :epoch-finalized ep-fin
+                  :lead-epochs effective-lead
+                  :min-lead min-validator-activation-lead-epochs})
 
       (< ep-eff min-eff)
       (diag-fail :validator-activation-lead-violated {:epoch-effective ep-eff :min-effective min-eff})

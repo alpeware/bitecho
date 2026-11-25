@@ -94,6 +94,10 @@
                        'outputs
                        false))))))
 
+(def default-max-attestation-lag-epochs
+  "Default maximum epoch lag allowed for fresh SLA oracle attestations (BIP-026 §1.4 P4.1)."
+  10)
+
 (defn init-vaults-state
   "Initializes pure Sans-IO persistent vaults & 7-bucket conservation state."
   ([] (init-vaults-state {}))
@@ -103,6 +107,8 @@
     :max-vaults             (long (or (:max-vaults opts) default-max-vaults))
     :min-vault-balance-ech  (long (or (:min-vault-balance-ech opts) default-min-vault-balance-ech))
     :settlement-take-bps    (long (or (:settlement-take-bps opts) default-settlement-take-bps))
+    :advisory-twin-pubkeys  (set (or (:advisory-twin-pubkeys opts) #{}))
+    :max-attestation-lag    (long (or (:max-attestation-lag opts) default-max-attestation-lag-epochs))
     :bootstrap-sunset-epoch (long (or (:bootstrap-sunset-epoch opts) default-bootstrap-sunset-epoch))
     :genesis-custody-supply (long (or (:genesis-custody-supply opts) 0))
     :total-minted           (long (or (:total-minted opts) 0))
@@ -344,6 +350,113 @@
                          dac)]))
         (or dacs {})))
 
+(defn sla-attestation-tuple
+  "Returns the domain-separated canonical tuple for an SLA oracle attestation (BIP-026 §1.4 P4.1, B6).
+   Explicitly binds `:network-uri`, `:network-genesis-cid`, `:vault-id`, `:vault-seq`, `:epoch`,
+   optional `:metric-id`, and `:score-bps`."
+  [{:keys [network-uri network-genesis-cid vault-id vault-seq epoch metric-id score-bps]}]
+  (if (some? metric-id)
+    ["bitecho-sla-attestation-v1"
+     (str network-uri)
+     (str network-genesis-cid)
+     (str vault-id)
+     (long (or vault-seq 0))
+     (long (or epoch 0))
+     (str metric-id)
+     (long (or score-bps 0))]
+    ["bitecho-sla-attestation-v1"
+     (str network-uri)
+     (str network-genesis-cid)
+     (str vault-id)
+     (long (or vault-seq 0))
+     (long (or epoch 0))
+     (long (or score-bps 0))]))
+
+(defn sla-attestation-bytes
+  "Returns canonical Fressian bytes for an SLA oracle attestation tuple (BIP-026 §1.4 P4.1, B6)."
+  [params]
+  (fressian/encode-canonical (sla-attestation-tuple params)))
+
+(defn- verify-and-canonicalize-oracle-attestations
+  "Pre-validates and canonicalizes `:oracle-attestations` fail-closed before SCI evaluation (BIP-026 §1.4 P4.1, B6):
+   1. Rejects any oracle pubkey in `:advisory-twin-pubkeys` with `:advisory-twin-signing-forbidden`.
+   2. Canonicalizes oracle pubkeys via `circle/normalize-spki-pubkey` (collapsing 64-hex & 88-hex aliasing).
+   3. Enforces exact `:vault-seq` match, epoch freshness (`cur-ep - max-lag <= att-ep <= cur-ep`),
+      `(<= 0 score-bps 10000)`, and valid Ed25519 signature over `sla-attestation-bytes`."
+  [state v raw-atts cur-ep]
+  (if (empty? raw-atts)
+    {:ok? true :attestations {}}
+    (let [twin-set (or (:advisory-twin-pubkeys state) #{})
+          net-uri (or (:network-uri state) (get-in state [:config :network-uri]) "")
+          gen-cid (or (:network-genesis-cid state) (get-in state [:config :network-genesis-cid]) "")
+          max-lag (long (or (:max-attestation-lag state)
+                            (get-in state [:config :max-attestation-lag])
+                            default-max-attestation-lag-epochs))
+          entries (cond
+                    (map? raw-atts) (seq raw-atts)
+                    (sequential? raw-atts) (map (fn [a] [(:oracle-pubkey a) a]) raw-atts)
+                    :else nil)]
+      (if-not entries
+        {:ok? false :error :invalid-oracle-attestations}
+        (loop [rem-entries entries
+               acc {}]
+          (if (empty? rem-entries)
+            {:ok? true :attestations acc}
+            (let [[raw-pk att] (first rem-entries)
+                  norm-pk (circle/normalize-spki-pubkey (or (when (map? att) (:oracle-pubkey att)) raw-pk))
+                  att-ep (when (map? att) (:epoch att))
+                  att-seq (when (map? att) (:vault-seq att))
+                  score-bps (when (map? att) (:score-bps att))
+                  sig (when (map? att) (:signature att))
+                  att-vid (or (when (map? att) (:vault-id att)) (:vault-id v))]
+              (cond
+                (or (not (map? att)) (nil? norm-pk))
+                {:ok? false :error :invalid-oracle-pubkey :detail {:oracle-pubkey raw-pk}}
+
+                (circle/advisory-twin? twin-set norm-pk)
+                {:ok? false :error :advisory-twin-signing-forbidden :detail {:pubkey norm-pk}}
+
+                (not= (str att-vid) (str (:vault-id v)))
+                {:ok? false :error :oracle-vault-id-mismatch :detail {:expected (:vault-id v) :actual att-vid}}
+
+                (or (not (integer? att-seq)) (not= (long att-seq) (long (:vault-seq v))))
+                {:ok? false :error :oracle-vault-seq-mismatch :detail {:expected (:vault-seq v) :actual att-seq}}
+
+                (or (not (integer? att-ep))
+                    (> (long att-ep) cur-ep)
+                    (> (- cur-ep (long att-ep)) max-lag))
+                {:ok? false :error :stale-oracle-attestation :detail {:epoch att-ep :current-epoch cur-ep :max-lag max-lag}}
+
+                (or (not (integer? score-bps))
+                    (< (long score-bps) 0)
+                    (> (long score-bps) 10000))
+                {:ok? false :error :invalid-oracle-score-bps :detail {:score-bps score-bps}}
+
+                (or (not (string? sig)) (str/blank? sig))
+                {:ok? false :error :invalid-oracle-signature :detail {:oracle-pubkey norm-pk}}
+
+                :else
+                (let [params-with-metric {:network-uri net-uri
+                                          :network-genesis-cid gen-cid
+                                          :vault-id (:vault-id v)
+                                          :vault-seq (long att-seq)
+                                          :epoch (long att-ep)
+                                          :metric-id (:metric-id att)
+                                          :score-bps (long score-bps)}
+                      bytes-primary (sla-attestation-bytes params-with-metric)
+                      sig-ok? (boolean (crypto/verify-with-fallback norm-pk bytes-primary sig))]
+                  (if-not sig-ok?
+                    {:ok? false :error :invalid-oracle-signature :detail {:oracle-pubkey norm-pk}}
+                    (recur (rest rem-entries)
+                           (assoc acc norm-pk
+                                  (assoc att
+                                         :oracle-pubkey norm-pk
+                                         :vault-id (:vault-id v)
+                                         :vault-seq (long att-seq)
+                                         :epoch (long att-ep)
+                                         :score-bps (long score-bps)
+                                         :verified? true)))))))))))))
+
 (defn spend-vault
   "Executes an in-place persistent vault spend against `[:vaults vault-id]`:
    - Matches exact `:vault-seq` and atomically increments `:vault-seq` in place.
@@ -351,12 +464,23 @@
    - Restricts `0-take :allocate` strictly to Root-chartered custody-bucket vaults transferring
      into registered chartered circle vaults preserving `:custody-bucket`.
    - Charges non-waivable `:settlement-take-bps` (`50 bps`) on all `:release` outputs.
-   - Atomically revokes any `:vault-spend-dac`s on `:puzzle-hash` rotation."
-  [state {:keys [vault-id vault-seq puzzle-source solution epoch]}]
+   - Atomically revokes any `:vault-spend-dac`s on `:puzzle-hash` rotation.
+   - Enforces advisory-twin isolation, canonical SLA oracle attestation verification, and relock
+     puzzle-hash binding (BIP-026 §1.4 P4.1, B6)."
+  [state {:keys [vault-id vault-seq puzzle-source solution epoch oracle-attestations]}]
   (let [v (get-in state [:vaults vault-id])
         take-bps (long (or (:settlement-take-bps state) default-settlement-take-bps))
         min-bal (long (or (:min-vault-balance-ech state) default-min-vault-balance-ech))
-        chartered (or (:chartered-vaults state) #{})]
+        chartered (or (:chartered-vaults state) #{})
+        twin-set (or (:advisory-twin-pubkeys state) #{})
+        ep (long (or epoch 0))
+        sol-sigs (when (map? (:signatures solution)) (:signatures solution))
+        twin-signer (when (seq sol-sigs)
+                      (some (fn [[raw-pk _]]
+                              (let [norm-pk (circle/normalize-spki-pubkey raw-pk)]
+                                (when (and norm-pk (circle/advisory-twin? twin-set norm-pk))
+                                  norm-pk)))
+                            sol-sigs))]
     (cond
       (nil? v)
       (diag-fail state :vault-not-found {:vault-id vault-id})
@@ -367,100 +491,118 @@
       (not= (long (or vault-seq -1)) (long (:vault-seq v)))
       (diag-fail state :vault-seq-mismatch {:vault-id vault-id :expected (:vault-seq v) :actual vault-seq})
 
+      twin-signer
+      (diag-fail state :advisory-twin-signing-forbidden {:vault-id vault-id :pubkey twin-signer})
+
       :else
-      (let [outputs (:outputs solution)
-            next-ph (or (:next-puzzle-hash solution) (:puzzle-hash v))
-            digest (treasury-spend-digest
-                    {:network-uri (:network-uri state)
-                     :network-genesis-cid (:network-genesis-cid state)
-                     :vault-id vault-id
-                     :puzzle-hash (:puzzle-hash v)
-                     :vault-seq (:vault-seq v)
-                     :outputs outputs
-                     :next-puzzle-hash next-ph})
-            env-ctx {:vault-mode? true
-                     :amount (:balance v)
-                     :puzzle-hash (:puzzle-hash v)
-                     :vault-id vault-id
-                     :vault-seq (:vault-seq v)
-                     :epoch (long (or epoch 0))
-                     :spend-digest digest}
-            eval-res (puzzle/eval-puzzle puzzle-source solution env-ctx)]
-        (if-not (:valid? eval-res)
-          (diag-fail state (or (:error eval-res) :vault-puzzle-rejected) {:vault-id vault-id})
-          (let [conds (:conditions eval-res)
-                relocks (filter #(= :relock (:type %)) conds)
-                allocs (filter #(= :allocate (:type %)) conds)
-                releases (filter #(= :release (:type %)) conds)
-                relock-amt (reduce + 0 (map (comp long :amount) relocks))
-                next-puzzle-hash (or (:next-puzzle-hash (first relocks)) (:puzzle-hash v))
-                alloc-custody-mismatch? (some (fn [a]
+      (let [raw-atts (or oracle-attestations (:oracle-attestations solution))
+            att-res (verify-and-canonicalize-oracle-attestations state v raw-atts ep)]
+        (if-not (:ok? att-res)
+          (diag-fail state (:error att-res) (assoc (or (:detail att-res) {}) :vault-id vault-id))
+          (let [outputs (:outputs solution)
+                next-ph (or (:next-puzzle-hash solution) (:puzzle-hash v))
+                net-uri (or (:network-uri state) (get-in state [:config :network-uri]) "")
+                gen-cid (or (:network-genesis-cid state) (get-in state [:config :network-genesis-cid]) "")
+                digest (treasury-spend-digest
+                        {:network-uri net-uri
+                         :network-genesis-cid gen-cid
+                         :vault-id vault-id
+                         :puzzle-hash (:puzzle-hash v)
+                         :vault-seq (:vault-seq v)
+                         :outputs outputs
+                         :next-puzzle-hash next-ph})
+                env-ctx {:vault-mode? true
+                         :amount (:balance v)
+                         :puzzle-hash (:puzzle-hash v)
+                         :vault-id vault-id
+                         :vault-seq (:vault-seq v)
+                         :epoch ep
+                         :network-uri net-uri
+                         :network-genesis-cid gen-cid
+                         :oracle-attestations (:attestations att-res)
+                         :spend-digest digest}
+                eval-res (puzzle/eval-puzzle puzzle-source solution env-ctx)]
+            (if-not (:valid? eval-res)
+              (diag-fail state (or (:error eval-res) :vault-puzzle-rejected) {:vault-id vault-id})
+              (let [conds (:conditions eval-res)
+                    relocks (filter #(= :relock (:type %)) conds)
+                    allocs (filter #(= :allocate (:type %)) conds)
+                    releases (filter #(= :release (:type %)) conds)
+                    relock-amt (reduce + 0 (map (comp long :amount) relocks))
+                    relock-ph (or (:next-puzzle-hash (first relocks)) (:puzzle-hash v))
+                    relock-ph-mismatch? (and (seq relocks)
+                                             (not= (str/lower-case (str relock-ph))
+                                                   (str/lower-case (str next-ph))))
+                    next-puzzle-hash relock-ph
+                    alloc-custody-mismatch? (some (fn [a]
+                                                    (let [tid (:target-vault-id a)
+                                                          tv (get-in state [:vaults tid])]
+                                                      (and (some? tv)
+                                                           (some? (:custody-bucket v))
+                                                           (not= (:custody-bucket v) (:custody-bucket tv)))))
+                                                  allocs)
+                    alloc-valid? (every? (fn [a]
+                                           (let [tid (:target-vault-id a)
+                                                 tv (get-in state [:vaults tid])]
+                                             (and (contains? chartered vault-id)
+                                                  (some? (:custody-bucket v))
+                                                  (contains? chartered tid)
+                                                  (some? tv)
+                                                  (= :active (:status tv))
+                                                  (= (:custody-bucket v) (:custody-bucket tv)))))
+                                         allocs)]
+                (cond
+                  (> (count relocks) 1)
+                  (diag-fail state :multiple-relock-conditions {:vault-id vault-id})
+
+                  relock-ph-mismatch?
+                  (diag-fail state :relock-puzzle-hash-mismatch {:vault-id vault-id :expected next-ph :actual relock-ph})
+
+                  (and (pos? relock-amt) (< relock-amt min-bal))
+                  (diag-fail state :vault-relock-below-min-balance {:vault-id vault-id :relock-amount relock-amt :min-balance min-bal})
+
+                  (and (seq allocs) alloc-custody-mismatch?)
+                  (diag-fail state :custody-bucket-mismatch {:vault-id vault-id :custody-bucket (:custody-bucket v)})
+
+                  (and (seq allocs) (not alloc-valid?))
+                  (diag-fail state :unauthorized-zero-take-allocate {:vault-id vault-id})
+
+                  :else
+                  (let [;; Apply commercial :release outputs using Hamilton largest-remainder apportionment (B5)
+                        ;; Custody vault burns go to :total-burned ONLY, NEVER :epoch-settlement-takes (B2)
+                        apportioned (escrow/apportion-settlement-take releases take-bps)
+                        total-take (reduce + 0 (map :take apportioned))
+                        custody-vault? (some? (:custody-bucket v))
+                        rel-applied (-> (reduce (fn [acc r]
+                                                  (let [net-amt (long (:net r))
+                                                        rec (or (circle/normalize-spki-pubkey (:receiver r)) (:receiver r))]
+                                                    (update-in acc [:ledger rec :balance] (fnil + 0) net-amt)))
+                                                state
+                                                apportioned)
+                                        (update :total-burned (fnil + 0) total-take)
+                                        (cond-> (and (not custody-vault?) (pos? total-take))
+                                          (update-in [:epoch-settlement-takes ep] (fnil + 0) total-take)))
+                        ;; Apply chartered 0-take :allocate outputs preserving exact :custody-bucket
+                        alloc-applied (reduce (fn [acc a]
                                                 (let [tid (:target-vault-id a)
-                                                      tv (get-in state [:vaults tid])]
-                                                  (and (some? tv)
-                                                       (some? (:custody-bucket v))
-                                                       (not= (:custody-bucket v) (:custody-bucket tv)))))
+                                                      amt (long (:amount a))]
+                                                  (update-in acc [:vaults tid :balance] (fnil + 0) amt)))
+                                              rel-applied
                                               allocs)
-                alloc-valid? (every? (fn [a]
-                                       (let [tid (:target-vault-id a)
-                                             tv (get-in state [:vaults tid])]
-                                         (and (contains? chartered vault-id)
-                                              (some? (:custody-bucket v))
-                                              (contains? chartered tid)
-                                              (some? tv)
-                                              (= :active (:status tv))
-                                              (= (:custody-bucket v) (:custody-bucket tv)))))
-                                     allocs)]
-            (cond
-              (> (count relocks) 1)
-              (diag-fail state :multiple-relock-conditions {:vault-id vault-id})
-
-              (and (pos? relock-amt) (< relock-amt min-bal))
-              (diag-fail state :vault-relock-below-min-balance {:vault-id vault-id :relock-amount relock-amt :min-balance min-bal})
-
-              (and (seq allocs) alloc-custody-mismatch?)
-              (diag-fail state :custody-bucket-mismatch {:vault-id vault-id :custody-bucket (:custody-bucket v)})
-
-              (and (seq allocs) (not alloc-valid?))
-              (diag-fail state :unauthorized-zero-take-allocate {:vault-id vault-id})
-
-              :else
-              (let [;; Apply commercial :release outputs using Hamilton largest-remainder apportionment (B5)
-                    ;; Custody vault burns go to :total-burned ONLY, NEVER :epoch-settlement-takes (B2)
-                    apportioned (escrow/apportion-settlement-take releases take-bps)
-                    total-take (reduce + 0 (map :take apportioned))
-                    custody-vault? (some? (:custody-bucket v))
-                    ep (long (or epoch 0))
-                    rel-applied (-> (reduce (fn [acc r]
-                                              (let [net-amt (long (:net r))
-                                                    rec (or (circle/normalize-spki-pubkey (:receiver r)) (:receiver r))]
-                                                (update-in acc [:ledger rec :balance] (fnil + 0) net-amt)))
-                                            state
-                                            apportioned)
-                                    (update :total-burned (fnil + 0) total-take)
-                                    (cond-> (and (not custody-vault?) (pos? total-take))
-                                      (update-in [:epoch-settlement-takes ep] (fnil + 0) total-take)))
-                    ;; Apply chartered 0-take :allocate outputs preserving exact :custody-bucket
-                    alloc-applied (reduce (fn [acc a]
-                                            (let [tid (:target-vault-id a)
-                                                  amt (long (:amount a))]
-                                              (update-in acc [:vaults tid :balance] (fnil + 0) amt)))
-                                          rel-applied
-                                          allocs)
-                    rotated? (not= next-puzzle-hash (:puzzle-hash v))
-                    updated-v (assoc v
-                                     :balance relock-amt
-                                     :vault-seq (inc (long (:vault-seq v)))
-                                     :puzzle-hash next-puzzle-hash
-                                     :status (if (zero? relock-amt) :closed :active))
-                    st' (-> alloc-applied
-                            (assoc-in [:vaults vault-id] updated-v)
-                            (cond-> rotated?
-                              (update :vault-spend-dacs revoke-dacs-for-vault vault-id)))]
-                {:ok? true
-                 :vault updated-v
-                 :state st'
-                 :effects []}))))))))
+                        rotated? (not= next-puzzle-hash (:puzzle-hash v))
+                        updated-v (assoc v
+                                         :balance relock-amt
+                                         :vault-seq (inc (long (:vault-seq v)))
+                                         :puzzle-hash next-puzzle-hash
+                                         :status (if (zero? relock-amt) :closed :active))
+                        st' (-> alloc-applied
+                                (assoc-in [:vaults vault-id] updated-v)
+                                (cond-> rotated?
+                                  (update :vault-spend-dacs revoke-dacs-for-vault vault-id)))]
+                    {:ok? true
+                     :vault updated-v
+                     :state st'
+                     :effects []}))))))))))
 
 (defn issue-vault-spend-dac
   "Issues a dedicated `:vault-spend-dac` bounded by `:max-per-epoch-bps` (default 500 bps).

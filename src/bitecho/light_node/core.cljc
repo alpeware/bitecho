@@ -1447,6 +1447,34 @@
            :type :chain-state-snapshot
            :signature (basalt/bytes->hex sig-bytes))))
 
+(defn trusted-validators-for-epoch
+  "Pure BIP-026 §1.2 P2.3 (B4) helper: resolves the set of trusted validator public keys
+   (canonically normalized via `normalize-pubkey-hex`) for `epoch` from verified
+   `:validator-set-history` or `:validator-set-mirror`, falling back to
+   `(vals (get-in state [:bootstrap :nodes]))` strictly when no verified rotation history
+   exists for `epoch`."
+  ([state]
+   (trusted-validators-for-epoch state (or (get-in state [:account :finalized-epoch])
+                                           (:epoch state)
+                                           0)))
+  ([state epoch]
+   (let [ep (long (or epoch 0))
+         hist (:validator-set-history state)
+         hist-entry (when (and (map? hist) (seq hist))
+                      (let [eligible (filter #(<= (long %) ep) (keys hist))]
+                        (when (seq eligible)
+                          (get hist (apply max eligible)))))
+         mirror (:validator-set-mirror state)
+         mirror-comm (when (and (map? mirror)
+                                (seq (:committee mirror))
+                                (<= (long (or (:epoch-effective mirror) 0)) ep))
+                       (:committee mirror))
+         raw-vals (cond
+                    (seq (:committee hist-entry)) (:committee hist-entry)
+                    (seq mirror-comm) mirror-comm
+                    :else (keep :pubkey (vals (get-in state [:bootstrap :nodes]))))]
+     (set (keep normalize-pubkey-hex raw-vals)))))
+
 (defn verify-chain-state-snapshot
   "Verifies structure, validator signature, nonce, and epoch freshness of a chain state snapshot.
    Returns {:ok? true :snapshot normalized} or {:ok? false :error <reason>}."
@@ -1559,7 +1587,21 @@
                               (parse-long-safe (or (:network-generation snapshot)
                                                    (get snapshot "network-generation")
                                                    (get snapshot "network_generation"))
-                                               1)))})
+                                               1))
+                       (seq (or (:validator-set-history snapshot)
+                                (get snapshot "validator-set-history")
+                                (get snapshot "validator_set_history")))
+                       (assoc :validator-set-history
+                              (or (:validator-set-history snapshot)
+                                  (get snapshot "validator-set-history")
+                                  (get snapshot "validator_set_history")))
+                       (map? (or (:validator-set-mirror snapshot)
+                                 (get snapshot "validator-set-mirror")
+                                 (get snapshot "validator_set_mirror")))
+                       (assoc :validator-set-mirror
+                              (or (:validator-set-mirror snapshot)
+                                  (get snapshot "validator-set-mirror")
+                                  (get snapshot "validator_set_mirror"))))})
         {:ok? false :error "invalid-snapshot-signature"}))))
 
 (defn verify-chain-state-quorum
@@ -1760,19 +1802,29 @@
                                                             "settled_epoch" "net_amount" "take_burned" "refund_reason")]
                                        (assoc acc eid (merge existing esc))))
                                    base-escrows
-                                   incoming-escrows)]
-        (-> state
-            (assoc :account new-account
-                   :network-generation snap-gen
-                   :transfer-seq (:seq new-account)
-                   :last-transfer-hash (last (:deps new-account))
-                   :epoch (if (or gen-incremented?
-                                  (> (long (or (:epoch state) 0)) (+ fin-epoch 1000)))
-                            fin-epoch
-                            (max (long (or (:epoch state) 0)) fin-epoch))
-                   :epoch-initialized? true
-                   :escrows merged-escrows)
-            (update :credited-tx-ids (fn [c] (into (or c #{}) (map str (:deps new-account))))))))))
+                                   incoming-escrows)
+            snap-vsh (or (:validator-set-history snapshot)
+                         (get snapshot "validator-set-history")
+                         (get snapshot "validator_set_history"))
+            snap-vsm (or (:validator-set-mirror snapshot)
+                         (get snapshot "validator-set-mirror")
+                         (get snapshot "validator_set_mirror"))]
+        (cond-> (-> state
+                    (assoc :account new-account
+                           :network-generation snap-gen
+                           :transfer-seq (:seq new-account)
+                           :last-transfer-hash (last (:deps new-account))
+                           :epoch (if (or gen-incremented?
+                                          (> (long (or (:epoch state) 0)) (+ fin-epoch 1000)))
+                                    fin-epoch
+                                    (max (long (or (:epoch state) 0)) fin-epoch))
+                           :epoch-initialized? true
+                           :escrows merged-escrows)
+                    (update :credited-tx-ids (fn [c] (into (or c #{}) (map str (:deps new-account))))))
+          (and (map? snap-vsh) (seq snap-vsh))
+          (update :validator-set-history (fnil merge {}) snap-vsh)
+          (map? snap-vsm)
+          (assoc :validator-set-mirror snap-vsm))))))
 
 (defn build-chain-state-query-envelope
   "Builds and wraps an authenticated :query-chain-state agent envelope.
@@ -4305,7 +4357,13 @@
                           (when-let [s (or (get cmd-map "snapshot") (:snapshot cmd-map))]
                             [s]))]
     (if raw-snapshots
-      (let [trusted-validators (set (keep :pubkey (vals (get-in state [:bootstrap :nodes]))))
+      (let [snap-ep (reduce max 0 (map (fn [s]
+                                         (long (or (:finalized-epoch s)
+                                                   (get s "finalized-epoch")
+                                                   (get s "finalized_epoch")
+                                                   0)))
+                                       (if (map? raw-snapshots) [raw-snapshots] raw-snapshots)))
+            trusted-validators (trusted-validators-for-epoch state snap-ep)
             q-opts {:expected-pubkey (:pubkey state)
                     :trusted-validators trusted-validators
                     :min-finalized-epoch (get-in state [:account :finalized-epoch] 0)}
@@ -9387,11 +9445,16 @@
 
 (defn handle-wire-chain-state-snapshot
   "Handles incoming validator :chain-state-snapshot over wire.
-   Verifies against trusted bootstrap validators and min finalized epoch.
-   Buffers snapshot in :chain-state-snapshots, prunes stale snapshots, and applies
+   Verifies against epoch-indexed trusted validators (`trusted-validators-for-epoch`, BIP-026 P2.3)
+   and min finalized epoch. Buffers snapshot in :chain-state-snapshots, prunes stale snapshots, and applies
    ONLY when verified BFT quorum is reached across trusted validators."
   [state msg]
-  (let [trusted (set (keep (comp normalize-pubkey-hex :pubkey) (vals (get-in state [:bootstrap :nodes]))))
+  (let [snap-ep (long (or (:finalized-epoch msg)
+                          (get msg "finalized-epoch")
+                          (get msg "finalized_epoch")
+                          (get-in state [:account :finalized-epoch])
+                          0))
+        trusted (trusted-validators-for-epoch state snap-ep)
         curr-gen (long (or (:network-generation state) 1))
         min-fin-ep (long (or (get-in state [:account :finalized-epoch]) 0))
         opts {:expected-pubkey (:pubkey state)

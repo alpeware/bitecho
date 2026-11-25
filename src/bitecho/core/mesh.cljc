@@ -1695,17 +1695,21 @@
                      (:privkey-bytes validator-identity)
                      (when-let [pk-hex (:privkey-hex validator-identity)]
                        (basalt/hex->bytes pk-hex)))
-        base-snap {:bitecho/type :chain-state-snapshot
-                   :type :chain-state-snapshot
-                   :validator-pubkey val-pub
-                   :pubkey pubkey
-                   :finalized-epoch fin-epoch
-                   :balance balance
-                   :spendable spendable
-                   :seq seq-num
-                   :deps deps
-                   :escrows matching-escrows
-                   :nonce (or nonce "")}]
+        base-snap (cond-> {:bitecho/type :chain-state-snapshot
+                           :type :chain-state-snapshot
+                           :validator-pubkey val-pub
+                           :pubkey pubkey
+                           :finalized-epoch fin-epoch
+                           :balance balance
+                           :spendable spendable
+                           :seq seq-num
+                           :deps deps
+                           :escrows matching-escrows
+                           :nonce (or nonce "")}
+                    (seq (:validator-set-history st))
+                    (assoc :validator-set-history (:validator-set-history st))
+                    (map? (:validator-set-mirror st))
+                    (assoc :validator-set-mirror (:validator-set-mirror st)))]
     (when (and val-pub val-priv)
       (let [canonical-str (relay/canonical-chain-state-snapshot-str base-snap)
             sig (crypto/sign val-priv (fressian/utf8->bytes canonical-str))
