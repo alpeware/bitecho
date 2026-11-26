@@ -626,13 +626,19 @@
                                 []))
                        (catch Exception _ []))
                      (fetch-validator-chain-state-snapshots! rt bootstrap pubkey nonce))
+             snap-ep (reduce max 0 (map #(long (or (:finalized-epoch %) (get % "finalized-epoch") (get % "finalized_epoch") 0)) snaps))
+             trusted-for-ep (let [t (light-core/trusted-validators-for-epoch
+                                     (merge {:bootstrap bootstrap}
+                                            (select-keys rt [:validator-set-history :validator-set-mirror]))
+                                     snap-ep)]
+                              (if (seq t) t trusted))
              q-res (if (empty? snaps)
                      {:ok? false :error "no-inband-snapshots-returned"}
                      (light-core/verify-chain-state-quorum
                       snaps
                       {:expected-pubkey pubkey
                        :expected-nonce nonce
-                       :trusted-validators trusted
+                       :trusted-validators trusted-for-ep
                        :min-finalized-epoch 0
                        :max-epoch-skew 2}))]
          (if-not (:ok? q-res)
@@ -643,7 +649,7 @@
                                   :detail (:error q-res)
                                   :responses (count snaps)})
              {:ok? false :error :validator-epoch-quorum-failed :detail (:error q-res)})
-           (let [quorum-threshold (max 1 (long (Math/ceil (/ (* 2.0 (count trusted)) 3.0))))
+           (let [quorum-threshold (max 1 (long (Math/ceil (/ (* 2.0 (count trusted-for-ep)) 3.0))))
                  agreed-validators (set (:validators q-res))
                  sorted-eps (->> snaps
                                  (filter #(contains? agreed-validators

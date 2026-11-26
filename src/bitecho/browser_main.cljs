@@ -3105,7 +3105,9 @@
                            signed-snaps (filterv #(or (:signature %) (:sig %)) raw-snaps)]
                        (if (and node-atom (seq signed-snaps))
                          (let [bootstrap (or (get-in @node-atom [:light-state :bootstrap]) default-bootstrap-descriptor)
-                               trusted (set (keep :pubkey (vals (:nodes bootstrap))))
+                               snap-ep (reduce max 0 (map #(long (or (:finalized-epoch %) (:finalized_epoch %) 0)) signed-snaps))
+                               light-st (assoc (or (:light-state @node-atom) {}) :bootstrap bootstrap)
+                               trusted (light-core/trusted-validators-for-epoch light-st snap-ep)
                                verify-opts {:expected-pubkey pk
                                             :expected-nonce nonce
                                             :trusted-validators trusted

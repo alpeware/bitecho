@@ -157,12 +157,23 @@
                            conds)
              base-sum (reduce + 0 (map :base indexed))
              rem-units (- total-take base-sum)
-             eligible (->> indexed
-                           (filter #(< (:base %) (:amount %)))
-                           (sort-by (fn [item] [(- (:rem item)) (:idx item)])))
-             bump-idxs (set (map :idx (take rem-units eligible)))]
-         (mapv (fn [{:keys [idx cond amount base]}]
-                 (let [t (if (contains? bump-idxs idx) (inc base) base)
-                       n (- amount t)]
-                   (assoc cond :take t :net n)))
-               indexed))))))
+             final-items (loop [items (mapv (fn [item] (assoc item :take (:base item))) indexed)
+                                remaining (long (max 0 rem-units))]
+                           (if (<= remaining 0)
+                             items
+                             (let [eligible (->> items
+                                                 (filter #(< (:take %) (:amount %)))
+                                                 (sort-by (fn [item] [(- (:rem item)) (:idx item)])))
+                                   bump-idxs (set (map :idx (take remaining eligible)))]
+                               (if (empty? bump-idxs)
+                                 items
+                                 (recur (mapv (fn [item]
+                                                (if (contains? bump-idxs (:idx item))
+                                                  (update item :take inc)
+                                                  item))
+                                              items)
+                                        (- remaining (count bump-idxs)))))))]
+         (mapv (fn [{:keys [cond amount take]}]
+                 (let [n (- amount take)]
+                   (assoc cond :take take :net n)))
+               final-items))))))

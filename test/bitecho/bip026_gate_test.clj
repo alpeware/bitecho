@@ -40,6 +40,7 @@
         blk (streamlet/map->Block {:hash b-hash
                                    :epoch epoch
                                    :parent-hash (or (:latest-finalized-block-hash state) "genesis")
+                                   :payload (vec receipts)
                                    :receipts (vec receipts)})
         st (-> state
                (assoc-in [:blocks b-hash] blk)
@@ -279,6 +280,7 @@
       (let [b-rcpt {:type :bounty-create
                     :receipt-id "rcpt-bounty-1"
                     :bounty-id "bounty-026-1"
+                    :maintainer-pubkey (:spki payer)
                     :payer (:spki payer)
                     :gross-amount 1000
                     :take-bps 50
@@ -348,15 +350,24 @@
       (let [s-with-desc (assoc-in s0 [:entity-descriptors "root/boot-child"]
                                   {:entity-kind :circle :path "root/boot-child" :vault-id "c-boot" :status :active})
             proposal-cid "1111111111111111111111111111111111111111111111111111111111111111"
+            sign-ballot-fn (resolve 'bitecho.core.circle/sign-consent-ballot)
+            lead-ballot (if sign-ballot-fn
+                          (sign-ballot-fn (:private owner) (:spki owner) proposal-cid :consent)
+                          {:vote :consent})
             consent-round {:proposal-cid proposal-cid
+                           :lead-link-pubkey (:spki owner)
                            :eligible-voters [(:spki owner)]
-                           :ballots {(:spki owner) {:vote :consent}}}
+                           :ballots {(:spki owner) lead-ballot}
+                           :quorum-size 1}
             r-dev (circle/dissolve-circle s-with-desc {:circle-path "root/boot-child" :parent-vault-id "p-dev" :consent-round consent-round} {})
             r-nil (circle/dissolve-circle s-with-desc {:circle-path "root/boot-child" :parent-vault-id "p-nil" :consent-round consent-round} {})
             r-closed (circle/dissolve-circle s-with-desc {:circle-path "root/boot-child" :parent-vault-id "p-closed" :consent-round consent-round} {})]
         (is (not (:ok? r-dev)) "dissolve-circle into :development parent MUST fail closed")
+        (is (= :custody-bucket-mismatch (:error r-dev)))
         (is (not (:ok? r-nil)) "dissolve-circle into nil-bucket parent MUST fail closed")
-        (is (not (:ok? r-closed)) "dissolve-circle into :closed parent MUST fail closed")))
+        (is (= :custody-bucket-mismatch (:error r-nil)))
+        (is (not (:ok? r-closed)) "dissolve-circle into :closed parent MUST fail closed")
+        (is (= :parent-vault-not-active (:error r-closed)))))
 
     (testing "B7-d: subnet/sign-directory-pointer passes BOTH data/verify-pointer AND subnet/verify-directory-pointer"
       (let [dir-kp (gen-kp)
@@ -400,7 +411,33 @@
           (is (= [24874 24874 24874 24877 1] nets))
           (is (every? #(>= % 0) nets))
           (is (= 500 (reduce + 0 takes)))
-          (is (= 100000 (+ (reduce + 0 nets) (reduce + 0 takes)))))))))
+          (is (= 100000 (+ (reduce + 0 nets) (reduce + 0 takes))))))))
+
+  (testing "B5-b (F5): Many 1-ECH micro-outputs + larger output apportion exact take with multi-pass cap safety"
+    (let [apportion-fn (resolve 'bitecho.economy.escrow/apportion-settlement-take)]
+      (is (some? apportion-fn) "escrow/apportion-settlement-take must exist")
+      (when apportion-fn
+        (let [micro-only (mapv (fn [i] {:type :release :receiver (str "micro-" i) :amount 1})
+                               (range 200))
+              expected-micro (escrow/calculate-escrow-settlement-take 200 200)
+              res-micro (apportion-fn micro-only 200)
+              takes-micro (mapv :take res-micro)
+              nets-micro (mapv :net res-micro)
+              mixed-outs (conj (mapv (fn [i] {:type :release :receiver (str "micro-" i) :amount 1})
+                                     (range 50))
+                               {:type :release :receiver "big" :amount 950})
+              expected-mixed (escrow/calculate-escrow-settlement-take 1000 200)
+              res-mixed (apportion-fn mixed-outs 200)
+              takes-mixed (mapv :take res-mixed)
+              nets-mixed (mapv :net res-mixed)]
+          (is (every? #(and (>= (:take %) 0) (<= (:take %) (:amount %))) res-micro))
+          (is (every? #(>= % 0) nets-micro))
+          (is (= expected-micro (reduce + 0 takes-micro)))
+          (is (= 200 (+ (reduce + 0 nets-micro) (reduce + 0 takes-micro))))
+          (is (every? #(and (>= (:take %) 0) (<= (:take %) (:amount %))) res-mixed))
+          (is (every? #(>= % 0) nets-mixed))
+          (is (= expected-mixed (reduce + 0 takes-mixed)))
+          (is (= 1000 (+ (reduce + 0 nets-mixed) (reduce + 0 takes-mixed)))))))))
 
 ;; =============================================================================
 ;; BIP-026 §4 Generative Properties (test.check defspec) for P1, P3, P5
@@ -411,48 +448,50 @@
   50
   (prop/for-all [amounts (gen/not-empty (gen/vector (gen/choose 1 50000) 1 8))
                  bps (gen/choose 1 500)]
-                (let [releases (mapv (fn [idx amt]
-                                       {:type :release :receiver (str "recv-" idx) :amount amt})
-                                     (range (count amounts))
-                                     amounts)
-                      total-gross (reduce + 0 amounts)
-                      expected-take (escrow/calculate-escrow-settlement-take total-gross bps)
-                      apportioned (escrow/apportion-settlement-take releases bps)
-                      takes (mapv :take apportioned)
-                      nets (mapv :net apportioned)
-                      ;; Also verify one-shot escrow rejects :allocate / :relock fail-closed
-                      payer (gen-kp)
-                      recv (gen-kp)
-                      alloc-src "(fn [_env _sol] [{:type :allocate :target-vault-id \"v1\" :amount 1000}])"
-                      alloc-ph (puzzle/puzzle-cid alloc-src)
-                      st0 (-> (sm/init-state [] (:spki payer))
-                              (assoc :escrows {"esc-1" {:escrow-id "esc-1"
-                                                        :payer (:spki payer)
-                                                        :receiver (:spki recv)
-                                                        :amount 1000
-                                                        :deliverable-hash alloc-ph
-                                                        :puzzle-hash alloc-ph
-                                                        :created-epoch 1
-                                                        :expires-epoch 100
-                                                        :status :locked}}
-                                     :ledger {(:spki payer) {:balance 0 :seq 0 :deps []}}
-                                     :genesis-custody-supply 1000))
-                      rel-rcpt {:type :release-intent
-                                :receipt-id "rel-forbid-1"
-                                :escrow-id "esc-1"
-                                :puzzle-source alloc-src
-                                :solution {}
-                                :sender (:spki recv)}
-                      st1 (finalize-single-block st0 2 [rel-rcpt])]
-                  (and (= (count amounts) (count apportioned))
-                       (every? #(and (>= (:take %) 0) (<= (:take %) (:amount %))) apportioned)
-                       (every? #(>= (:net %) 0) apportioned)
-                       (= expected-take (reduce + 0 takes))
-                       (= total-gross (+ (reduce + 0 nets) (reduce + 0 takes)))
-                       (= :locked (get-in st1 [:escrows "esc-1" :status]))
-                       (pos? (long (get-in st1 [:diagnostics :escrow-vault-condition-forbidden] 0)))
-                       (pos? (long (or (:failed-receipts-count st1) 0)))
-                       (:ok? (vault/verify-7-bucket-conservation st1))))))
+                (if-let [apportion-fn (resolve 'bitecho.economy.escrow/apportion-settlement-take)]
+                  (let [releases (mapv (fn [idx amt]
+                                         {:type :release :receiver (str "recv-" idx) :amount amt})
+                                       (range (count amounts))
+                                       amounts)
+                        total-gross (reduce + 0 amounts)
+                        expected-take (escrow/calculate-escrow-settlement-take total-gross bps)
+                        apportioned (apportion-fn releases bps)
+                        takes (mapv :take apportioned)
+                        nets (mapv :net apportioned)
+                        ;; Also verify one-shot escrow rejects :allocate / :relock fail-closed
+                        payer (gen-kp)
+                        recv (gen-kp)
+                        alloc-src "(fn [_env _sol] [{:type :allocate :target-vault-id \"v1\" :amount 1000}])"
+                        alloc-ph (puzzle/puzzle-cid alloc-src)
+                        st0 (-> (sm/init-state [] (:spki payer))
+                                (assoc :escrows {"esc-1" {:escrow-id "esc-1"
+                                                          :payer (:spki payer)
+                                                          :receiver (:spki recv)
+                                                          :amount 1000
+                                                          :deliverable-hash alloc-ph
+                                                          :puzzle-hash alloc-ph
+                                                          :created-epoch 1
+                                                          :expires-epoch 100
+                                                          :status :locked}}
+                                       :ledger {(:spki payer) {:balance 0 :seq 0 :deps []}}
+                                       :genesis-custody-supply 1000))
+                        rel-rcpt {:type :release-intent
+                                  :receipt-id "rel-forbid-1"
+                                  :escrow-id "esc-1"
+                                  :puzzle-source alloc-src
+                                  :solution {}
+                                  :sender (:spki recv)}
+                        st1 (finalize-single-block st0 2 [rel-rcpt])]
+                    (and (= (count amounts) (count apportioned))
+                         (every? #(and (>= (:take %) 0) (<= (:take %) (:amount %))) apportioned)
+                         (every? #(>= (:net %) 0) apportioned)
+                         (= expected-take (reduce + 0 takes))
+                         (= total-gross (+ (reduce + 0 nets) (reduce + 0 takes)))
+                         (= :locked (get-in st1 [:escrows "esc-1" :status]))
+                         (pos? (long (get-in st1 [:diagnostics :escrow-vault-condition-forbidden] 0)))
+                         (pos? (long (or (:failed-receipts-count st1) 0)))
+                         (:ok? (vault/verify-7-bucket-conservation st1))))
+                  false)))
 
 (defspec ^{:doc "P1.3 (B2): Custody-vault :release takes go to :total-burned ONLY and NEVER inflate [:epoch-settlement-takes ep]; organic (nil bucket) vault takes feed BOTH."}
   prop-custody-burns-never-inflate-r-trailing
@@ -567,12 +606,18 @@
                                 :payer (:spki payer)
                                 :balance vault-amt
                                 :created-epoch 4}
-                      v-tuple (vault/vault-create-signing-tuple
-                               (assoc v-params :network-uri net-uri :network-genesis-cid gen-cid))
+                      v-tuple-fn (resolve 'bitecho.circles.vault/vault-create-signing-tuple)
+                      v-tuple (if v-tuple-fn
+                                (v-tuple-fn (assoc v-params :network-uri net-uri :network-genesis-cid gen-cid))
+                                ["bitecho-vault-create-v1"
+                                 net-uri gen-cid (:vault-id v-params) (:entity-uri v-params)
+                                 (:custody-bucket v-params) (:puzzle-hash v-params)
+                                 (:payer v-params) (long (:balance v-params)) (long (:created-epoch v-params))])
                       v-rcpt (assoc v-params :signature (basalt/bytes->hex (crypto/sign-canonical (:private payer) v-tuple)))
                       rcpts [{:type :burn :receipt-id "rcpt-burn-1" :sender (:spki payer) :amount burn-amt}
                              {:type :bounty-create :receipt-id "rcpt-bounty-1" :bounty-id "b-prop-1"
-                              :payer (:spki payer) :gross-amount bounty-amt :take-bps 50 :builder-bps 500 :epoch 4}
+                              :maintainer-pubkey (:spki payer) :payer (:spki payer) :gross-amount bounty-amt
+                              :take-bps 50 :builder-bps 500 :epoch 4}
                              v-rcpt
                              {:type :bogus-unknown-prop :receipt-id "rcpt-unk-prop"}]
                       s1 (finalize-single-block s0 5 rcpts)
@@ -606,9 +651,13 @@
                                            "c-v" {:vault-id "c-v" :entity-uri "root/c" :custody-bucket child-bucket
                                                   :puzzle-hash ph :balance principal :vault-seq 1 :created-epoch 0 :status :active}}})
                                 :entity-descriptors {"root/c" {:entity-kind :circle :path "root/c" :vault-id "c-v" :status :active}})
+                      sign-ballot-fn (resolve 'bitecho.core.circle/sign-consent-ballot)
+                      verify-env-fn (resolve 'bitecho.core.circle/verify-encrypted-entity-envelope)
                       signed-round {:proposal-cid prop-cid
                                     :lead-link-pubkey (:spki owner)
-                                    :ballots {(:spki owner) (circle/sign-consent-ballot (:private owner) (:spki owner) prop-cid :consent)}
+                                    :ballots {(:spki owner) (if sign-ballot-fn
+                                                              (sign-ballot-fn (:private owner) (:spki owner) prop-cid :consent)
+                                                              {:vote :consent})}
                                     :quorum-size 1}
                       unsigned-round {:proposal-cid prop-cid
                                       :lead-link-pubkey (:spki owner)
@@ -627,9 +676,11 @@
                             :storage-accounting {:bytes-at-rest 512 :payer-pubkey (:spki owner) :fee-ech 0}}
                       enc-ok (circle/encrypt-shared-descriptor desc gk {:owner-signers [{:pubkey (:spki owner) :privkey (:private owner)}]})
                       enc-bad-path (assoc enc-ok :blinded-path "root/protocol")
-                      v-enc-ok (circle/verify-encrypted-entity-envelope enc-ok {:network-uri net-uri :network-genesis-cid gen-cid})
-                      v-enc-bad (circle/verify-encrypted-entity-envelope enc-bad-path {:network-uri net-uri :network-genesis-cid gen-cid})]
-                  (and (false? (:ok? res-unsigned))
+                      v-enc-ok (when verify-env-fn (verify-env-fn enc-ok {:network-uri net-uri :network-genesis-cid gen-cid}))
+                      v-enc-bad (when verify-env-fn (verify-env-fn enc-bad-path {:network-uri net-uri :network-genesis-cid gen-cid}))]
+                  (and (some? sign-ballot-fn)
+                       (some? verify-env-fn)
+                       (false? (:ok? res-unsigned))
                        (if (= child-bucket parent-bucket)
                          (and (:ok? res-signed)
                               (:ok? (vault/verify-7-bucket-conservation (:state res-signed))))
@@ -750,8 +801,46 @@
                                        :puzzle-source sla-puzzle-src
                                        :solution {:oracle-attestations {(:spki o1) att-o1
                                                                         o1-raw att-o1}}
-                                       :epoch 50})]
-        (is (not (:ok? res)) "Aliased 64-hex + 88-hex same oracle must not satisfy 2-of-2 quorum")))
+                                       :epoch 50})
+            ;; Allowlist-free counting puzzle: directly observes (count (:oracle-attestations env))
+            ;; so 64-hex + 88-hex aliasing collapse (2 -> 1) is directly observable without an allowlist
+            count-puzzle-src (str "(fn [env _sol]"
+                                  "  (let [atts (or (:oracle-attestations env) {})]"
+                                  "    (if (>= (count atts) 2)"
+                                  "      [{:type :release :receiver " (pr-str (:spki recv)) " :amount 1000}"
+                                  "       {:type :relock :amount 9000 :next-puzzle-hash (:puzzle-hash env)}]"
+                                  "      false)))")
+            count-ph (puzzle/puzzle-cid count-puzzle-src)
+            s-count (assoc-in s0 [:vaults "v-sla-count"]
+                              {:vault-id "v-sla-count"
+                               :entity-uri "root/sla-count"
+                               :custody-bucket nil
+                               :puzzle-hash count-ph
+                               :balance 10000
+                               :vault-seq 1
+                               :created-epoch 0
+                               :status :active})
+            att-c1 (make-sla-attestation o1 {:network-uri net-uri :network-genesis-cid gen-cid
+                                             :vault-id "v-sla-count" :vault-seq 1 :epoch 50 :score-bps 9900})
+            att-c2 (make-sla-attestation o2 {:network-uri net-uri :network-genesis-cid gen-cid
+                                             :vault-id "v-sla-count" :vault-seq 1 :epoch 50 :score-bps 9800})
+            r-alias-count (vault/spend-vault s-count {:vault-id "v-sla-count"
+                                                      :vault-seq 1
+                                                      :puzzle-source count-puzzle-src
+                                                      :solution {:oracle-attestations {(:spki o1) att-c1
+                                                                                       o1-raw att-c1}}
+                                                      :epoch 50})
+            r-distinct-count (vault/spend-vault s-count {:vault-id "v-sla-count"
+                                                         :vault-seq 1
+                                                         :puzzle-source count-puzzle-src
+                                                         :solution {:oracle-attestations {(:spki o1) att-c1
+                                                                                          (:spki o2) att-c2}}
+                                                         :epoch 50})]
+        (is (not (:ok? res)) "Aliased 64-hex + 88-hex same oracle must not satisfy 2-of-2 quorum")
+        (is (not (:ok? r-alias-count))
+            "Allowlist-free counting puzzle MUST observe 2 -> 1 collapse on 64-hex + 88-hex aliasing")
+        (is (:ok? r-distinct-count)
+            "Allowlist-free counting puzzle MUST succeed with 2 distinct verified oracles")))
 
     (testing "B6-c: Stale epoch, mismatched :vault-seq, and score-bps > 10000 MUST fail closed"
       (let [att-stale (make-sla-attestation o2 {:network-uri net-uri :network-genesis-cid gen-cid
@@ -770,8 +859,11 @@
                                          :solution {:oracle-attestations {(:spki o1) att-o1 (:spki o2) att-bad-bps}}
                                          :epoch 50})]
         (is (not (:ok? r-stale)) "Stale oracle attestation must fail closed")
+        (is (= :stale-oracle-attestation (:error r-stale)))
         (is (not (:ok? r-seq)) "Mismatched :vault-seq attestation must fail closed")
-        (is (not (:ok? r-bps)) "score-bps > 10000 must fail closed")))
+        (is (= :oracle-vault-seq-mismatch (:error r-seq)))
+        (is (not (:ok? r-bps)) "score-bps > 10000 must fail closed")
+        (is (= :invalid-oracle-score-bps (:error r-bps)))))
 
     (testing "B6-d: Mismatched relock :next-puzzle-hash vs solution next-ph MUST fail closed with :relock-puzzle-hash-mismatch"
       (let [hijacked-ph "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -980,7 +1072,7 @@
                               :epoch-effective ep-eff
                               :quorum-threshold 4
                               :consent-round-cid consent-cid
-                              :committee (mapv :spki v1-kps)})
+                              :committee (mapv :mixed-pub v1-kps)})
                       [{:pubkey (:spki root-kp) :privkey (:private root-kp)}])
             rot-rcpt {:type :rotate-validator-set
                       :receipt-id "rcpt-rot-b4-1"
@@ -1099,6 +1191,10 @@
                                                      :vault-id "v-sla-prop" :vault-seq 1 :epoch (- cur-ep lag) :score-bps score2})
                       att-stale (make-sla-attestation o2 {:network-uri net-uri :network-genesis-cid gen-cid
                                                           :vault-id "v-sla-prop" :vault-seq 1 :epoch (- cur-ep stale-extra) :score-bps score2})
+                      att-bad-seq (make-sla-attestation o2 {:network-uri net-uri :network-genesis-cid gen-cid
+                                                            :vault-id "v-sla-prop" :vault-seq 2 :epoch cur-ep :score-bps score2})
+                      att-bad-bps (make-sla-attestation o2 {:network-uri net-uri :network-genesis-cid gen-cid
+                                                            :vault-id "v-sla-prop" :vault-seq 1 :epoch cur-ep :score-bps 10001})
                       att-twin (make-sla-attestation twin {:network-uri net-uri :network-genesis-cid gen-cid
                                                            :vault-id "v-sla-prop" :vault-seq 1 :epoch cur-ep :score-bps score2})
                       r-twin (vault/spend-vault s0 {:vault-id "v-sla-prop" :vault-seq 1 :puzzle-source sla-src
@@ -1110,6 +1206,12 @@
                       r-stale (vault/spend-vault s0 {:vault-id "v-sla-prop" :vault-seq 1 :puzzle-source sla-src
                                                      :solution {:oracle-attestations {(:spki o1) att1 (:spki o2) att-stale}}
                                                      :epoch cur-ep})
+                      r-seq (vault/spend-vault s0 {:vault-id "v-sla-prop" :vault-seq 1 :puzzle-source sla-src
+                                                   :solution {:oracle-attestations {(:spki o1) att1 (:spki o2) att-bad-seq}}
+                                                   :epoch cur-ep})
+                      r-bps (vault/spend-vault s0 {:vault-id "v-sla-prop" :vault-seq 1 :puzzle-source sla-src
+                                                   :solution {:oracle-attestations {(:spki o1) att1 (:spki o2) att-bad-bps}}
+                                                   :epoch cur-ep})
                       r-hijack (vault/spend-vault s0 {:vault-id "v-sla-prop" :vault-seq 1 :puzzle-source sla-src
                                                       :solution {:oracle-attestations {(:spki o1) att1 (:spki o2) att2}
                                                                  :next-puzzle-hash ph
@@ -1121,7 +1223,9 @@
                                                   :epoch cur-ep})]
                   (and (= :advisory-twin-signing-forbidden (:error r-twin))
                        (not (:ok? r-alias))
-                       (not (:ok? r-stale))
+                       (= :stale-oracle-attestation (:error r-stale))
+                       (= :oracle-vault-seq-mismatch (:error r-seq))
+                       (= :invalid-oracle-score-bps (:error r-bps))
                        (= :relock-puzzle-hash-mismatch (:error r-hijack))
                        (:ok? r-ok)
                        (= relock-amt (get-in (:state r-ok) [:vaults "v-sla-prop" :balance]))

@@ -285,7 +285,8 @@
           ;; Helper to finalize one Streamlet epoch on a given active partition of nodes
           finalize-epoch!
           (fn [nodes-map active-pks ep parent-hash receipts]
-            (let [ref-st (get nodes-map (first active-pks))
+            (let [ref-st (or (some #(get nodes-map %) active-pks)
+                             (first (vals nodes-map)))
                   hist-entry (streamlet/committee-at-epoch (:validator-set-history ref-st) ep)
                   comm (vec (sort (or (:committee hist-entry) (:validators ref-st))))
                   leader (nth comm (mod ep (count comm)))
