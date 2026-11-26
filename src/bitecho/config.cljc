@@ -19,7 +19,7 @@
 
 (def version
   "Current protocol and release milestone version."
-  "0.23.22")
+  "0.23.24")
 
 (def ratified-theta-star
   "Selected Monte Carlo Tokenomics v2.1 Pareto-optimal parameter vector (`BIP-009` / `P-DEPLOY-9`)."

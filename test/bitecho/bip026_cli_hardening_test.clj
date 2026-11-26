@@ -17,6 +17,7 @@
             [bitecho.status.core :as status-core]
             [clojure.core.async :as async]
             [clojure.data.json :as json]
+            [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [clojure.test.check.clojure-test :refer [defspec]]
@@ -493,7 +494,15 @@
           "S4.2: 0-replica failure MUST NOT deduct burn")
       (is (pos? (long (get-in (:state fail-commit) [:diagnostics :artifact-replica-quorum-unmet] 0))))
       (is (true? (get-in local-res [:response "ok"]))
-          "S4.2: explicit --local-only MUST succeed offline"))))
+          "S4.2: explicit --local-only MUST succeed offline")
+      ;; F-WS3-1: Node.js CLI & serve paths both use 2-phase prepare-artifact-put + commit-artifact-put-outcome
+      (let [node-src (slurp "src/bitecho/node_main.cljs")
+            prep-hits (count (re-seq #"light-core/prepare-artifact-put" node-src))
+            commit-hits (count (re-seq #"light-core/commit-artifact-put-outcome" node-src))]
+        (is (>= prep-hits 2)
+            "F-WS3-1: node_main.cljs MUST route both serve and one-shot CLI artifact-put through light-core/prepare-artifact-put")
+        (is (>= commit-hits 2)
+            "F-WS3-1: node_main.cljs MUST commit both serve and one-shot CLI artifact-put via light-core/commit-artifact-put-outcome")))))
 
 (deftest scen-b10-s5-2-and-s5-3-bounty-and-dac-validation-test
   (testing "B10-d (S5.2): bounty-create rejects blank bounty-id and gross <= 0; bounty-settle rejects 0{64}/non-64-hex patch-cid with zero burn"
@@ -569,7 +578,26 @@
           "S6.1: node_main.cljs MUST use :event-loop-lag-ms instead of :loop-lag-ms")
       (let [jvm-ctx (jvm-light/build-light-runtime-ctx)]
         (is (integer? (get-in jvm-ctx [:storage :host-free-disk-bytes]))
-            "S6.1: JVM build-light-runtime-ctx MUST report integer :host-free-disk-bytes"))))
+            "S6.1: JVM build-light-runtime-ctx MUST report integer :host-free-disk-bytes"))
+      ;; F-WS3-3: Disk-hydrated :cache-index-bytes from <state-dir>/cache/index.fressian
+      (let [sd (temp-dir "bip026-cache-idx-bytes-")
+            prev-tm @jvm-light/jvm-light-telemetry-atom]
+        (try
+          (let [cache-dir (io/file sd "cache")
+                idx-file (io/file cache-dir "index.fressian")
+                payload (byte-array (repeat 137 (byte 42)))]
+            (.mkdirs cache-dir)
+            (Files/write (.toPath idx-file) payload (make-array java.nio.file.OpenOption 0))
+            (swap! jvm-light/jvm-light-telemetry-atom assoc :state-dir (.getAbsolutePath sd))
+            (let [ctx (jvm-light/build-light-runtime-ctx)]
+              (is (= 137 (get-in ctx [:storage :cache-index-bytes]))
+                  "F-WS3-3: JVM build-light-runtime-ctx MUST hydrate :cache-index-bytes from <state-dir>/cache/index.fressian")))
+          (finally
+            (reset! jvm-light/jvm-light-telemetry-atom prev-tm)
+            (delete-tree! sd))))
+      (is (and (str/includes? node-src "\"index.fressian\"")
+               (str/includes? node-src "disk-idx-bytes"))
+          "F-WS3-3: node_main.cljs build-light-runtime-ctx MUST stat <state-dir>/cache/index.fressian for :cache-index-bytes")))
 
   (testing "B11-b (S6.2): node_main.cljs merges :runtime-ctx without clobbering :lock-state (:role :single per D50)"
     (let [node-src (slurp "src/bitecho/node_main.cljs")]
@@ -585,10 +613,26 @@
       (is (= "single" (get-in rendered ["instance_lock" "role"]))
           "S6.2 (D50): status.instance_lock.role MUST stay \"single\" after merging telemetry")))
 
-  (testing "B11-c (S6.3): node_main.cljs HTTP helpers attach .once socket error guards"
-    (let [node-src (slurp "src/bitecho/node_main.cljs")]
-      (is (str/includes? node-src "(.once req \"socket\"")
-          "S6.3: node_main.cljs MUST attach (.once req \"socket\" ...) ECONNRESET guard")))
+  (testing "B11-c (S6.3): all 4 node_main.cljs HTTP/TLS helpers attach .once socket/error guards"
+    (let [node-src (slurp "src/bitecho/node_main.cljs")
+          fn-slice (fn [fn-name]
+                     (let [start (.indexOf node-src (str "(defn- " fn-name))
+                           end (when (>= start 0)
+                                 (.indexOf node-src "\n(defn" (inc start)))]
+                       (when (>= start 0)
+                         (if (and end (pos? end))
+                           (subs node-src start end)
+                           (subs node-src start)))))]
+      (is (str/includes? (or (fn-slice "http-get-string!") "") "(.once req \"socket\"")
+          "S6.3 (F-WS3-2): http-get-string! MUST attach (.once req \"socket\" ...) guard")
+      (is (str/includes? (or (fn-slice "open-https-proxy-tls-socket!") "") "(.once tls-sock \"error\"")
+          "S6.3 (F-WS3-2): open-https-proxy-tls-socket! MUST use (.once tls-sock \"error\" ...) guard")
+      (is (not (str/includes? (or (fn-slice "open-https-proxy-tls-socket!") "") "(.on tls-sock \"error\""))
+          "S6.3 (F-WS3-2): open-https-proxy-tls-socket! MUST NOT use (.on tls-sock \"error\" ...)")
+      (is (str/includes? (or (fn-slice "http-post-bytes-detailed!") "") "(.once req \"socket\"")
+          "S6.3 (F-WS3-2): http-post-bytes-detailed! MUST attach (.once req \"socket\" ...) guard")
+      (is (str/includes? (or (fn-slice "node-http-request!") "") "(.once req \"socket\"")
+          "S6.3 (F-WS3-2): node-http-request! MUST attach (.once req \"socket\" ...) guard")))
 
   (testing "B11-d (S6.4): GET /app and GET /app?foo=1 return HTTP 301 Location: /app/[?foo=1] on JVM and Node full nodes"
     (let [full-node-src (slurp "src/bitecho/full_node_main.cljs")]

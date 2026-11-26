@@ -142,7 +142,7 @@
           updater-atom (atom (deploy/init-light-updater-state
                               (cond-> {:node-id (or node-id "jvm-node")
                                        :artifact-role :jvm-jar
-                                       :current-version (or current-version "0.23.22")
+                                       :current-version (or current-version "0.23.24")
                                        :current-cid cur-cid
                                        :pointer-url pointer-url
                                        :force-http? (boolean force-http?)

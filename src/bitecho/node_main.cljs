@@ -432,7 +432,12 @@
                                                (done! (.toString buf "utf8")))))
                             (.on res "error" (fn [_] (done! nil)))))))]
         (.on req "timeout" (fn [] (.destroy req) (done! nil)))
-        (.on req "error" (fn [_] (done! nil))))
+        (.on req "error" (fn [_] (done! nil)))
+        ;; BIP-026 S6.3 (B11): Defensive .once socket ECONNRESET guard (no keep-alive listener leak)
+        (.once req "socket"
+               (fn [sock]
+                 (when sock
+                   (.once sock "error" (fn [_] (done! nil)))))))
       (catch :default _
         (done! nil)))))
 
@@ -475,10 +480,11 @@
                    (done! nil (str "proxy-connect-status-" (.-statusCode res))))
                (try
                  (let [tls-sock (.connect node-tls #js {:socket sock :servername target-host})]
-                   (.on tls-sock "error"
-                        (fn [e]
-                          (try (.destroy sock) (catch :default _ nil))
-                          (done! nil (str e))))
+                   ;; BIP-026 S6.3 (B11): .once error guard on proxy TLS socket
+                   (.once tls-sock "error"
+                          (fn [e]
+                            (try (.destroy sock) (catch :default _ nil))
+                            (done! nil (str e))))
                    (.once tls-sock "secureConnect"
                           (fn []
                             (done! tls-sock nil))))
@@ -690,6 +696,13 @@
                             (reset! active-req req)
                             (.on req "timeout" (fn [] (.destroy req) (done! {:ok? false :status 408 :error "timeout"})))
                             (.on req "error" (fn [err] (done! {:ok? false :status 500 :error (str err)})))
+                            ;; BIP-026 S6.3 (B11): Defensive .once socket ECONNRESET guard
+                            (.once req "socket"
+                                   (fn [sock]
+                                     (when sock
+                                       (.once sock "error"
+                                              (fn [err]
+                                                (done! {:ok? false :status 500 :error (str err)}))))))
                             (.end req))
                           (catch :default e
                             (done! {:ok? false :status 500 :error (str e)}))))]
@@ -1513,9 +1526,15 @@
   (let [t @light-runtime-telemetry-atom
         idx (or (:cache-index t) (cache/init-cache-index))
         cs (cache/cache-storage-summary idx)
+        state-dir (or (:state-dir t) ".")
+        disk-idx-bytes (try
+                         (let [idx-path (.join node-path (str state-dir) "cache" "index.fressian")]
+                           (when (.existsSync node-fs idx-path)
+                             (long (or (.-size (.statSync node-fs idx-path)) 0))))
+                         (catch :default _ nil))
         host-free (try
                     (when (fn? (.-statfsSync node-fs))
-                      (let [st (.statfsSync node-fs (or (:state-dir t) "."))]
+                      (let [st (.statfsSync node-fs state-dir)]
                         (when st
                           (* (long (or (.-bavail st) (.-bfree st) 0))
                              (long (or (.-bsize st) 0))))))
@@ -1523,7 +1542,7 @@
     {:storage (cond-> (merge cs
                              {:state-bytes (long (or (:state-bytes t) 0))
                               :cache-bytes (long (or (:total-bytes idx) (:cache-bytes cs) 0))
-                              :cache-index-bytes (long (or (:cache-index-bytes t) (:cache-index-bytes cs) 0))
+                              :cache-index-bytes (long (or disk-idx-bytes (:cache-index-bytes t) (:cache-index-bytes cs) 0))
                               :cache-entries (long (or (:cache-entries cs) (count (or (:entries idx) {}))))
                               :cache-budget-bytes (long (or (:cache-budget-bytes t) cache/default-max-cache-bytes))
                               :cache-evictions (long (or (get-in t [:diagnostics :cache-blob-evicted]) 0))
@@ -4747,7 +4766,11 @@
                 storage-put-net? (and (= eff-domain-verb "storage-put")
                                       (not (boolean (or (get cmd-map "local_only")
                                                         (get cmd-map "local-only")
-                                                        (:local-only cmd-map)))))]
+                                                        (:local-only cmd-map)))))
+                artifact-put-net? (and (= eff-domain-verb "artifact-put")
+                                       (not (boolean (or (get cmd-map "local_only")
+                                                         (get cmd-map "local-only")
+                                                         (:local-only cmd-map)))))]
             (cond
               stage-c-verb?
               (handle-node-stage-c-verb!
@@ -4781,6 +4804,36 @@
                          (reset! state-atom committed-st)
                          (when state-file (try (save-light-state-async! state-file @state-atom) (catch :default _ nil)))
                          (finish-resp! (dissoc committed :ok?))))))))
+
+              artifact-put-net?
+              (let [sub-str (str (or (get cmd-map "subnet_id") (:subnet-id @state-atom) "global"))
+                    prep (light-core/prepare-artifact-put @state-atom cmd-map (:privkey-bytes identity) sub-str)]
+                (if-not (:ok? prep)
+                  (do
+                    (when (:state prep)
+                      (reset! state-atom (:state prep))
+                      (when state-file (try (save-light-state-async! state-file @state-atom) (catch :default _ nil))))
+                    (finish-resp! (dissoc prep :ok?)))
+                  (let [art-relay (or (get cmd-map "relay_url")
+                                      (get cmd-map "relay-url")
+                                      (:relay-url cmd-map)
+                                      relay-url)
+                        commit-art! (fn [net-receipt]
+                                      (let [committed0 (light-core/commit-artifact-put-outcome @state-atom (:publish-intent prep) net-receipt)
+                                            committed-st (if (and state-file (seq (:cache-effects committed0)))
+                                                           (execute-cache-effects! state-file (:state committed0) (:cache-effects committed0) {:state-atom state-atom})
+                                                           (:state committed0))
+                                            committed (assoc committed0
+                                                             :state committed-st
+                                                             :net-envelopes (if (:ok? committed0) (:net-envelopes prep) []))]
+                                        (reset! state-atom committed-st)
+                                        (when state-file (try (save-light-state-async! state-file @state-atom) (catch :default _ nil)))
+                                        (finish-resp! (dissoc committed :ok?))))]
+                    (if art-relay
+                      (post-artifact-to-relay!
+                       art-relay "artifact-put" (assoc (:publish-intent prep) "ok" true)
+                       commit-art!)
+                      (commit-art! {:ok? false :error "no-relay-configured" :confirmed-replicas []})))))
 
               :else
               (let [st-before @state-atom
@@ -4825,7 +4878,7 @@
                           (assoc raw-res :response (:response out-write-res) :state @state-atom)
                           raw-res)
                     state-changed? (and (some? (:state res)) (not (identical? (:state res) st-before)) (not= (:state res) st-before))
-                    art-relay (when (contains? #{"artifact-put" "artifact-revoke"} eff-domain-verb)
+                    art-relay (when (= "artifact-revoke" eff-domain-verb)
                                 (or (get cmd-map "relay_url")
                                     (get cmd-map "relay-url")
                                     (:relay-url cmd-map)
@@ -5408,7 +5461,7 @@
            updater-atom (atom (deploy/init-light-updater-state
                                (cond-> {:node-id (or (:peer-id identity) "light-node")
                                         :artifact-role :light-node
-                                        :current-version "0.23.22"
+                                        :current-version "0.23.24"
                                         :current-cid current-cid
                                         :pointer-url pointer-url
                                         :force-http? (boolean (:auto-update-force-http? opts))
@@ -6615,7 +6668,11 @@
                                               storage-put-net? (and (= eff-domain-verb "storage-put")
                                                                     (not (boolean (or (get cmd-map "local_only")
                                                                                       (get cmd-map "local-only")
-                                                                                      (:local-only cmd-map)))))]
+                                                                                      (:local-only cmd-map)))))
+                                              artifact-put-net? (and (= eff-domain-verb "artifact-put")
+                                                                     (not (boolean (or (get cmd-map "local_only")
+                                                                                       (get cmd-map "local-only")
+                                                                                       (:local-only cmd-map)))))]
                                           (cond
                                             stage-c-verb?
                                             (handle-node-stage-c-verb!
@@ -6649,6 +6706,34 @@
                                                        (emit-json-line! (:response committed))
                                                        (.exit js/process (if (:ok? committed) 0 1))))))))
 
+                                            artifact-put-net?
+                                            (let [sub-str (str (or (get cmd-map "subnet_id") (:subnet-id @state-atom) "global"))
+                                                  prep (light-core/prepare-artifact-put @state-atom cmd-map (:privkey-bytes identity) sub-str)]
+                                              (if-not (:ok? prep)
+                                                (do
+                                                  (when (:state prep) (save-light-state! state-file (:state prep)))
+                                                  (emit-json-line! (:response prep))
+                                                  (.exit js/process 1))
+                                                (let [art-relay (or (get cmd-map "relay_url")
+                                                                    (get cmd-map "relay-url")
+                                                                    (:relay-url cmd-map)
+                                                                    effective-relay-url)
+                                                      commit-art! (fn [net-receipt]
+                                                                    (let [committed0 (light-core/commit-artifact-put-outcome @state-atom (:publish-intent prep) net-receipt)
+                                                                          committed-st (if (and state-file (seq (:cache-effects committed0)))
+                                                                                         (execute-cache-effects-sync! state-file (:state committed0) (:cache-effects committed0))
+                                                                                         (:state committed0))
+                                                                          committed (assoc committed0 :state committed-st)]
+                                                                      (reset! state-atom committed-st)
+                                                                      (save-light-state! state-file @state-atom)
+                                                                      (emit-json-line! (:response committed))
+                                                                      (.exit js/process (if (:ok? committed) 0 1))))]
+                                                  (if art-relay
+                                                    (post-artifact-to-relay!
+                                                     art-relay "artifact-put" (assoc (:publish-intent prep) "ok" true)
+                                                     commit-art!)
+                                                    (commit-art! {:ok? false :error "no-relay-configured" :confirmed-replicas []})))))
+
                                             :else
                                             (let [read-blob-cmd? (contains? #{"storage-get" "artifact-get"} eff-domain-verb)
                                                   hydrated-from-cache? (and read-blob-cmd?
@@ -6677,7 +6762,7 @@
                                                   res (if (:applied? out-write-res)
                                                         (assoc raw-res :response (:response out-write-res) :state @state-atom)
                                                         raw-res)
-                                                  art-relay (when (contains? #{"artifact-put" "artifact-revoke"} eff-domain-verb)
+                                                  art-relay (when (= "artifact-revoke" eff-domain-verb)
                                                               (or (get cmd-map "relay_url")
                                                                   (get cmd-map "relay-url")
                                                                   (:relay-url cmd-map)

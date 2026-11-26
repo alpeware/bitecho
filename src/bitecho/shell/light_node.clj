@@ -608,15 +608,23 @@
 
 (defn build-light-runtime-ctx
   "BIP-025 F3 / BIP-026 S6.1: Projects live `jvm-light-telemetry-atom` storage and latency telemetry into
-   `runtime-ctx` for `status-core/render-status` (`bitecho.status/v1`), including live host usable disk bytes."
+   `runtime-ctx` for `status-core/render-status` (`bitecho.status/v1`), including live host usable disk bytes
+   and disk-hydrated `:cache-index-bytes`."
   []
   (let [tm @jvm-light-telemetry-atom
         cs (cache/cache-storage-summary (:cache-index tm))
+        state-dir (or (:state-dir tm) ".")
+        disk-idx-bytes (try
+                         (let [f (io/file (str state-dir) "cache" "index.fressian")]
+                           (when (.exists f)
+                             (.length f)))
+                         (catch Exception _ nil))
         host-free (try
-                    (.getUsableSpace (io/file (or (:state-dir tm) ".")))
+                    (.getUsableSpace (io/file state-dir))
                     (catch Exception _ nil))]
     {:storage (cond-> (merge cs
                              {:state-bytes (long (:state-bytes tm 0))
+                              :cache-index-bytes (long (or disk-idx-bytes (:cache-index-bytes tm) (:cache-index-bytes cs) 0))
                               :cache-budget-bytes (long (:cache-budget-bytes tm cache/default-max-cache-bytes))
                               :events-log-bytes (long (:events-log-bytes tm 0))
                               :events-log-max-bytes (long (:events-log-max-bytes tm cli/default-max-events-log-bytes))})

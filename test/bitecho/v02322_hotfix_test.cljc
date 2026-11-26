@@ -238,8 +238,8 @@
       (is (some #(= :light-update-non-monotonic-version (:reason %)) effs-down)))))
 
 (deftest v02322-version-and-persistence-whitelist-test
-  (testing "config/version is bumped to 0.23.22"
-    (is (= "0.23.22" config/version)))
+  (testing "config/version is bumped to 0.23.24"
+    (is (= "0.23.24" config/version)))
   (testing "browser persistence sanitizer preserves :subnet-id-startup-override diagnostic"
     (let [sanitized (browser/sanitize-state-for-persistence
                      {:subnet-id "devnet.bitecho.org"

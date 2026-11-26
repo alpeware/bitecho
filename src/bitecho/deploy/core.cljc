@@ -1884,9 +1884,9 @@
      :artifact-role (keyword (or artifact-role :light-node))
      :phase :watching
      :generation 1
-     :current-version (str (or current-version "0.23.22"))
+     :current-version (str (or current-version "0.23.24"))
      :current-cid (normalize-hex current-cid)
-     :lkg-version (str (or current-version "0.23.22"))
+     :lkg-version (str (or current-version "0.23.24"))
      :lkg-cid (normalize-hex current-cid)
      :pinned-version (when (and (string? pinned-version) (not (str/blank? pinned-version)))
                        (str/trim pinned-version))
